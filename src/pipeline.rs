@@ -14,7 +14,7 @@ use helicase::{
 };
 
 use crate::{
-    adapter::{AdapterCatalog, TrimAdaptersTransform},
+    adapter::TrimAdaptersTransform,
     cli::{Cli, IngressHandle},
     filter::{MaxNsFilter, MinEntropyFilter, MinLengthFilter, MinMeanQualityFilter},
     output::{PairedOutputHandle, SingleOutputHandle, SingleRecordOutput},
@@ -75,9 +75,12 @@ fn run_single(
     summary_context: RunContext,
 ) -> Result<()> {
     // build a plan for what to do with the reads based on the user's provided settings
-    let plan = Plan::new()
-        .max_ns(cli.max_ns)
-        .trim_adapters(AdapterCatalog::illumina_truseq())
+    let plan = Plan::<Logical>::new().max_ns(cli.max_ns);
+    let plan = match cli.adapter_preset.catalog() {
+        Some(catalog) => plan.trim_adapters(catalog),
+        None => plan,
+    };
+    let plan = plan
         .quality_trim(cli.trim_min_q)
         .min_length(cli.min_length)
         .min_mean_q(cli.min_mean_q)
@@ -153,9 +156,12 @@ fn run_paired(
     ui: &crate::cli::UiPolicy,
     summary_context: RunContext,
 ) -> Result<()> {
-    let plan = Plan::<Logical>::new()
-        .max_ns(cli.max_ns)
-        .trim_adapters(AdapterCatalog::illumina_truseq())
+    let plan = Plan::<Logical>::new().max_ns(cli.max_ns);
+    let plan = match cli.adapter_preset.catalog() {
+        Some(catalog) => plan.trim_adapters(catalog),
+        None => plan,
+    };
+    let plan = plan
         .quality_trim(cli.trim_min_q)
         .min_length(cli.min_length)
         .min_mean_q(cli.min_mean_q)
@@ -447,6 +453,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
+        adapter::AdapterPreset,
         cli::{Cli, InvalidFastqPolicy},
         output::{
             InterleavedOutput, OutputArgs, OutputEncoding, OutputFormat, PairedRecordOutput,
@@ -477,6 +484,7 @@ mod tests {
             max_ns: 4,
             min_mean_q: 20.0,
             trim_min_q: 20,
+            adapter_preset: AdapterPreset::IlluminaTruSeq,
             min_entropy: 0.0,
             interleaved: true,
             output_format: OutputFormat::Fastq,

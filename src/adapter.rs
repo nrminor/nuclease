@@ -2,6 +2,8 @@
 
 use wide::u8x16;
 
+use clap::ValueEnum;
+
 use crate::{
     plan::{
         BuildPlan, IntoExecutionStep, ReadTransform, TransformArena, TransformResult, TransformStep,
@@ -10,8 +12,29 @@ use crate::{
 };
 
 /// Curated adapter catalogs available to trimming transforms.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdapterCatalog {
     IlluminaTruSeq,
+}
+
+/// Adapter trimming presets exposed by the CLI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum AdapterPreset {
+    /// Do not trim adapters.
+    None,
+    /// Trim Illumina `TruSeq` adapter overlap.
+    #[value(name = "illumina-truseq", alias = "illumina-tru-seq")]
+    IlluminaTruSeq,
+}
+
+impl AdapterPreset {
+    /// Return the curated adapter catalog for presets that trim adapters.
+    pub(crate) const fn catalog(self) -> Option<AdapterCatalog> {
+        match self {
+            Self::None => None,
+            Self::IlluminaTruSeq => Some(AdapterCatalog::illumina_truseq()),
+        }
+    }
 }
 
 impl AdapterCatalog {
@@ -21,14 +44,14 @@ impl AdapterCatalog {
     }
 
     /// Return the raw adapter sequences included in this preset.
-    fn adapters(&self) -> &'static [&'static [u8]] {
+    fn adapters(self) -> &'static [&'static [u8]] {
         match self {
             Self::IlluminaTruSeq => &[TRUSEQ_R1, TRUSEQ_R2],
         }
     }
 
     /// Build the default overlap matcher used for this preset.
-    fn default_matcher(&self) -> AdapterMatcher<'_> {
+    fn default_matcher(self) -> AdapterMatcher<'static> {
         AdapterMatcher {
             adapters: self.adapters(),
             min_overlap: 8,

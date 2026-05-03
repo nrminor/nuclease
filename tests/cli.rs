@@ -53,6 +53,68 @@ fn local_single_fastq_streams_cleaned_reads_and_writes_summary() {
 }
 
 #[test]
+fn adapter_preset_defaults_to_illumina_truseq() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    fs::write(&input, b"@read1\nACGTAGATCGGAAG\n+\nIIIIIIIIIIIIII\n")
+        .expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in1",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"@read1\nACGT\n+\nIIII\n");
+}
+
+#[test]
+fn adapter_preset_none_skips_adapter_trimming() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    let fixture = b"@read1\nACGTAGATCGGAAG\n+\nIIIIIIIIIIIIII\n";
+    fs::write(&input, fixture).expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in1",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--adapter-preset",
+            "none",
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, fixture);
+}
+
+#[test]
 fn warn_drop_invalid_fastq_drops_bad_record_and_keeps_streaming() {
     let temp = tempdir().expect("tempdir should be created");
     let input = temp.path().join("reads.fastq");

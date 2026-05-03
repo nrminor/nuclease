@@ -18,6 +18,7 @@ use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
+    adapter::AdapterPreset,
     ena::{Accession, EnaClient, FastqUrlsByLayout},
     output::{OutputArgs, OutputEncoding, OutputFormat},
     progress::ProgressMode,
@@ -156,6 +157,16 @@ pub struct Cli {
         help = "3' quality trimming cutoff in Phred units"
     )]
     pub trim_min_q: u8,
+
+    /// Adapter trimming preset to apply.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = AdapterPreset::IlluminaTruSeq,
+        help_heading = "Preprocessing",
+        help = "Adapter trimming preset to apply"
+    )]
+    pub adapter_preset: AdapterPreset,
 
     /// How to handle FASTQ records whose sequence and quality lengths do not match.
     #[arg(
@@ -429,6 +440,7 @@ mod tests {
 
     use super::{Cli, Ingress, InvalidFastqPolicy, UiPolicy};
     use crate::{
+        adapter::AdapterPreset,
         ena::Accession,
         output::{OutputEncoding, OutputFormat},
         progress::ProgressMode,
@@ -444,6 +456,7 @@ mod tests {
             min_mean_q: 20.0,
             min_entropy: 0.0,
             trim_min_q: 20,
+            adapter_preset: AdapterPreset::IlluminaTruSeq,
             invalid_fastq_policy: InvalidFastqPolicy::Error,
             interleaved: false,
             output_format: OutputFormat::Fastq,
@@ -476,6 +489,7 @@ mod tests {
             min_mean_q: 20.0,
             trim_min_q: 20,
             min_entropy: 0.0,
+            adapter_preset: AdapterPreset::IlluminaTruSeq,
             invalid_fastq_policy: InvalidFastqPolicy::Error,
             interleaved: false,
             output_format: OutputFormat::Fastq,
@@ -506,6 +520,7 @@ mod tests {
             min_mean_q: 20.0,
             trim_min_q: 20,
             min_entropy: 0.0,
+            adapter_preset: AdapterPreset::IlluminaTruSeq,
             invalid_fastq_policy: InvalidFastqPolicy::Error,
             interleaved: true,
             output_format: OutputFormat::Fastq,
