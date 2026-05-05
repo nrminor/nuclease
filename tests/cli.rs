@@ -115,10 +115,9 @@ fn adapter_preset_none_skips_adapter_trimming() {
 }
 
 #[test]
-fn warn_drop_invalid_fastq_drops_bad_record_and_keeps_streaming() {
+fn warn_drop_invalid_fastq_policy_does_not_recover_parser_error() {
     let temp = tempdir().expect("tempdir should be created");
     let input = temp.path().join("reads.fastq");
-    let summary = temp.path().join("summary.json");
     fs::write(
         &input,
         b"@good1\nACGT\n+\nIIII\n@bad\nAAAA\n+\nI\n@good2\nTGCA\n+\nJJJJ\n",
@@ -137,57 +136,41 @@ fn warn_drop_invalid_fastq_drops_bad_record_and_keeps_streaming() {
             "0",
             "--invalid-fastq-policy",
             "warn-drop",
-            "--summary",
-            summary.to_str().expect("summary path should be UTF-8"),
+            "-qqq",
         ])
         .output()
         .expect("nuclease should run");
 
-    assert!(
-        output.status.success(),
-        "nuclease failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        output.stdout,
-        b"@good1\nACGT\n+\nIIII\n@good2\nTGCA\n+\nJJJJ\n"
-    );
-
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("dropping invalid FASTQ record"),
-        "stderr did not include invalid-record warning: {stderr}"
+        !output.status.success(),
+        "parser-level FASTQ errors should remain fatal under warn-drop"
     );
     assert!(
-        stderr.contains("bad"),
-        "stderr did not include invalid record header: {stderr}"
+        stderr.contains("FASTQ parser rejected malformed input"),
+        "stderr did not include controlled parser diagnostic: {stderr}"
     );
-
-    let summary_json = fs::read_to_string(summary).expect("summary should be readable");
-    let summary: Value = serde_json::from_str(&summary_json).expect("summary should be JSON");
-    assert_eq!(summary["reads_seen"], 3);
-    assert_eq!(summary["reads_emitted"], 2);
-    assert_eq!(summary["invalid_reads"], 1);
-    assert_eq!(
-        summary["invalid_fastq_samples"][0]["kind"],
-        "sequence_quality_length_mismatch"
+    assert!(
+        stderr.contains("invalid_fastq_policy=warn_drop"),
+        "stderr did not include active invalid FASTQ policy: {stderr}"
     );
-    assert_eq!(summary["invalid_fastq_samples"][0]["header"], "bad");
-    assert_eq!(summary["invalid_fastq_samples"][0]["sequence_len"], 4);
-    assert_eq!(summary["invalid_fastq_samples"][0]["quality_len"], 1);
-    assert_eq!(summary["invalid_fastq_samples_truncated"], false);
+    assert!(
+        stderr.contains("parser_error_kind=UnequalLengths"),
+        "stderr did not include needletail error kind: {stderr}"
+    );
+    assert!(
+        !stderr.contains("The application panicked"),
+        "parser-level error should not surface as a panic: {stderr}"
+    );
 }
 
 #[test]
-fn invalid_fastq_report_writes_every_invalid_event_as_jsonl() {
+fn invalid_fastq_report_writes_fatal_parser_error_as_jsonl() {
     let temp = tempdir().expect("tempdir should be created");
     let input = temp.path().join("reads.fastq");
     let report = temp.path().join("invalid-fastq.jsonl");
-    fs::write(
-        &input,
-        b"@bad1\nAAAA\n+\nI\n@good\nTGCA\n+\nJJJJ\n@bad2\nCCCC\n+\nJJ\n",
-    )
-    .expect("fixture FASTQ should be writable");
+    fs::write(&input, b"@bad1\nAAAA\n+\nI\n@good\nTGCA\n+\nJJJJ\n")
+        .expect("fixture FASTQ should be writable");
 
     let output = nuclease()
         .args([
@@ -209,23 +192,31 @@ fn invalid_fastq_report_writes_every_invalid_event_as_jsonl() {
         .expect("nuclease should run");
 
     assert!(
-        output.status.success(),
-        "nuclease failed: {}",
+        !output.status.success(),
+        "parser-level FASTQ errors should be fatal: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stdout, b"@good\nTGCA\n+\nJJJJ\n");
 
     let report = fs::read_to_string(report).expect("invalid FASTQ report should be readable");
     let events = report
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("event should be JSON"))
         .collect::<Vec<_>>();
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0]["header"], "bad1");
-    assert_eq!(events[0]["sequence_len"], 4);
-    assert_eq!(events[0]["quality_len"], 1);
-    assert_eq!(events[1]["header"], "bad2");
-    assert_eq!(events[1]["quality_len"], 2);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["kind"], "fastq_parse_error");
+    assert_eq!(events[0]["mate"], "single");
+    assert_eq!(events[0]["policy"], "silent_drop");
+    assert_eq!(events[0]["recoverable"], false);
+    assert_eq!(events[0]["fatal"], true);
+    assert_eq!(events[0]["parser_error_kind"], "UnequalLengths");
+    assert_eq!(events[0]["parser_error_line"], 1);
+    assert!(
+        events[0]["parser_error_message"]
+            .as_str()
+            .is_some_and(|message| message.contains("quality length is 1")),
+        "event did not preserve parser error message: {:?}",
+        events[0]
+    );
 }
 
 #[test]
@@ -282,7 +273,7 @@ fn malformed_fastq_does_not_surface_raw_parser_slice_panic() {
         "raw parser panic banner leaked to stderr: {stderr}"
     );
     assert!(
-        output.status.success() || stderr.contains("FASTQ parser failed"),
+        output.status.success() || stderr.contains("FASTQ parser rejected malformed input"),
         "malformed input should either warn/drop successfully or fail with controlled parser diagnostics: {stderr}"
     );
 }

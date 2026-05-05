@@ -1,6 +1,7 @@
 //! Command-line interface and ingress selection types.
 
 use std::{
+    fmt,
     fs::File,
     io::{self, IsTerminal, Read},
     path::PathBuf,
@@ -74,15 +75,30 @@ pub(crate) struct UiPolicy {
     pub progress_mode: ProgressMode,
 }
 
-/// Policy for handling malformed FASTQ records whose sequence and quality lengths disagree.
+/// Policy for handling invalid FASTQ input.
+///
+/// Some invalid FASTQ events are recoverable because `nuclease` still has a safe record or pair
+/// boundary. Parser-level or stream-level corruption is still managed by this policy for reporting
+/// and diagnostics, but remains fatal when the stream cannot be safely resynchronized.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum InvalidFastqPolicy {
-    /// Fail immediately when an invalid FASTQ record is observed.
+    /// Fail immediately when invalid FASTQ input is observed.
     Error,
-    /// Warn and drop invalid FASTQ records.
+    /// Warn and drop invalid FASTQ records or pairs when recovery is safe.
     WarnDrop,
-    /// Drop invalid FASTQ records without warning.
+    /// Drop invalid FASTQ records or pairs without warning when recovery is safe.
     SilentDrop,
+}
+
+impl fmt::Display for InvalidFastqPolicy {
+    /// Format the policy as its stable machine-readable token.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Error => "error",
+            Self::WarnDrop => "warn_drop",
+            Self::SilentDrop => "silent_drop",
+        })
+    }
 }
 
 /// Top-level CLI arguments for `nuclease`.
@@ -168,13 +184,13 @@ pub struct Cli {
     )]
     pub adapter_preset: AdapterPreset,
 
-    /// How to handle FASTQ records whose sequence and quality lengths do not match.
+    /// How to handle invalid FASTQ input.
     #[arg(
         long,
         value_enum,
         default_value_t = InvalidFastqPolicy::Error,
         help_heading = "Preprocessing",
-        help = "How to handle invalid FASTQ records with mismatched sequence and quality lengths"
+        help = "How to handle invalid FASTQ input; unrecoverable parser or stream errors are reported and remain fatal"
     )]
     pub invalid_fastq_policy: InvalidFastqPolicy,
 

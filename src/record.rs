@@ -38,6 +38,18 @@ pub struct InvalidFastqEvent {
     pub reads_seen: u64,
     /// Total pairs observed when the event was detected, if paired input is active.
     pub pairs_seen: Option<u64>,
+    /// Invalid FASTQ handling policy active when the event was observed.
+    pub policy: String,
+    /// Whether the event occurred at a known safe record or pair boundary.
+    pub recoverable: bool,
+    /// Whether the event forces this run to stop.
+    pub fatal: bool,
+    /// Parser-specific error kind for fatal parser-level FASTQ failures.
+    pub parser_error_kind: Option<String>,
+    /// Parser-specific error message for fatal parser-level FASTQ failures.
+    pub parser_error_message: Option<String>,
+    /// Parser-reported line number for fatal parser-level FASTQ failures.
+    pub parser_error_line: Option<u64>,
 }
 
 /// Newline-delimited JSON writer for invalid FASTQ events.
@@ -69,6 +81,7 @@ impl InvalidFastqReport {
 pub(crate) struct InvalidFastqContext {
     reads_seen: u64,
     pairs_seen: Option<u64>,
+    policy: InvalidFastqPolicy,
 }
 
 impl InvalidFastqContext {
@@ -86,6 +99,12 @@ impl InvalidFastqContext {
             right_header: None,
             reads_seen: self.reads_seen,
             pairs_seen: self.pairs_seen,
+            policy: self.policy.to_string(),
+            recoverable: true,
+            fatal: self.policy == InvalidFastqPolicy::Error,
+            parser_error_kind: None,
+            parser_error_message: None,
+            parser_error_line: None,
         }
     }
 
@@ -107,6 +126,42 @@ impl InvalidFastqContext {
             right_header: Some(String::from_utf8_lossy(right.header()).into_owned()),
             reads_seen: self.reads_seen,
             pairs_seen: self.pairs_seen,
+            policy: self.policy.to_string(),
+            recoverable: true,
+            fatal: self.policy == InvalidFastqPolicy::Error,
+            parser_error_kind: None,
+            parser_error_message: None,
+            parser_error_line: None,
+        }
+    }
+
+    pub(crate) fn parse_error(
+        self,
+        source: &str,
+        mate: &'static str,
+        parser_error_kind: String,
+        parser_error_message: String,
+        parser_error_line: Option<u64>,
+    ) -> InvalidFastqEvent {
+        InvalidFastqEvent {
+            kind: "fastq_parse_error",
+            source: source.to_owned(),
+            mate: Some(mate),
+            header: None,
+            sequence_len: None,
+            quality_len: None,
+            left_mate: None,
+            right_mate: None,
+            left_header: None,
+            right_header: None,
+            reads_seen: self.reads_seen,
+            pairs_seen: self.pairs_seen,
+            policy: self.policy.to_string(),
+            recoverable: false,
+            fatal: true,
+            parser_error_kind: Some(parser_error_kind),
+            parser_error_message: Some(parser_error_message),
+            parser_error_line,
         }
     }
 }
@@ -247,7 +302,7 @@ impl<'a> RecordView<'a> {
             return Ok(Some(self));
         }
 
-        stats.record_invalid_read(|context| context.length_mismatch(self))?;
+        stats.record_invalid_read(policy, |context| context.length_mismatch(self))?;
 
         match policy {
             InvalidFastqPolicy::Error => bail!(
@@ -284,7 +339,7 @@ impl<'a> RecordView<'a> {
         if left.pair_key() == right.pair_key() {
             Ok(Some(RecordPair { left, right }))
         } else {
-            stats.record_invalid_pair_with_event(|context| {
+            stats.record_invalid_pair_with_event(policy, |context| {
                 context.paired_header_mismatch(left, right)
             })?;
             match policy {
@@ -445,10 +500,22 @@ impl ReadStats {
     /// Increment the invalid-record counter for one malformed FASTQ record.
     pub fn record_invalid_read(
         &mut self,
+        policy: InvalidFastqPolicy,
         build: impl FnOnce(InvalidFastqContext) -> InvalidFastqEvent,
     ) -> Result<()> {
         self.invalid_reads += 1;
-        let context = self.invalid_fastq_context();
+        let context = self.invalid_fastq_context(policy);
+        self.record_invalid_fastq_sample(build(context))
+    }
+
+    /// Increment the invalid-record counter for one fatal parser-level FASTQ error.
+    pub fn record_invalid_parse_error(
+        &mut self,
+        policy: InvalidFastqPolicy,
+        build: impl FnOnce(InvalidFastqContext) -> InvalidFastqEvent,
+    ) -> Result<()> {
+        self.invalid_reads += 1;
+        let context = self.invalid_fastq_context(policy);
         self.record_invalid_fastq_sample(build(context))
     }
 
@@ -460,10 +527,11 @@ impl ReadStats {
     /// Increment the invalid-pair counter and remember a representative event.
     pub fn record_invalid_pair_with_event(
         &mut self,
+        policy: InvalidFastqPolicy,
         build: impl FnOnce(InvalidFastqContext) -> InvalidFastqEvent,
     ) -> Result<()> {
         self.invalid_pairs += 1;
-        let context = self.invalid_fastq_context();
+        let context = self.invalid_fastq_context(policy);
         self.record_invalid_fastq_sample(build(context))
     }
 
@@ -491,10 +559,11 @@ impl ReadStats {
         Ok(())
     }
 
-    fn invalid_fastq_context(&self) -> InvalidFastqContext {
+    fn invalid_fastq_context(&self, policy: InvalidFastqPolicy) -> InvalidFastqContext {
         InvalidFastqContext {
             reads_seen: self.reads_seen,
             pairs_seen: (self.pairs_seen > 0).then_some(self.pairs_seen),
+            policy,
         }
     }
 

@@ -8,14 +8,11 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
-use helicase::{
-    Config, FastqParser, HelicaseParser, ParserOptions,
-    input::{FromReader, InputData},
-};
+use needletail::{errors::ParseError, parse_fastx_reader, parser::SequenceRecord};
 
 use crate::{
     adapter::TrimAdaptersTransform,
-    cli::{Cli, IngressHandle},
+    cli::{Cli, IngressHandle, InvalidFastqPolicy},
     filter::{MaxNsFilter, MinEntropyFilter, MinLengthFilter, MinMeanQualityFilter},
     output::{PairedOutputHandle, SingleOutputHandle, SingleRecordOutput},
     plan::{BuildPlan, Execute, Logical, OrphanPolicy, Plan, RecordPair, TransformArena},
@@ -24,8 +21,6 @@ use crate::{
     record::{InputSource, InvalidFastqReport, MateSide, ReadStats, RecordProvenance, RecordView},
     report::{self, RunContext, RunLayout},
 };
-
-const FASTQ_CONFIG: Config = ParserOptions::default().compute_quality().config();
 
 /// Run the CLI-selected ingress path to completion.
 ///
@@ -89,26 +84,22 @@ fn run_single(
         .compile();
 
     // build out the mutable state needed to run the application loop
-    let mut parser = FastqParser::<FASTQ_CONFIG, _>::from_reader(reader).wrap_err(
+    let mut parser = parse_fastx_reader(reader).wrap_err(
         "failed to initialize FASTQ parser for single-end input\nhelp: confirm the input is readable FASTQ, optionally gzip-compressed if the parser supports it",
     )?;
     let mut arena = TransformArena::new();
     let mut stats = read_stats(cli)?;
     let mut progress = ProgressReporter::new(ui.progress_mode, cli.progress_every);
     let started_at = Instant::now();
+    let admission = FastqAdmission::new(&summary_context, cli.invalid_fastq_policy);
 
-    while catch_parser_panic(&summary_context.input_label(), "single", &stats, || {
-        parser.next()
-    })?
-    .is_some()
+    while let Some(next_record) =
+        catch_parser_panic(&summary_context.input_label(), "single", &stats, || {
+            parser.next()
+        })?
     {
-        let Some(record) = read_validated_single(
-            &parser,
-            &summary_context,
-            cli.invalid_fastq_policy,
-            &mut stats,
-        )?
-        else {
+        let parsed_record = admission.parse("single", &mut stats, next_record)?;
+        let Some(record) = admission.single(&parsed_record, &mut stats)? else {
             continue;
         };
         arena.reset();
@@ -168,16 +159,17 @@ fn run_paired(
         .min_entropy(cli.min_entropy)
         .orphan_policy(OrphanPolicy::DropPair)
         .compile();
-    let mut parser_r1 = FastqParser::<FASTQ_CONFIG, _>::from_reader(r1).wrap_err(
+    let mut parser_r1 = parse_fastx_reader(r1).wrap_err(
         "failed to initialize FASTQ parser for read 1\nhelp: confirm --in1 is readable FASTQ and has the expected compression",
     )?;
-    let mut parser_r2 = FastqParser::<FASTQ_CONFIG, _>::from_reader(r2).wrap_err(
+    let mut parser_r2 = parse_fastx_reader(r2).wrap_err(
         "failed to initialize FASTQ parser for read 2\nhelp: confirm --in2 is readable FASTQ and has the expected compression",
     )?;
     let mut arena = TransformArena::new();
     let mut stats = read_stats(cli)?;
     let mut progress = ProgressReporter::new(ui.progress_mode, cli.progress_every);
     let started_at = Instant::now();
+    let admission = FastqAdmission::new(&summary_context, cli.invalid_fastq_policy);
 
     loop {
         let next_r1 = catch_parser_panic(&summary_context.input_label(), "left", &stats, || {
@@ -188,15 +180,10 @@ fn run_paired(
         })?;
 
         match (next_r1, next_r2) {
-            (Some(_), Some(_)) => {
-                let Some(pair) = read_validated_pair(
-                    &parser_r1,
-                    &parser_r2,
-                    &summary_context,
-                    cli.invalid_fastq_policy,
-                    &mut stats,
-                )?
-                else {
+            (Some(record_r1), Some(record_r2)) => {
+                let parsed_r1 = admission.parse("left", &mut stats, record_r1)?;
+                let parsed_r2 = admission.parse("right", &mut stats, record_r2)?;
+                let Some(pair) = admission.pair(&parsed_r1, &parsed_r2, &mut stats)? else {
                     continue;
                 };
 
@@ -240,60 +227,118 @@ fn run_paired(
     Ok(())
 }
 
-fn read_validated_single<'a, 'p, R>(
-    parser: &'a FastqParser<'p, FASTQ_CONFIG, R>,
-    summary_context: &'a RunContext,
-    policy: crate::cli::InvalidFastqPolicy,
-    stats: &mut ReadStats,
-) -> Result<Option<RecordView<'a>>>
-where
-    R: InputData<'p>,
-{
-    let source = summary_context.input_label();
-    let sequence = catch_parser_panic(&source, "single", stats, || parser.get_dna_string())?;
-    let quality = catch_parser_panic(&source, "single", stats, || parser.get_quality())?
-        .ok_or_else(|| missing_quality_error(&source, "single", stats))?;
-    let header = catch_parser_panic(&source, "single", stats, || parser.get_header())?;
-    let provenance = single_provenance(summary_context);
-    let unvalidated_record = RecordView::new(header, sequence, quality).with_provenance(provenance);
-
-    stats.record_seen(sequence.len());
-
-    unvalidated_record.validate(policy, stats)
+struct FastqAdmission<'context> {
+    context: &'context RunContext,
+    policy: InvalidFastqPolicy,
 }
 
-fn read_validated_pair<'a, 'p, R1, R2>(
-    parser_r1: &'a FastqParser<'p, FASTQ_CONFIG, R1>,
-    parser_r2: &'a FastqParser<'p, FASTQ_CONFIG, R2>,
-    summary_context: &'a RunContext,
-    policy: crate::cli::InvalidFastqPolicy,
-    stats: &mut ReadStats,
-) -> Result<Option<RecordPair<'a>>>
-where
-    R1: InputData<'p>,
-    R2: InputData<'p>,
-{
-    let source = summary_context.input_label();
-    let sequence_r1 = catch_parser_panic(&source, "left", stats, || parser_r1.get_dna_string())?;
-    let sequence_r2 = catch_parser_panic(&source, "right", stats, || parser_r2.get_dna_string())?;
-    let quality_r1 = catch_parser_panic(&source, "left", stats, || parser_r1.get_quality())?
-        .ok_or_else(|| missing_quality_error(&source, "left", stats))?;
-    let quality_r2 = catch_parser_panic(&source, "right", stats, || parser_r2.get_quality())?
-        .ok_or_else(|| missing_quality_error(&source, "right", stats))?;
-    let left_provenance = paired_provenance(summary_context, MateSide::Left);
-    let right_provenance = paired_provenance(summary_context, MateSide::Right);
-    let header_r1 = catch_parser_panic(&source, "left", stats, || parser_r1.get_header())?;
-    let header_r2 = catch_parser_panic(&source, "right", stats, || parser_r2.get_header())?;
-    let unvalidated_r1 =
-        RecordView::new(header_r1, sequence_r1, quality_r1).with_provenance(left_provenance);
-    let unvalidated_r2 =
-        RecordView::new(header_r2, sequence_r2, quality_r2).with_provenance(right_provenance);
+impl<'context> FastqAdmission<'context> {
+    fn new(context: &'context RunContext, policy: InvalidFastqPolicy) -> Self {
+        Self { context, policy }
+    }
 
-    stats.record_seen(sequence_r1.len());
-    stats.record_seen(sequence_r2.len());
-    stats.pairs_seen += 1;
+    fn parse<'record>(
+        &self,
+        mate: &'static str,
+        stats: &mut ReadStats,
+        next_record: Result<SequenceRecord<'record>, ParseError>,
+    ) -> Result<SequenceRecord<'record>> {
+        match next_record {
+            Ok(record) => Ok(record),
+            Err(error) => self.parser_error(mate, stats, &error),
+        }
+    }
 
-    unvalidated_r1.validate_pair(unvalidated_r2, policy, stats)
+    fn single<'record>(
+        &'record self,
+        parsed_record: &'record SequenceRecord<'_>,
+        stats: &mut ReadStats,
+    ) -> Result<Option<RecordView<'record>>> {
+        let source = self.context.input_label();
+        let sequence = parsed_record.raw_seq();
+        let quality = parsed_record
+            .qual()
+            .ok_or_else(|| missing_quality_error(&source, "single", stats))?;
+        let record = RecordView::new(parsed_record.id(), sequence, quality)
+            .with_provenance(single_provenance(self.context));
+
+        stats.record_seen(sequence.len());
+
+        record.validate(self.policy, stats)
+    }
+
+    fn pair<'record>(
+        &'record self,
+        parsed_r1: &'record SequenceRecord<'_>,
+        parsed_r2: &'record SequenceRecord<'_>,
+        stats: &mut ReadStats,
+    ) -> Result<Option<RecordPair<'record>>> {
+        let source = self.context.input_label();
+        let sequence_r1 = parsed_r1.raw_seq();
+        let sequence_r2 = parsed_r2.raw_seq();
+        let quality_r1 = parsed_r1
+            .qual()
+            .ok_or_else(|| missing_quality_error(&source, "left", stats))?;
+        let quality_r2 = parsed_r2
+            .qual()
+            .ok_or_else(|| missing_quality_error(&source, "right", stats))?;
+        let left = RecordView::new(parsed_r1.id(), sequence_r1, quality_r1)
+            .with_provenance(paired_provenance(self.context, MateSide::Left));
+        let right = RecordView::new(parsed_r2.id(), sequence_r2, quality_r2)
+            .with_provenance(paired_provenance(self.context, MateSide::Right));
+
+        stats.record_seen(sequence_r1.len());
+        stats.record_seen(sequence_r2.len());
+        stats.pairs_seen += 1;
+
+        left.validate_pair(right, self.policy, stats)
+    }
+
+    fn parser_error<T>(
+        &self,
+        mate: &'static str,
+        stats: &mut ReadStats,
+        error: &ParseError,
+    ) -> Result<T> {
+        let source = self.context.input_label();
+        let parser_error_kind = format!("{:?}", error.kind);
+        let parser_error_message = error.to_string();
+        let parser_error_line = (error.position.line > 0).then_some(error.position.line);
+
+        stats.record_invalid_parse_error(self.policy, |context| {
+            context.parse_error(
+                &source,
+                mate,
+                parser_error_kind.clone(),
+                parser_error_message.clone(),
+                parser_error_line,
+            )
+        })?;
+
+        if self.policy == InvalidFastqPolicy::WarnDrop {
+            tracing::warn!(
+                source,
+                mate,
+                parser_error_kind,
+                parser_error = parser_error_message,
+                "invalid FASTQ parser error is unrecoverable; stopping instead of dropping and continuing"
+            );
+        }
+
+        bail!(
+            "FASTQ parser rejected malformed input while reading source={source} mate={mate}\n\
+             invalid_fastq_policy={}\n\
+             reads_seen={} pairs_seen={} invalid_reads={} invalid_pairs={}\n\
+             parser_error={parser_error_message}\n\
+             parser_error_kind={parser_error_kind}\n\
+             help: malformed FASTQ parse errors are not currently recoverable; check input integrity and retry ENA-backed reads if the stream may have been interrupted",
+            self.policy,
+            stats.reads_seen,
+            stats.pairs_seen,
+            stats.invalid_reads,
+            stats.invalid_pairs,
+        )
+    }
 }
 
 fn catch_parser_panic<T>(
@@ -449,7 +494,7 @@ mod tests {
     use std::{fs::File, io::Cursor, path::Path};
 
     use color_eyre::{Result, eyre::bail};
-    use helicase::{Config, FastqParser, HelicaseParser, ParserOptions, input::FromReader};
+    use needletail::parse_fastx_reader;
     use tempfile::tempdir;
 
     use crate::{
@@ -464,8 +509,6 @@ mod tests {
     };
 
     use super::run_paired;
-
-    const TEST_FASTQ_CONFIG: Config = ParserOptions::default().compute_quality().config();
 
     fn single_output_for_vec(format: OutputFormat) -> SingleOutput<StreamSink<Vec<u8>>> {
         SingleOutput::new(StreamSink::new(Vec::new(), format))
@@ -511,13 +554,14 @@ mod tests {
         let reader = File::open(&input)?;
         let output = single_output_for_vec(OutputFormat::Fastq);
         let mut output = output;
-        let mut parser = FastqParser::<TEST_FASTQ_CONFIG, _>::from_reader(reader)?;
-        while parser.next().is_some() {
+        let mut parser = parse_fastx_reader(reader)?;
+        while let Some(parsed_record) = parser.next() {
+            let parsed_record = parsed_record?;
             let record = RecordView::new(
-                parser.get_header(),
-                parser.get_dna_string(),
-                parser
-                    .get_quality()
+                parsed_record.id(),
+                parsed_record.raw_seq(),
+                parsed_record
+                    .qual()
                     .expect("FASTQ parser must provide quality scores"),
             );
             output.write_record(record)?;
@@ -547,13 +591,14 @@ mod tests {
         let reader = File::open(&input)?;
         let output = single_output_for_vec(OutputFormat::Fastq);
         let mut output = output;
-        let mut parser = FastqParser::<TEST_FASTQ_CONFIG, _>::from_reader(reader)?;
-        while parser.next().is_some() {
+        let mut parser = parse_fastx_reader(reader)?;
+        while let Some(parsed_record) = parser.next() {
+            let parsed_record = parsed_record?;
             let record = RecordView::new(
-                parser.get_header(),
-                parser.get_dna_string(),
-                parser
-                    .get_quality()
+                parsed_record.id(),
+                parsed_record.raw_seq(),
+                parsed_record
+                    .qual()
                     .expect("FASTQ parser must provide quality scores"),
             );
             output.write_record(record)?;
@@ -575,13 +620,14 @@ mod tests {
         let reader = File::open(&input)?;
         let output = single_output_for_vec(OutputFormat::Fasta);
         let mut output = output;
-        let mut parser = FastqParser::<TEST_FASTQ_CONFIG, _>::from_reader(reader)?;
-        while parser.next().is_some() {
+        let mut parser = parse_fastx_reader(reader)?;
+        while let Some(parsed_record) = parser.next() {
+            let parsed_record = parsed_record?;
             let record = RecordView::new(
-                parser.get_header(),
-                parser.get_dna_string(),
-                parser
-                    .get_quality()
+                parsed_record.id(),
+                parsed_record.raw_seq(),
+                parsed_record
+                    .qual()
                     .expect("FASTQ parser must provide quality scores"),
             );
             output.write_record(record)?;
@@ -600,26 +646,30 @@ mod tests {
         let r2 = Cursor::new(b"@r1/2\nTTTT\n+\nKKKK\n@r2/2\nGGGG\n+\nLLLL\n".as_slice());
         let output = interleaved_output_for_vec(OutputFormat::Fastq);
         let mut output = output;
-        let mut parser_r1 = FastqParser::<TEST_FASTQ_CONFIG, _>::from_reader(r1)?;
-        let mut parser_r2 = FastqParser::<TEST_FASTQ_CONFIG, _>::from_reader(r2)?;
+        let mut parser_r1 = parse_fastx_reader(r1)?;
+        let mut parser_r2 = parse_fastx_reader(r2)?;
         loop {
             match (parser_r1.next(), parser_r2.next()) {
-                (Some(_), Some(_)) => output.write_pair(
-                    RecordView::new(
-                        parser_r1.get_header(),
-                        parser_r1.get_dna_string(),
-                        parser_r1
-                            .get_quality()
-                            .expect("FASTQ parser must provide quality scores"),
-                    ),
-                    RecordView::new(
-                        parser_r2.get_header(),
-                        parser_r2.get_dna_string(),
-                        parser_r2
-                            .get_quality()
-                            .expect("FASTQ parser must provide quality scores"),
-                    ),
-                )?,
+                (Some(parsed_r1), Some(parsed_r2)) => {
+                    let parsed_r1 = parsed_r1?;
+                    let parsed_r2 = parsed_r2?;
+                    output.write_pair(
+                        RecordView::new(
+                            parsed_r1.id(),
+                            parsed_r1.raw_seq(),
+                            parsed_r1
+                                .qual()
+                                .expect("FASTQ parser must provide quality scores"),
+                        ),
+                        RecordView::new(
+                            parsed_r2.id(),
+                            parsed_r2.raw_seq(),
+                            parsed_r2
+                                .qual()
+                                .expect("FASTQ parser must provide quality scores"),
+                        ),
+                    )?;
+                }
                 (None, None) => break,
                 _ => bail!("paired FASTQ inputs have different record counts"),
             }

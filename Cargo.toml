@@ -1,6 +1,6 @@
 [package]
 name = "nuclease"
-version = "0.1.0"
+version = "0.1.1"
 description = "Streaming FASTQ preprocessor with a focus on extensibility"
 authors = ["Nicholas Minor <nrminor@wisc.edu>"]
 edition = "2024"
@@ -23,7 +23,7 @@ color-eyre = "0.6.5"
 bumpalo = "3.17.0"
 bytecount = "0.6.9"
 flate2 = "1.1.5"
-helicase = { git = "https://github.com/nrminor/helicase.git", rev = "8dc4f1bf6d6885fc177fa09261c7ed091946fd44" }
+needletail = "0.7.3"
 reqwest = { version = "0.12.24", default-features = false, features = [
   "blocking",
   "rustls-tls",
