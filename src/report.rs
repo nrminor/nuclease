@@ -5,10 +5,7 @@ use std::{fmt::Write as _, fs::File, io::BufWriter, path::Path, time::Duration};
 use color_eyre::eyre::Result;
 use serde::Serialize;
 
-use crate::{
-    cli::Ingress,
-    record::{InvalidFastqEvent, ReadStats},
-};
+use crate::record::{InvalidFastqEvent, ReadStats};
 
 /// Lightweight run context needed to explain a preprocessing run.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -23,57 +20,6 @@ pub struct RunContext {
     pub input1: Option<String>,
     /// Second local FASTQ path when paired local ingress was used.
     pub input2: Option<String>,
-}
-
-impl RunContext {
-    /// Derive summary context from the selected ingress mode.
-    pub fn from_ingress(ingress: &Ingress) -> Self {
-        match ingress {
-            Ingress::Ena { accession } => Self {
-                ingress_mode: IngressMode::Ena,
-                layout: RunLayout::Single,
-                accession: Some(accession.to_string()),
-                input1: None,
-                input2: None,
-            },
-            Ingress::LocalSingle { fastq } => Self {
-                ingress_mode: IngressMode::Local,
-                layout: RunLayout::Single,
-                accession: None,
-                input1: Some(fastq.display().to_string()),
-                input2: None,
-            },
-            Ingress::LocalPaired { r1, r2 } => Self {
-                ingress_mode: IngressMode::Local,
-                layout: RunLayout::Paired,
-                accession: None,
-                input1: Some(r1.display().to_string()),
-                input2: Some(r2.display().to_string()),
-            },
-        }
-    }
-
-    /// Return a compact user-facing label for the selected input source.
-    pub fn input_label(&self) -> String {
-        match self.ingress_mode {
-            IngressMode::Ena => self.accession.as_ref().map_or_else(
-                || "ena:<unknown>".to_owned(),
-                |accession| format!("ena:{accession}"),
-            ),
-            IngressMode::Local => match (&self.input1, &self.input2) {
-                (Some(input1), Some(input2)) => format!("local-paired:{input1}|{input2}"),
-                (Some(input1), None) => format!("local:{input1}"),
-                _ => "local:<unknown>".to_owned(),
-            },
-        }
-    }
-
-    /// Override the layout once the runtime ingress handle shape is known.
-    #[must_use]
-    pub const fn with_layout(mut self, layout: RunLayout) -> Self {
-        self.layout = layout;
-        self
-    }
 }
 
 /// Ingress origin for a run summary.

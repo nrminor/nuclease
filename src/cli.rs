@@ -2,8 +2,7 @@
 
 use std::{
     fmt,
-    fs::File,
-    io::{self, IsTerminal, Read},
+    io::{self, IsTerminal},
     path::PathBuf,
 };
 
@@ -14,13 +13,13 @@ use clap::{
         styling::{AnsiColor, Effects},
     },
 };
-use color_eyre::eyre::{Result, WrapErr, bail, eyre};
+use color_eyre::eyre::{Result, bail, eyre};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
     adapter::AdapterPreset,
-    ena::{Accession, EnaClient, FastqUrlsByLayout},
+    ena::Accession,
     output::{OutputArgs, OutputEncoding, OutputFormat},
     progress::ProgressMode,
 };
@@ -293,71 +292,6 @@ pub enum Ingress {
     LocalSingle { fastq: PathBuf },
     /// Local paired-end FASTQ ingress.
     LocalPaired { r1: PathBuf, r2: PathBuf },
-}
-
-/// Opened ingress readers ready to feed the parser path.
-pub enum IngressHandle {
-    /// Single-reader ingress.
-    Single(Box<dyn Read + Send>),
-    /// Paired-reader ingress.
-    Paired(Box<dyn Read + Send>, Box<dyn Read + Send>),
-}
-
-impl Ingress {
-    /// Open concrete readers for the selected ingress.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when local files cannot be opened or ENA lookup/opening fails.
-    pub fn open(self) -> Result<IngressHandle> {
-        match self {
-            Self::LocalSingle { fastq } => {
-                let reader = File::open(&fastq).wrap_err_with(|| {
-                    format!(
-                        "failed to open local single-end FASTQ input: {}\n\
-                         help: check that --in1 points to a readable FASTQ file on this machine",
-                        fastq.display()
-                    )
-                })?;
-                Ok(IngressHandle::Single(Box::new(reader)))
-            }
-            Self::LocalPaired { r1, r2 } => Ok(IngressHandle::Paired(
-                Box::new(File::open(&r1).wrap_err_with(|| {
-                    format!(
-                        "failed to open local paired FASTQ input for read 1: {}\n\
-                         help: check that --in1 is readable from the current execution environment",
-                        r1.display()
-                    )
-                })?),
-                Box::new(File::open(&r2).wrap_err_with(|| {
-                    format!(
-                        "failed to open local paired FASTQ input for read 2: {}\n\
-                         help: check that --in2 is readable from the current execution environment",
-                        r2.display()
-                    )
-                })?),
-            )),
-            Self::Ena { accession } => {
-                let client = EnaClient::new()
-                    .wrap_err("failed to construct ENA HTTP client for FASTQ streaming")?;
-                match client.lookup_fastq_urls(&accession).wrap_err_with(|| {
-                    format!(
-                        "failed to resolve ENA FASTQ URLs for accession {accession}\n\
-                         help: confirm this is a run accession with public FASTQ files in ENA"
-                    )
-                })? {
-                    FastqUrlsByLayout::Single(url) => {
-                        let r = client.open_retrying_stream(url);
-                        Ok(IngressHandle::Single(Box::new(r)))
-                    }
-                    FastqUrlsByLayout::Paired(urls) => {
-                        let (r1, r2) = client.open_retrying_paired_streams(urls);
-                        Ok(IngressHandle::Paired(Box::new(r1), Box::new(r2)))
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl Cli {

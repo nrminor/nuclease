@@ -18,7 +18,7 @@ nuclease \
 --min-mean-q 20 \
 --min-entropy 0.7 \
 --trim-min-q 10 \
---adapter-preset illumina_truseq \
+--adapter-preset illumina-truseq \
 --summary summary.json \
 | sourmash sketch dna -p k=31 - -o sample.zip
 ```
@@ -54,6 +54,8 @@ Supported transforms are:
 - 3' quality trimming (`--trim-min-q`): trims low-quality suffixes using the configured Phred cutoff.
 
 For paired-end input, the CLI currently uses the `DropPair` orphan policy: if one mate is rejected, the surviving mate is suppressed rather than emitted. The execution engine also has an internal `EmitOrphan` policy, but orphan emission is not exposed as a supported CLI/output mode yet.
+
+Invalid FASTQ handling is controlled with `--invalid-fastq-policy`. Recoverable invalid records or pairs, such as mate ID mismatches, can fail immediately, warn and drop, or silently drop depending on the selected policy. Parser-level corruption that cannot be safely resynchronized is still reported through the same policy and optional `--invalid-fastq-report` JSONL file, but remains fatal.
 
 ## Contributing to nuclease
 
