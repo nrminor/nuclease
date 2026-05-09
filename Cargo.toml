@@ -1,6 +1,6 @@
 [package]
 name = "nuclease"
-version = "0.1.1"
+version = "0.1.2"
 description = "Streaming FASTQ preprocessor with a focus on extensibility"
 authors = ["Nicholas Minor <nrminor@wisc.edu>"]
 edition = "2024"

@@ -73,6 +73,11 @@ impl InvalidFastqReport {
     fn write_event(&mut self, event: &InvalidFastqEvent) -> Result<()> {
         serde_json::to_writer(&mut self.writer, event)?;
         self.writer.write_all(b"\n")?;
+        if event.fatal {
+            // Fatal parser events explain why the run is about to exit. Flush those diagnostics
+            // before returning the error so failed-job artifacts do not depend on normal teardown.
+            self.writer.flush()?;
+        }
         Ok(())
     }
 }
@@ -590,7 +595,13 @@ impl ReadStats {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputSource, MateSide, ReadStats, RecordProvenance, RecordView};
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{
+        InputSource, InvalidFastqReport, MateSide, ReadStats, RecordProvenance, RecordView,
+    };
     use crate::cli::InvalidFastqPolicy;
 
     #[test]
@@ -650,5 +661,33 @@ mod tests {
                 .mate,
             Some(MateSide::Left)
         );
+    }
+
+    #[test]
+    fn invalid_fastq_report_flushes_fatal_events_before_drop() {
+        let temp = tempdir().expect("tempdir should be created");
+        let path = temp.path().join("invalid-fastq.jsonl");
+        let mut stats = ReadStats::default();
+        stats.set_invalid_fastq_report(
+            InvalidFastqReport::create(&path).expect("invalid FASTQ report should be created"),
+        );
+
+        stats
+            .record_invalid_parse_error(InvalidFastqPolicy::SilentDrop, |context| {
+                context.parse_error(
+                    "ena:SRR000001",
+                    "single",
+                    "UnequalLengths".to_owned(),
+                    "Unequal length: sequence length is 4 while quality length is 1".to_owned(),
+                    Some(1),
+                )
+            })
+            .expect("fatal invalid FASTQ event should be reported");
+
+        let report = fs::read_to_string(path)
+            .expect("fatal invalid FASTQ report should be readable before stats is dropped");
+        assert!(report.contains("\"kind\":\"fastq_parse_error\""));
+        assert!(report.contains("\"fatal\":true"));
+        assert!(report.ends_with('\n'));
     }
 }
