@@ -46,7 +46,7 @@ impl ReadTransform for QualityTrim {
         "quality_trim"
     }
 
-    fn apply<'a>(&self, record: RecordView<'a>, arena: &'a TransformArena) -> TransformResult<'a> {
+    fn apply<'a>(&self, record: RecordView<'a>, _arena: &'a TransformArena) -> TransformResult<'a> {
         assert_eq!(
             record.sequence().len(),
             record.quality().len(),
@@ -65,8 +65,8 @@ impl ReadTransform for QualityTrim {
         TransformResult {
             record: record
                 .with_sequence_and_quality(
-                    arena.alloc_slice_copy(&record.sequence()[..trim_end]),
-                    arena.alloc_slice_copy(&record.quality()[..trim_end]),
+                    &record.sequence()[..trim_end],
+                    &record.quality()[..trim_end],
                 )
                 .expect("quality trimming should preserve equal sequence and quality lengths"),
             applied: true,

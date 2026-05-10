@@ -334,6 +334,238 @@ fn paired_fastq_streams_interleaved_reads_and_writes_summary() {
 }
 
 #[test]
+fn paired_fastq_merge_pairs_emits_merged_record() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input1 = temp.path().join("reads_1.fastq");
+    let input2 = temp.path().join("reads_2.fastq");
+    let summary = temp.path().join("summary.json");
+    fs::write(
+        &input1,
+        b"@read-1/1\nACGTTGCAGTACGATCGTACGGAATTCGCCGATGACTGACCTAGGTCAGTACGATC\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )
+    .expect("read 1 fixture should be writable");
+    fs::write(
+        &input2,
+        b"@read-1/2\nGATCGTACTGACCTAGGTCAGTCATCGGCGAATTCCGTACGATCGTACTGCAACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )
+    .expect("read 2 fixture should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in1",
+            input1.to_str().expect("read 1 path should be UTF-8"),
+            "--in2",
+            input2.to_str().expect("read 2 path should be UTF-8"),
+            "--merge-pairs",
+            "--interleaved",
+            "--adapter-preset",
+            "none",
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "--summary",
+            summary.to_str().expect("summary path should be UTF-8"),
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("FASTQ output should be UTF-8");
+    assert!(
+        stdout.starts_with("@read-1\n"),
+        "merged read should use normalized pair id as header: {stdout}"
+    );
+    assert_eq!(
+        stdout.matches('\n').count(),
+        4,
+        "merged pair should emit one FASTQ record: {stdout}"
+    );
+
+    let summary_json = fs::read_to_string(summary).expect("summary should be readable");
+    let summary: Value = serde_json::from_str(&summary_json).expect("summary should be JSON");
+    assert_eq!(summary["reads_seen"], 2);
+    assert_eq!(summary["reads_emitted"], 1);
+    assert_eq!(summary["pairs_seen"], 1);
+    assert_eq!(summary["pairs_emitted"], 1);
+}
+
+#[test]
+fn paired_fastq_merge_pairs_keeps_unmerged_pair() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input1 = temp.path().join("reads_1.fastq");
+    let input2 = temp.path().join("reads_2.fastq");
+    let summary = temp.path().join("summary.json");
+    fs::write(&input1, b"@read1/1\nAAAAAAAAAAAA\n+\nIIIIIIIIIIII\n")
+        .expect("read 1 fixture should be writable");
+    fs::write(&input2, b"@read1/2\nCCCCCCCCCCCC\n+\nJJJJJJJJJJJJ\n")
+        .expect("read 2 fixture should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in1",
+            input1.to_str().expect("read 1 path should be UTF-8"),
+            "--in2",
+            input2.to_str().expect("read 2 path should be UTF-8"),
+            "--merge-pairs",
+            "--interleaved",
+            "--adapter-preset",
+            "none",
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "--summary",
+            summary.to_str().expect("summary path should be UTF-8"),
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"@read1/1\nAAAAAAAAAAAA\n+\nIIIIIIIIIIII\n@read1/2\nCCCCCCCCCCCC\n+\nJJJJJJJJJJJJ\n"
+    );
+
+    let summary_json = fs::read_to_string(summary).expect("summary should be readable");
+    let summary: Value = serde_json::from_str(&summary_json).expect("summary should be JSON");
+    assert_eq!(summary["reads_seen"], 2);
+    assert_eq!(summary["reads_emitted"], 2);
+    assert_eq!(summary["pairs_seen"], 1);
+    assert_eq!(summary["pairs_emitted"], 1);
+}
+
+#[test]
+fn paired_fastq_merge_min_overlap_can_reject_shorter_overlap() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input1 = temp.path().join("reads_1.fastq");
+    let input2 = temp.path().join("reads_2.fastq");
+    fs::write(
+        &input1,
+        b"@read-1/1\nACGTTGCAGTACGATCGTACGGAATTCGCCGATGACTGACCTAGGTCAGTACGATC\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )
+    .expect("read 1 fixture should be writable");
+    fs::write(
+        &input2,
+        b"@read-1/2\nGATCGTACTGACCTAGGTCAGTCATCGGCGAATTCCGTACGATCGTACTGCAACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )
+    .expect("read 2 fixture should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in1",
+            input1.to_str().expect("read 1 path should be UTF-8"),
+            "--in2",
+            input2.to_str().expect("read 2 path should be UTF-8"),
+            "--merge-pairs",
+            "--merge-min-overlap",
+            "80",
+            "--interleaved",
+            "--adapter-preset",
+            "none",
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        bytecount::count(&output.stdout, b'@'),
+        2,
+        "high merge-min-overlap should preserve the original pair: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn merge_pairs_rejects_single_end_input() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    fs::write(&input, b"@read1\nACGT\n+\nIIII\n").expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in1",
+            input.to_str().expect("input path should be UTF-8"),
+            "--merge-pairs",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        !output.status.success(),
+        "single-end merge-pairs input should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--merge-pairs requires paired-end input"),
+        "stderr did not explain paired-input requirement: {stderr}"
+    );
+}
+
+#[test]
+fn merge_pairs_rejects_split_paired_output() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input1 = temp.path().join("reads_1.fastq");
+    let input2 = temp.path().join("reads_2.fastq");
+    let out1 = temp.path().join("out_1.fastq");
+    let out2 = temp.path().join("out_2.fastq");
+    fs::write(&input1, b"@read1/1\nAAAA\n+\nIIII\n").expect("read 1 fixture should be writable");
+    fs::write(&input2, b"@read1/2\nTTTT\n+\nIIII\n").expect("read 2 fixture should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in1",
+            input1.to_str().expect("read 1 path should be UTF-8"),
+            "--in2",
+            input2.to_str().expect("read 2 path should be UTF-8"),
+            "--merge-pairs",
+            "--out1",
+            out1.to_str().expect("out1 path should be UTF-8"),
+            "--out2",
+            out2.to_str().expect("out2 path should be UTF-8"),
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        !output.status.success(),
+        "split output should fail when merge-pairs is enabled"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--merge-pairs cannot be used with split paired output"),
+        "stderr did not explain merge-pairs output constraint: {stderr}"
+    );
+}
+
+#[test]
 fn paired_fastq_count_mismatch_reports_source_and_progress() {
     let temp = tempdir().expect("tempdir should be created");
     let input1 = temp.path().join("reads_1.fastq");

@@ -39,7 +39,7 @@ This downloads a pre-built binary for your platform when one is available. If no
 
 ## Supported Preprocessing Operations
 
-`nuclease` currently has a small built-in set of filters and transforms. Filters decide whether a read should continue through the stream. Transforms may change the sequence and quality data before later filters are evaluated.
+`nuclease` currently has a small built-in set of filters and transforms. Filters decide whether a read should continue through the stream. Transforms may change the sequence and quality data before later filters are evaluated. Most operations act on one record at a time, but paired-end input can also run pair-aware preprocessing before the ordinary per-record steps.
 
 Supported filters are:
 
@@ -50,10 +50,11 @@ Supported filters are:
 
 Supported transforms are:
 
-- Illumina TruSeq adapter trimming: trims detected 3' adapter overlap using the built-in TruSeq R1/R2 adapter catalog.
+- Paired-read overlap merging (`--merge-pairs`): attempts to merge paired-end reads before per-record trimming and filtering. Merging is powered by [`libpairassembly`](https://github.com/nrminor/pairassembler), and can be tuned with `--merge-min-overlap`, `--merge-max-mismatch-rate`, and `--merge-min-correction-delta-q`.
+- Illumina TruSeq adapter trimming (`--adapter-preset illumina-truseq`): trims detected 3' adapter overlap using the built-in TruSeq R1/R2 adapter catalog. Use `--adapter-preset none` to disable adapter trimming.
 - 3' quality trimming (`--trim-min-q`): trims low-quality suffixes using the configured Phred cutoff.
 
-For paired-end input, the CLI currently uses the `DropPair` orphan policy: if one mate is rejected, the surviving mate is suppressed rather than emitted. The execution engine also has an internal `EmitOrphan` policy, but orphan emission is not exposed as a supported CLI/output mode yet.
+For paired-end input, the CLI currently uses the `DropPair` orphan policy during paired processing: if one mate is rejected, the surviving mate is suppressed rather than emitted. With `--merge-pairs`, successfully merged pairs become single records and continue through the rest of the pipeline as single records. Pairs that cannot be merged continue through paired processing as the original mate pair. Because a merge-enabled run may contain a mix of merged single records and unmerged pairs, `--merge-pairs` requires paired input and single-stream output rather than split `--out1`/`--out2` files. The execution engine also has an internal `EmitOrphan` policy, but orphan emission is not exposed as a supported CLI/output mode yet.
 
 Invalid FASTQ handling is controlled with `--invalid-fastq-policy`. Recoverable invalid records or pairs, such as mate ID mismatches, can fail immediately, warn and drop, or silently drop depending on the selected policy. Parser-level corruption that cannot be safely resynchronized is still reported through the same policy and optional `--invalid-fastq-report` JSONL file, but remains fatal.
 
@@ -290,8 +291,8 @@ In both cases, the following steps are all that's needed to do new things in `nu
 
 If you're guessing I have plans to make use of this extensibility, you'd be right! These plans currently include:
 
-1. Internal integration with [Deacon](https://github.com/bede/deacon) to allow decontamination or enrichment with Deacon indices.
-2. Support for paired-read overlap merging.
-3. Support for memory-frugal sorting of reads by sequence homology to improve compression.
-4. More adapter trimming support.
-5. Read demultiplexing.
+- [ ] Internal integration with [Deacon](https://github.com/bede/deacon) to allow decontamination or enrichment with Deacon indices.
+- [x] Support for paired-read overlap merging.
+- [ ] Support for memory-frugal sorting of reads by sequence homology to improve compression.
+- [ ] More adapter trimming support.
+- [ ] Read demultiplexing.

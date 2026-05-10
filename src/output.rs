@@ -12,7 +12,7 @@ use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use flate2::{Compression, write::GzEncoder};
 
 use crate::{
-    plan::ExecutionOutcome,
+    plan::{EmittedUnit, ExecutionOutcome},
     record::{ReadStats, RecordView, SequenceRecordRef},
 };
 
@@ -25,6 +25,7 @@ pub struct OutputArgs {
     out: Option<PathBuf>,
     out1: Option<PathBuf>,
     out2: Option<PathBuf>,
+    merge_pairs: bool,
 }
 
 impl OutputArgs {
@@ -44,7 +45,14 @@ impl OutputArgs {
             out,
             out1,
             out2,
+            merge_pairs: false,
         }
+    }
+
+    /// Preserve the simple paired-output resolution call while carrying plan cardinality context.
+    pub(crate) fn with_merge_pairs(mut self, merge_pairs: bool) -> Self {
+        self.merge_pairs = merge_pairs;
+        self
     }
 
     fn resolved_single_encoding(&self) -> OutputEncoding {
@@ -81,6 +89,17 @@ impl OutputArgs {
             }
             _ => Ok(OutputEncoding::Plain),
         }
+    }
+
+    fn validate_paired_merge_output(&self) -> Result<()> {
+        if self.merge_pairs && (self.out1.is_some() || self.out2.is_some()) {
+            bail!(
+                "--merge-pairs cannot be used with split paired output yet\n\
+                 help: merged and unmerged reads require one output stream; use --interleaved or --out"
+            );
+        }
+
+        Ok(())
     }
 
     /// Resolve runtime-selected single-end output arguments into an opened output handle.
@@ -154,6 +173,7 @@ impl OutputArgs {
     /// Returns an error when the raw output arguments describe an invalid paired-end output
     /// combination or when the selected sinks cannot be opened.
     pub fn resolve_paired(self) -> Result<PairedOutputHandle> {
+        self.validate_paired_merge_output()?;
         let encoding = self.resolved_paired_encoding()?;
         match (self.interleaved, &self.out, &self.out1, &self.out2) {
             (true, None, Some(_), Some(_)) => {
@@ -824,6 +844,16 @@ pub trait SingleRecordOutput {
     fn write_record(&mut self, record: RecordView<'_>) -> Result<()>;
 }
 
+/// Trait for outputs that can consume a full plan execution outcome.
+pub(crate) trait UnitOutput {
+    /// Write the emitted records in one outcome and update output counters.
+    fn write_outcome(
+        &mut self,
+        outcome: &ExecutionOutcome<'_>,
+        stats: &mut ReadStats,
+    ) -> Result<()>;
+}
+
 impl<S> SingleRecordOutput for SingleOutput<S>
 where
     S: for<'a> RecordSink<RecordView<'a>>,
@@ -953,6 +983,20 @@ impl SingleRecordOutput for SingleOutputHandle {
     }
 }
 
+impl UnitOutput for SingleOutputHandle {
+    fn write_outcome(
+        &mut self,
+        outcome: &ExecutionOutcome<'_>,
+        stats: &mut ReadStats,
+    ) -> Result<()> {
+        for record in outcome.emitted() {
+            self.write_record(record)?;
+            stats.record_emitted(record.sequence().len());
+        }
+        Ok(())
+    }
+}
+
 /// Opened interleaved paired-output handle hidden behind [`PairedOutputHandle`].
 pub(crate) struct InterleavedOutputHandle {
     inner: InterleavedPairedOutput,
@@ -994,27 +1038,41 @@ impl PairedOutputHandle {
             Self::Split(output) => output.finish(),
         }
     }
+}
 
-    /// Emit a fully surviving paired execution outcome and update paired emission counters.
-    pub fn write_pair_outcome(
+impl UnitOutput for PairedOutputHandle {
+    fn write_outcome(
         &mut self,
         outcome: &ExecutionOutcome<'_>,
         stats: &mut ReadStats,
     ) -> Result<()> {
-        let left = outcome
-            .left_emitted()
-            .expect("fully emitted paired outcome must have a left record");
-        let right = outcome
-            .right_emitted()
-            .expect("fully emitted paired outcome must have a right record");
-        self.write_pair(left, right)?;
-
-        // record out states
-        stats.record_emitted(left.sequence().len());
-        stats.record_emitted(right.sequence().len());
-        stats.record_pair_emitted();
-
-        Ok(())
+        match outcome.emitted_unit() {
+            EmittedUnit::None => {
+                if outcome.rejection_count() > 0 {
+                    stats.record_pair_rejected();
+                }
+                Ok(())
+            }
+            EmittedUnit::Single(record) => match self {
+                Self::Interleaved(output) => {
+                    output.inner.sink.write_record(record)?;
+                    stats.record_emitted(record.sequence().len());
+                    stats.record_pair_emitted();
+                    Ok(())
+                }
+                Self::Split(_) => bail!(
+                    "split paired output cannot represent a merged single read\n\
+                     help: use --interleaved or --out when --merge-pairs is enabled"
+                ),
+            },
+            EmittedUnit::Pair(pair) => {
+                self.write_pair(pair.left, pair.right)?;
+                stats.record_emitted(pair.left.sequence().len());
+                stats.record_emitted(pair.right.sequence().len());
+                stats.record_pair_emitted();
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1261,6 +1319,28 @@ mod tests {
             error
                 .to_string()
                 .contains("paired output paths imply different encodings")
+        );
+    }
+
+    #[test]
+    fn paired_output_rejects_split_output_when_merge_pairs_is_enabled() {
+        let output = OutputArgs::new(
+            false,
+            OutputFormat::Fastq,
+            Some(OutputEncoding::Plain),
+            None,
+            Some(PathBuf::from("r1.fastq")),
+            Some(PathBuf::from("r2.fastq")),
+        )
+        .with_merge_pairs(true);
+
+        let Err(error) = output.resolve_paired() else {
+            panic!("split paired output cannot represent merged single reads");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("--merge-pairs cannot be used with split paired output")
         );
     }
 }

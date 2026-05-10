@@ -17,7 +17,8 @@ use crate::{
     cli::{Cli, Ingress, InvalidFastqPolicy, UiPolicy},
     ena::{Accession, EnaClient, FastqUrlsByLayout},
     filter::{MaxNsFilter, MinEntropyFilter, MinLengthFilter, MinMeanQualityFilter},
-    output::{OutputArgs, PairedOutputHandle, SingleOutputHandle, SingleRecordOutput},
+    output::{OutputArgs, PairedOutputHandle, SingleOutputHandle, UnitOutput},
+    pair_merge::MergePairsTransform,
     plan::{
         BuildPlan, Execute, Execution, Logical, OrphanPolicy, Plan, RecordPair, TransformArena,
     },
@@ -169,6 +170,10 @@ struct RunConfig {
     min_entropy: f64,
     trim_min_q: u8,
     adapter_preset: AdapterPreset,
+    merge_pairs: bool,
+    merge_min_overlap: usize,
+    merge_max_mismatch_rate: f32,
+    merge_min_correction_delta_q: u8,
     invalid_fastq_policy: InvalidFastqPolicy,
     progress_every: u64,
     summary: Option<PathBuf>,
@@ -184,11 +189,56 @@ impl From<&Cli> for RunConfig {
             min_entropy: cli.min_entropy,
             trim_min_q: cli.trim_min_q,
             adapter_preset: cli.adapter_preset,
+            merge_pairs: cli.merge_pairs,
+            merge_min_overlap: cli.merge_min_overlap,
+            merge_max_mismatch_rate: cli.merge_max_mismatch_rate,
+            merge_min_correction_delta_q: cli.merge_min_correction_delta_q,
             invalid_fastq_policy: cli.invalid_fastq_policy,
             progress_every: cli.progress_every,
             summary: cli.summary.clone(),
             invalid_fastq_report: cli.invalid_fastq_report.clone(),
         }
+    }
+}
+
+impl RunConfig {
+    fn validate_layout(&self, layout: RunLayout) -> Result<()> {
+        if self.merge_pairs && layout == RunLayout::Single {
+            bail!(
+                "--merge-pairs requires paired-end input\n\
+                 help: provide --in1 and --in2, or use an ENA accession with paired FASTQ files"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn build_plan(&self, layout: RunLayout) -> Result<Plan<Execution>> {
+        self.validate_layout(layout)?;
+
+        let plan = Plan::<Logical>::new();
+        let plan = if self.merge_pairs && layout == RunLayout::Paired {
+            plan.merge_pairs(crate::pair_merge::MergePairsConfig {
+                min_overlap: self.merge_min_overlap,
+                max_mismatch_rate: self.merge_max_mismatch_rate,
+                min_correction_delta_q: self.merge_min_correction_delta_q,
+            })?
+        } else {
+            plan
+        };
+        let plan = plan.max_ns(self.max_ns);
+        let plan = match self.adapter_preset.catalog() {
+            Some(catalog) => plan.trim_adapters(catalog),
+            None => plan,
+        };
+
+        Ok(plan
+            .quality_trim(self.trim_min_q)
+            .min_length(self.min_length)
+            .min_mean_q(self.min_mean_q)
+            .min_entropy(self.min_entropy)
+            .orphan_policy(OrphanPolicy::DropPair)
+            .compile())
     }
 }
 
@@ -206,9 +256,11 @@ pub fn run(cli: &Cli) -> Result<()> {
         "invalid input selection\nhelp: choose exactly one ingress mode: --ena ACCESSION, --in1 FASTQ, or --in1 FASTQ --in2 FASTQ",
     )? {
         Ingress::LocalSingle { fastq } => {
+            config.validate_layout(RunLayout::Single)?;
             SingleEndContext::open_local(fastq, cli.output_args())?.run(&config, &ui)
         }
         Ingress::LocalPaired { r1, r2 } => {
+            config.validate_layout(RunLayout::Paired)?;
             PairedEndContext::open_local(r1, r2, cli.output_args())?.run(&config, &ui)
         }
         Ingress::Ena { accession } => run_ena(&accession, cli.output_args(), &config, &ui),
@@ -232,28 +284,16 @@ fn run_ena(
 
     match layout {
         FastqUrlsByLayout::Single(url) => {
+            config.validate_layout(RunLayout::Single)?;
             SingleEndContext::open_ena(accession, client.open_retrying_stream(url), output_args)?
                 .run(config, ui)
         }
         FastqUrlsByLayout::Paired(urls) => {
+            config.validate_layout(RunLayout::Paired)?;
             let (r1, r2) = client.open_retrying_paired_streams(urls);
             PairedEndContext::open_ena(accession, r1, r2, output_args)?.run(config, ui)
         }
     }
-}
-
-fn build_plan(config: &RunConfig) -> Plan<Execution> {
-    let plan = Plan::<Logical>::new().max_ns(config.max_ns);
-    let plan = match config.adapter_preset.catalog() {
-        Some(catalog) => plan.trim_adapters(catalog),
-        None => plan,
-    };
-    plan.quality_trim(config.trim_min_q)
-        .min_length(config.min_length)
-        .min_mean_q(config.min_mean_q)
-        .min_entropy(config.min_entropy)
-        .orphan_policy(OrphanPolicy::DropPair)
-        .compile()
 }
 
 impl RunContext<SingleEnd> {
@@ -301,7 +341,7 @@ impl RunContext<SingleEnd> {
             mut output,
             _layout,
         } = self;
-        let plan = build_plan(config);
+        let mut plan = config.build_plan(RunLayout::Single)?;
 
         // build out the mutable state needed to run the application loop
         let mut parser = parse_fastx_reader(reader).wrap_err(
@@ -323,18 +363,10 @@ impl RunContext<SingleEnd> {
             };
             arena.reset();
 
-            let outcome = plan.execute(record, &mut arena, &mut stats);
-            if outcome.rejection_count() == 0 {
-                for record in outcome.emitted() {
-                    output.write_record(record).wrap_err_with(|| {
-                    format!(
-                        "failed to write single-end output record\nheader: {}\nhelp: check downstream pipe or output filesystem health",
-                        String::from_utf8_lossy(record.header())
-                    )
-                })?;
-                    stats.record_emitted(record.sequence().len());
-                }
-            }
+            let outcome = plan.execute(record, &mut arena, &mut stats)?;
+            output.write_outcome(&outcome, &mut stats).wrap_err(
+                "failed to write single-end output record\nhelp: check downstream pipe or output filesystem health",
+            )?;
 
             progress.maybe_report(&stats);
         }
@@ -416,7 +448,7 @@ impl RunContext<PairedEnd> {
             mut output,
             _layout,
         } = self;
-        let plan = build_plan(config);
+        let mut plan = config.build_plan(RunLayout::Paired)?;
         let mut parser_r1 = parse_fastx_reader(r1).wrap_err(
         "failed to initialize FASTQ parser for read 1\nhelp: confirm --in1 is readable FASTQ and has the expected compression",
     )?;
@@ -444,8 +476,10 @@ impl RunContext<PairedEnd> {
 
                     arena.reset();
 
-                    let outcome = plan.execute(pair, &mut arena, &mut stats);
-                    write_paired_outcome(&mut output, &outcome, &mut stats)?;
+                    let outcome = plan.execute(pair, &mut arena, &mut stats)?;
+                    output.write_outcome(&outcome, &mut stats).wrap_err(
+                        "failed to write paired output record group\nhelp: check downstream pipe or output filesystem health",
+                    )?;
 
                     progress.maybe_report(&stats);
                 }
@@ -650,42 +684,6 @@ fn panic_message(panic: &Box<dyn Any + Send>) -> String {
     }
 }
 
-fn write_paired_outcome(
-    output: &mut PairedOutputHandle,
-    outcome: &crate::plan::ExecutionOutcome<'_>,
-    stats: &mut ReadStats,
-) -> Result<()> {
-    if outcome.is_fully_emitted() {
-        output.write_pair_outcome(outcome, stats).wrap_err(
-            "failed to write paired output record group\nhelp: check downstream pipe or output filesystem health",
-        )?;
-    } else if outcome.is_fully_rejected() && outcome.rejection_count() > 0 {
-        stats.record_pair_rejected();
-    } else if outcome.is_orphan() {
-        let orphan_policy = OrphanPolicy::EmitOrphan;
-        let rejection_code = outcome.first_rejection_code().unwrap_or("unknown");
-        bail!(
-            "paired preprocessing produced an orphan read, but the configured output cannot represent orphans yet\n\
-             orphan_policy: {orphan_policy:?}\n\
-             first_rejection: {rejection_code}\n\
-             pairs_seen: {}\n\
-             help: this is an internal plan/output mismatch; use DropPair for paired output until orphan output is implemented",
-            stats.pairs_seen,
-        );
-    } else {
-        bail!(
-            "paired preprocessing produced an unexpected mixed outcome\n\
-             pairs_seen: {} reads_seen: {} reads_rejected: {}\n\
-             help: please report this with the input layout and preprocessing flags",
-            stats.pairs_seen,
-            stats.reads_seen,
-            stats.reads_rejected,
-        );
-    }
-
-    Ok(())
-}
-
 fn read_stats(config: &RunConfig) -> Result<ReadStats> {
     let mut stats = ReadStats::default();
     if let Some(path) = &config.invalid_fastq_report {
@@ -737,6 +735,10 @@ mod tests {
             min_mean_q: 20.0,
             trim_min_q: 20,
             adapter_preset: AdapterPreset::IlluminaTruSeq,
+            merge_pairs: false,
+            merge_min_overlap: 10,
+            merge_max_mismatch_rate: 0.2,
+            merge_min_correction_delta_q: 0,
             min_entropy: 0.0,
             interleaved: true,
             output_format: OutputFormat::Fastq,

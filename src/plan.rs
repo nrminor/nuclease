@@ -21,6 +21,10 @@ pub(crate) enum OrphanPolicy {
     #[default]
     DropPair,
     /// Emit the surviving mate as an orphan.
+    #[allow(
+        dead_code,
+        reason = "orphan emission is supported by the plan model even though the current CLI keeps paired output conservative"
+    )]
     EmitOrphan,
 }
 
@@ -64,13 +68,85 @@ pub(crate) trait ReadFilter: Send + Sync + 'static {
     fn evaluate(&self, record: &RecordView<'_>) -> Result<(), Self::Reason>;
 }
 
-/// Contract for read transforms that may rewrite a record using the transform arena.
+/// Contract for read transforms that may rewrite one record using the transform arena.
 pub(crate) trait ReadTransform: Send + Sync + 'static {
     /// Stable machine-readable transform code suitable for aggregation.
     fn code(&self) -> &'static str;
 
     /// Apply the transform and return the resulting record view.
     fn apply<'a>(&self, record: RecordView<'a>, arena: &'a TransformArena) -> TransformResult<'a>;
+}
+
+/// Active execution unit carried between plan steps.
+#[derive(Clone, Copy)]
+pub(crate) enum ActiveUnit<'a> {
+    /// One single-end record, or one paired record that has become a single record.
+    Single(RecordView<'a>),
+    /// One paired-end execution unit.
+    Pair(RecordPair<'a>),
+}
+
+/// Emitted unit produced by an execution plan.
+#[derive(Clone, Copy)]
+pub(crate) enum EmittedUnit<'a> {
+    /// Emit no records.
+    None,
+    /// Emit one record.
+    Single(RecordView<'a>),
+    /// Emit a paired record group.
+    Pair(RecordPair<'a>),
+}
+
+/// Result of a pair-aware transform.
+pub(crate) enum PairTransformResult<'a> {
+    /// Continue as a pair.
+    Pair {
+        /// Pair after transformation.
+        pair: RecordPair<'a>,
+        /// Whether the transform materially changed the unit.
+        applied: bool,
+    },
+    /// Continue as one record.
+    Single {
+        /// Record after transformation.
+        record: RecordView<'a>,
+        /// Whether the transform materially changed the unit.
+        applied: bool,
+    },
+    /// Drop the entire unit with a stable rejection reason.
+    #[allow(
+        dead_code,
+        reason = "pair-aware extension points may reject whole units even though merge-pairs currently keeps unmerged pairs"
+    )]
+    Drop {
+        /// Stable rejection reason code.
+        reason: &'static str,
+    },
+}
+
+/// Contract for transforms that operate on a paired unit and may change output cardinality.
+pub(crate) trait PairTransform: Send {
+    /// Stable machine-readable transform code suitable for aggregation.
+    fn code(&self) -> &'static str;
+
+    /// Apply this transform to a paired unit.
+    fn apply_pair<'a>(
+        &mut self,
+        pair: RecordPair<'a>,
+        arena: &'a TransformArena,
+    ) -> Result<PairTransformResult<'a>>;
+
+    /// Apply this transform to a single unit.
+    fn apply_single<'a>(
+        &mut self,
+        record: RecordView<'a>,
+        _arena: &'a TransformArena,
+    ) -> Result<PairTransformResult<'a>> {
+        Ok(PairTransformResult::Single {
+            record,
+            applied: false,
+        })
+    }
 }
 
 /// Result of applying one transform.
@@ -81,23 +157,48 @@ pub(crate) struct TransformResult<'a> {
     pub applied: bool,
 }
 
-/// Outcome of applying one execution step to a record.
+/// Outcome of applying one execution step to an active unit.
 pub(crate) enum StepOutcome<'a> {
-    /// Continue execution with the returned record view.
-    Continue {
-        /// Record view after this step.
-        record: RecordView<'a>,
-        /// Stable transform code when a transform materially changed the record.
-        transform_applied: Option<&'static str>,
-    },
-    /// Reject the record with a boxed rejection reason.
-    Reject(Box<dyn RejectionReason>),
+    /// Continue execution with the returned unit.
+    Continue(ActiveUnit<'a>),
+    /// Stop execution and return the terminal outcome.
+    Stop(ExecutionOutcome<'a>),
+}
+
+/// Mutable execution context shared by runtime steps for one execution unit.
+pub(crate) struct StepContext<'a, 'stats> {
+    arena: &'a TransformArena,
+    stats: &'stats mut ReadStats,
+    orphan_policy: OrphanPolicy,
+    rejection_count: usize,
+}
+
+impl StepContext<'_, '_> {
+    fn record_rejection(&mut self, code: &'static str) {
+        self.stats.record_rejected(code);
+        self.rejection_count += 1;
+    }
+
+    fn record_transform(&mut self, code: &'static str) {
+        self.stats.record_transform(code);
+    }
+
+    fn outcome<'a>(&self, emitted: EmittedUnit<'a>) -> ExecutionOutcome<'a> {
+        ExecutionOutcome {
+            emitted,
+            rejection_count: self.rejection_count,
+        }
+    }
 }
 
 /// Internal executable step stored by compiled execution plans.
-pub(crate) trait ExecutionStep: Send + Sync {
-    /// Apply this step to a record.
-    fn apply<'a>(&self, record: RecordView<'a>, arena: &'a TransformArena) -> StepOutcome<'a>;
+pub(crate) trait ExecutionStep: Send {
+    /// Apply this step to an active execution unit.
+    fn apply<'a>(
+        &mut self,
+        unit: ActiveUnit<'a>,
+        context: &mut StepContext<'a, '_>,
+    ) -> Result<StepOutcome<'a>>;
 }
 
 /// Internal wrapper that turns a filter operation into a runtime step.
@@ -107,13 +208,55 @@ impl<F> ExecutionStep for FilterStep<F>
 where
     F: ReadFilter,
 {
-    fn apply<'a>(&self, record: RecordView<'a>, _arena: &'a TransformArena) -> StepOutcome<'a> {
-        match self.0.evaluate(&record) {
-            Ok(()) => StepOutcome::Continue {
-                record,
-                transform_applied: None,
+    fn apply<'a>(
+        &mut self,
+        unit: ActiveUnit<'a>,
+        context: &mut StepContext<'a, '_>,
+    ) -> Result<StepOutcome<'a>> {
+        Ok(match unit {
+            ActiveUnit::Single(record) => match self.0.evaluate(&record) {
+                Ok(()) => StepOutcome::Continue(ActiveUnit::Single(record)),
+                Err(reason) => {
+                    context.record_rejection(reason.code());
+                    StepOutcome::Stop(context.outcome(EmittedUnit::None))
+                }
             },
-            Err(reason) => StepOutcome::Reject(Box::new(reason)),
+            ActiveUnit::Pair(pair) => apply_filter_to_pair(&self.0, pair, context),
+        })
+    }
+}
+
+fn apply_filter_to_pair<'a, F>(
+    filter: &F,
+    pair: RecordPair<'a>,
+    context: &mut StepContext<'a, '_>,
+) -> StepOutcome<'a>
+where
+    F: ReadFilter,
+{
+    let left = filter.evaluate(&pair.left).map_err(|reason| reason.code());
+    let right = filter.evaluate(&pair.right).map_err(|reason| reason.code());
+
+    match (left, right) {
+        (Ok(()), Ok(())) => StepOutcome::Continue(ActiveUnit::Pair(pair)),
+        (Err(left_reason), Ok(())) => {
+            context.record_rejection(left_reason);
+            match context.orphan_policy {
+                OrphanPolicy::DropPair => StepOutcome::Stop(context.outcome(EmittedUnit::None)),
+                OrphanPolicy::EmitOrphan => StepOutcome::Continue(ActiveUnit::Single(pair.right)),
+            }
+        }
+        (Ok(()), Err(right_reason)) => {
+            context.record_rejection(right_reason);
+            match context.orphan_policy {
+                OrphanPolicy::DropPair => StepOutcome::Stop(context.outcome(EmittedUnit::None)),
+                OrphanPolicy::EmitOrphan => StepOutcome::Continue(ActiveUnit::Single(pair.left)),
+            }
+        }
+        (Err(left_reason), Err(right_reason)) => {
+            context.record_rejection(left_reason);
+            context.record_rejection(right_reason);
+            StepOutcome::Stop(context.outcome(EmittedUnit::None))
         }
     }
 }
@@ -125,12 +268,65 @@ impl<T> ExecutionStep for TransformStep<T>
 where
     T: ReadTransform,
 {
-    fn apply<'a>(&self, record: RecordView<'a>, arena: &'a TransformArena) -> StepOutcome<'a> {
-        let result = self.0.apply(record, arena);
-        StepOutcome::Continue {
-            record: result.record,
-            transform_applied: result.applied.then_some(self.0.code()),
-        }
+    fn apply<'a>(
+        &mut self,
+        unit: ActiveUnit<'a>,
+        context: &mut StepContext<'a, '_>,
+    ) -> Result<StepOutcome<'a>> {
+        let code = self.0.code();
+        let mut map_one = |record| {
+            let result = self.0.apply(record, context.arena);
+            if result.applied {
+                context.record_transform(code);
+            }
+            result.record
+        };
+
+        Ok(StepOutcome::Continue(match unit {
+            ActiveUnit::Single(record) => ActiveUnit::Single(map_one(record)),
+            ActiveUnit::Pair(pair) => ActiveUnit::Pair(RecordPair {
+                left: map_one(pair.left),
+                right: map_one(pair.right),
+            }),
+        }))
+    }
+}
+
+/// Internal wrapper that turns a pair-aware transform into a runtime step.
+pub(crate) struct PairTransformStep<T>(pub(crate) T);
+
+impl<T> ExecutionStep for PairTransformStep<T>
+where
+    T: PairTransform,
+{
+    fn apply<'a>(
+        &mut self,
+        unit: ActiveUnit<'a>,
+        context: &mut StepContext<'a, '_>,
+    ) -> Result<StepOutcome<'a>> {
+        let result = match unit {
+            ActiveUnit::Single(record) => self.0.apply_single(record, context.arena)?,
+            ActiveUnit::Pair(pair) => self.0.apply_pair(pair, context.arena)?,
+        };
+
+        Ok(match result {
+            PairTransformResult::Pair { pair, applied } => {
+                if applied {
+                    context.record_transform(self.0.code());
+                }
+                StepOutcome::Continue(ActiveUnit::Pair(pair))
+            }
+            PairTransformResult::Single { record, applied } => {
+                if applied {
+                    context.record_transform(self.0.code());
+                }
+                StepOutcome::Continue(ActiveUnit::Single(record))
+            }
+            PairTransformResult::Drop { reason } => {
+                context.record_rejection(reason);
+                StepOutcome::Stop(context.outcome(EmittedUnit::None))
+            }
+        })
     }
 }
 
@@ -209,111 +405,31 @@ pub(crate) struct RecordPair<'a> {
     pub right: RecordView<'a>,
 }
 
-/// Final terminal slot result for one side of an execution unit.
-pub(crate) enum ExecutionSlot<'a> {
-    /// This side produced a record that should be emitted.
-    Emit(RecordView<'a>),
-    /// This side was rejected by filtering.
-    Reject(Box<dyn RejectionReason>),
-    /// This side survived per-read execution but was suppressed by final execution policy.
-    Suppress,
-}
-
-impl<'a> ExecutionSlot<'a> {
-    fn emitted(&self) -> Option<RecordView<'a>> {
-        match self {
-            Self::Emit(record) => Some(*record),
-            Self::Reject(_) | Self::Suppress => None,
-        }
-    }
-
-    fn is_emit(&self) -> bool {
-        matches!(self, Self::Emit(_))
-    }
-
-    fn is_reject(&self) -> bool {
-        matches!(self, Self::Reject(_))
-    }
-}
-
 /// Shared final execution result for single-read and paired-read execution.
 pub(crate) struct ExecutionOutcome<'a> {
-    left: ExecutionSlot<'a>,
-    right: Option<ExecutionSlot<'a>>,
+    emitted: EmittedUnit<'a>,
+    rejection_count: usize,
 }
 
 impl<'a> ExecutionOutcome<'a> {
-    /// Construct a single-record outcome.
-    pub fn single(slot: ExecutionSlot<'a>) -> Self {
-        Self {
-            left: slot,
-            right: None,
-        }
-    }
-
-    /// Construct a paired-record outcome.
-    pub fn pair(left: ExecutionSlot<'a>, right: ExecutionSlot<'a>) -> Self {
-        Self {
-            left,
-            right: Some(right),
-        }
+    /// Return the emitted unit.
+    pub fn emitted_unit(&self) -> EmittedUnit<'a> {
+        self.emitted
     }
 
     /// Iterate over records that should be emitted.
-    pub fn emitted(&self) -> impl Iterator<Item = RecordView<'a>> + '_ {
-        [self.left_emitted(), self.right_emitted()]
-            .into_iter()
-            .flatten()
-    }
-
-    /// Count records that should be emitted.
-    pub fn emitted_count(&self) -> usize {
-        usize::from(self.left.is_emit())
-            + usize::from(self.right.as_ref().is_some_and(ExecutionSlot::is_emit))
+    pub fn emitted(&self) -> impl Iterator<Item = RecordView<'a>> {
+        let records = match self.emitted {
+            EmittedUnit::None => [None, None],
+            EmittedUnit::Single(record) => [Some(record), None],
+            EmittedUnit::Pair(pair) => [Some(pair.left), Some(pair.right)],
+        };
+        records.into_iter().flatten()
     }
 
     /// Count retained rejection reasons.
     pub fn rejection_count(&self) -> usize {
-        usize::from(self.left.is_reject())
-            + usize::from(self.right.as_ref().is_some_and(ExecutionSlot::is_reject))
-    }
-
-    /// Return the first stable rejection code retained in the final outcome.
-    pub fn first_rejection_code(&self) -> Option<&'static str> {
-        match (&self.left, &self.right) {
-            (ExecutionSlot::Reject(reason), _) | (_, Some(ExecutionSlot::Reject(reason))) => {
-                Some(reason.code())
-            }
-            _ => None,
-        }
-    }
-
-    /// Return true when execution emitted every slot in the unit.
-    pub fn is_fully_emitted(&self) -> bool {
-        match &self.right {
-            None => self.left.is_emit(),
-            Some(right) => self.left.is_emit() && right.is_emit(),
-        }
-    }
-
-    /// Return true when execution emitted no records.
-    pub fn is_fully_rejected(&self) -> bool {
-        self.emitted_count() == 0
-    }
-
-    /// Return true when paired execution emitted exactly one surviving orphan.
-    pub fn is_orphan(&self) -> bool {
-        self.right.is_some() && self.emitted_count() == 1
-    }
-
-    /// Return the emitted left record when present.
-    pub fn left_emitted(&self) -> Option<RecordView<'a>> {
-        self.left.emitted()
-    }
-
-    /// Return the emitted right record when present.
-    pub fn right_emitted(&self) -> Option<RecordView<'a>> {
-        self.right.as_ref().and_then(ExecutionSlot::emitted)
+        self.rejection_count
     }
 }
 
@@ -321,84 +437,61 @@ impl<'a> ExecutionOutcome<'a> {
 pub(crate) trait Execute<'a, In> {
     /// Execute the compiled plan against one execution unit.
     fn execute(
-        &self,
+        &mut self,
         input: In,
         arena: &'a mut TransformArena,
         stats: &mut ReadStats,
-    ) -> ExecutionOutcome<'a>;
+    ) -> Result<ExecutionOutcome<'a>>;
 }
 
 impl Plan<Execution> {
-    /// Execute all compiled steps against one record and return the terminal slot result.
-    fn execute_record<'a>(
-        &self,
-        record: RecordView<'a>,
+    /// Execute all compiled steps against one active unit.
+    fn execute_unit<'a>(
+        &mut self,
+        mut unit: ActiveUnit<'a>,
         arena: &'a TransformArena,
         stats: &mut ReadStats,
-    ) -> ExecutionSlot<'a> {
-        let mut current = record;
+    ) -> Result<ExecutionOutcome<'a>> {
+        let mut context = StepContext {
+            arena,
+            stats,
+            orphan_policy: self.orphan_policy,
+            rejection_count: 0,
+        };
 
-        for step in &self.steps {
-            match step.apply(current, arena) {
-                StepOutcome::Continue {
-                    record,
-                    transform_applied,
-                } => {
-                    current = record;
-                    if let Some(code) = transform_applied {
-                        stats.record_transform(code);
-                    }
-                }
-                StepOutcome::Reject(reason) => {
-                    stats.record_rejected(reason.code());
-                    return ExecutionSlot::Reject(reason);
-                }
+        for step in &mut self.steps {
+            match step.apply(unit, &mut context)? {
+                StepOutcome::Continue(next) => unit = next,
+                StepOutcome::Stop(outcome) => return Ok(outcome),
             }
         }
 
-        ExecutionSlot::Emit(current)
+        Ok(context.outcome(match unit {
+            ActiveUnit::Single(record) => EmittedUnit::Single(record),
+            ActiveUnit::Pair(pair) => EmittedUnit::Pair(pair),
+        }))
     }
 }
 
 impl<'a> Execute<'a, RecordView<'a>> for Plan<Execution> {
     fn execute(
-        &self,
+        &mut self,
         input: RecordView<'a>,
         arena: &'a mut TransformArena,
         stats: &mut ReadStats,
-    ) -> ExecutionOutcome<'a> {
-        ExecutionOutcome::single(self.execute_record(input, arena, stats))
+    ) -> Result<ExecutionOutcome<'a>> {
+        self.execute_unit(ActiveUnit::Single(input), arena, stats)
     }
 }
 
 impl<'a> Execute<'a, RecordPair<'a>> for Plan<Execution> {
     fn execute(
-        &self,
+        &mut self,
         input: RecordPair<'a>,
         arena: &'a mut TransformArena,
         stats: &mut ReadStats,
-    ) -> ExecutionOutcome<'a> {
-        let left = self.execute_record(input.left, arena, stats);
-        let right = self.execute_record(input.right, arena, stats);
-
-        match self.orphan_policy {
-            OrphanPolicy::DropPair => match (left, right) {
-                (ExecutionSlot::Emit(left_record), ExecutionSlot::Emit(right_record)) => {
-                    ExecutionOutcome::pair(
-                        ExecutionSlot::Emit(left_record),
-                        ExecutionSlot::Emit(right_record),
-                    )
-                }
-                (ExecutionSlot::Emit(_), right) => {
-                    ExecutionOutcome::pair(ExecutionSlot::Suppress, right)
-                }
-                (left, ExecutionSlot::Emit(_)) => {
-                    ExecutionOutcome::pair(left, ExecutionSlot::Suppress)
-                }
-                (left, right) => ExecutionOutcome::pair(left, right),
-            },
-            OrphanPolicy::EmitOrphan => ExecutionOutcome::pair(left, right),
-        }
+    ) -> Result<ExecutionOutcome<'a>> {
+        self.execute_unit(ActiveUnit::Pair(input), arena, stats)
     }
 }
 
@@ -466,13 +559,13 @@ mod tests {
         fn apply<'a>(
             &self,
             record: RecordView<'a>,
-            arena: &'a TransformArena,
+            _arena: &'a TransformArena,
         ) -> TransformResult<'a> {
             TransformResult {
                 record: record
                     .with_sequence_and_quality(
-                        arena.alloc_slice_copy(&record.sequence()[self.amount..]),
-                        arena.alloc_slice_copy(&record.quality()[self.amount..]),
+                        &record.sequence()[self.amount..],
+                        &record.quality()[self.amount..],
                     )
                     .expect("trim prefix should preserve equal sequence and quality lengths"),
                 applied: true,
@@ -504,29 +597,34 @@ mod tests {
 
     #[test]
     fn single_execution_rejects_record_when_filter_fails() {
-        let plan = Plan::<Logical>::new().step(MinLength::new(6)).compile();
+        let mut plan = Plan::<Logical>::new().step(MinLength::new(6)).compile();
         let mut arena = TransformArena::new();
         let mut stats = ReadStats::default();
 
-        let outcome = plan.execute(record(b"ACGT"), &mut arena, &mut stats);
+        let outcome = plan
+            .execute(record(b"ACGT"), &mut arena, &mut stats)
+            .expect("single-record filter failure should produce a rejected outcome");
 
-        assert!(outcome.is_fully_rejected());
+        assert_eq!(outcome.emitted().count(), 0);
         assert_eq!(outcome.rejection_count(), 1);
         assert_eq!(stats.rejection_counts.get("too_short"), Some(&1));
     }
 
     #[test]
     fn single_execution_applies_transform_in_order() {
-        let plan = Plan::<Logical>::new().step(TrimPrefix::new(1)).compile();
+        let mut plan = Plan::<Logical>::new().step(TrimPrefix::new(1)).compile();
         let mut arena = TransformArena::new();
         let mut stats = ReadStats::default();
 
-        let outcome = plan.execute(record(b"ACGT"), &mut arena, &mut stats);
+        let outcome = plan
+            .execute(record(b"ACGT"), &mut arena, &mut stats)
+            .expect("single-record transform should produce an emitted outcome");
 
-        assert!(outcome.is_fully_emitted());
+        assert_eq!(outcome.emitted().count(), 1);
         assert_eq!(
             outcome
-                .left_emitted()
+                .emitted()
+                .next()
                 .expect("record should emit")
                 .sequence(),
             b"CGT"
@@ -535,54 +633,58 @@ mod tests {
 
     #[test]
     fn paired_execution_drops_orphan_by_default() {
-        let plan = Plan::<Logical>::new().step(MinLength::new(6)).compile();
+        let mut plan = Plan::<Logical>::new().step(MinLength::new(6)).compile();
         let mut arena = TransformArena::new();
         let mut stats = ReadStats::default();
 
-        let outcome = plan.execute(
-            RecordPair {
-                left: record(b"ACGTAC"),
-                right: record(b"ACGT"),
-            },
-            &mut arena,
-            &mut stats,
-        );
+        let outcome = plan
+            .execute(
+                RecordPair {
+                    left: record(b"ACGTAC"),
+                    right: record(b"ACGT"),
+                },
+                &mut arena,
+                &mut stats,
+            )
+            .expect("paired filter failure should produce a rejected outcome");
 
-        assert!(outcome.is_fully_rejected());
-        assert!(!outcome.is_orphan());
-        assert_eq!(outcome.emitted_count(), 0);
+        assert_eq!(outcome.emitted().count(), 0);
         assert_eq!(outcome.rejection_count(), 1);
     }
 
     #[test]
     fn paired_execution_can_emit_orphan_when_policy_allows() {
-        let plan = Plan::<Logical>::new()
+        let mut plan = Plan::<Logical>::new()
             .step(MinLength::new(6))
             .orphan_policy(OrphanPolicy::EmitOrphan)
             .compile();
         let mut arena = TransformArena::new();
         let mut stats = ReadStats::default();
 
-        let outcome = plan.execute(
-            RecordPair {
-                left: record(b"ACGTAC"),
-                right: record(b"ACGT"),
-            },
-            &mut arena,
-            &mut stats,
-        );
+        let outcome = plan
+            .execute(
+                RecordPair {
+                    left: record(b"ACGTAC"),
+                    right: record(b"ACGT"),
+                },
+                &mut arena,
+                &mut stats,
+            )
+            .expect("paired orphan policy should produce an emitted orphan outcome");
 
-        assert!(outcome.is_orphan());
-        assert_eq!(outcome.emitted_count(), 1);
+        assert_eq!(outcome.emitted().count(), 1);
         assert_eq!(outcome.rejection_count(), 1);
     }
 
     #[test]
     fn emitted_iterator_preserves_slot_order() {
-        let outcome = ExecutionOutcome::pair(
-            super::ExecutionSlot::Emit(record(b"AAAAAA")),
-            super::ExecutionSlot::Emit(record(b"CCCCCC")),
-        );
+        let outcome = ExecutionOutcome {
+            emitted: super::EmittedUnit::Pair(RecordPair {
+                left: record(b"AAAAAA"),
+                right: record(b"CCCCCC"),
+            }),
+            rejection_count: 0,
+        };
 
         let emitted = outcome
             .emitted()

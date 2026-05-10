@@ -9,6 +9,7 @@ mod cli;
 mod ena;
 mod filter;
 mod output;
+mod pair_merge;
 mod pipeline;
 mod plan;
 mod progress;

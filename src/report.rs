@@ -23,7 +23,7 @@ pub struct RunContext {
 }
 
 /// Ingress origin for a run summary.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IngressMode {
     /// Reads were streamed from ENA.
@@ -33,7 +33,7 @@ pub enum IngressMode {
 }
 
 /// Record layout processed by the run.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunLayout {
     /// Single-end records.

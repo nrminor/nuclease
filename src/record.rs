@@ -395,7 +395,7 @@ impl<'a> RecordView<'a> {
         }
     }
 
-    fn pair_key(&self) -> &[u8] {
+    pub(crate) fn pair_key(&self) -> &'a [u8] {
         let first_token = self
             .header()
             .split(u8::is_ascii_whitespace)

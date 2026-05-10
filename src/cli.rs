@@ -32,12 +32,9 @@ pub const INFO: &str = r"
 █  █ █ █▄ ▄█ ▀███▀      ▀ ▀███▀      █            ▀███▀   
 █   ██  ▀▀▀                         █                     
                                    ▀                      
-==================================================
+=========================================================
 
-`nuclease` streams local or ENA FASTQ through a compact preprocessing plan
-and emits cleaned FASTQ/FASTA for downstream tools. Defaults are chosen to
-be sensible, while additional flags compose into stricter preprocessing when
-needed.
+`nuclease` is a fast and resource-frugal sequencing read preprocessor. It streams local or ENA FASTQ through a processing plan and emits cleaned FASTQ/FASTA for downstream tools. It starts with sensible defaults that users can override with additional flags when stricter filtering or transformation is needed. See below for more.
 ";
 
 const AFTER_HELP: &str = "\
@@ -182,6 +179,41 @@ pub struct Cli {
         help = "Adapter trimming preset to apply"
     )]
     pub adapter_preset: AdapterPreset,
+
+    /// Attempt to merge paired-end reads before per-record filters.
+    #[arg(
+        long,
+        help_heading = "Preprocessing",
+        help = "Attempt to merge paired-end reads before trimming and filtering; requires paired input and single-stream output"
+    )]
+    pub merge_pairs: bool,
+
+    /// Minimum overlap length required before paired reads can merge.
+    #[arg(
+        long,
+        default_value_t = 10,
+        help_heading = "Preprocessing",
+        help = "Minimum overlap length required before paired reads can merge"
+    )]
+    pub merge_min_overlap: usize,
+
+    /// Maximum mismatch fraction allowed in candidate paired-read overlaps.
+    #[arg(
+        long,
+        default_value_t = 0.2,
+        help_heading = "Preprocessing",
+        help = "Maximum mismatch fraction allowed in candidate paired-read overlaps"
+    )]
+    pub merge_max_mismatch_rate: f32,
+
+    /// Minimum Phred-quality gap required before overlap correction rewrites disagreeing bases.
+    #[arg(
+        long,
+        default_value_t = 0,
+        help_heading = "Preprocessing",
+        help = "Minimum Phred-quality gap required before overlap correction rewrites disagreeing bases"
+    )]
+    pub merge_min_correction_delta_q: u8,
 
     /// How to handle invalid FASTQ input.
     #[arg(
@@ -378,6 +410,7 @@ impl Cli {
             self.out1.clone(),
             self.out2.clone(),
         )
+        .with_merge_pairs(self.merge_pairs)
     }
 }
 
@@ -407,6 +440,10 @@ mod tests {
             min_entropy: 0.0,
             trim_min_q: 20,
             adapter_preset: AdapterPreset::IlluminaTruSeq,
+            merge_pairs: false,
+            merge_min_overlap: 10,
+            merge_max_mismatch_rate: 0.2,
+            merge_min_correction_delta_q: 0,
             invalid_fastq_policy: InvalidFastqPolicy::Error,
             interleaved: false,
             output_format: OutputFormat::Fastq,
@@ -440,6 +477,10 @@ mod tests {
             trim_min_q: 20,
             min_entropy: 0.0,
             adapter_preset: AdapterPreset::IlluminaTruSeq,
+            merge_pairs: false,
+            merge_min_overlap: 10,
+            merge_max_mismatch_rate: 0.2,
+            merge_min_correction_delta_q: 0,
             invalid_fastq_policy: InvalidFastqPolicy::Error,
             interleaved: false,
             output_format: OutputFormat::Fastq,
@@ -471,6 +512,10 @@ mod tests {
             trim_min_q: 20,
             min_entropy: 0.0,
             adapter_preset: AdapterPreset::IlluminaTruSeq,
+            merge_pairs: false,
+            merge_min_overlap: 10,
+            merge_max_mismatch_rate: 0.2,
+            merge_min_correction_delta_q: 0,
             invalid_fastq_policy: InvalidFastqPolicy::Error,
             interleaved: true,
             output_format: OutputFormat::Fastq,
