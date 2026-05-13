@@ -34,12 +34,14 @@ pub const INFO: &str = r"
                                    ▀                      
 =========================================================
 
-`nuclease` is a fast and resource-frugal sequencing read preprocessor. It streams local or ENA FASTQ through a processing plan and emits cleaned FASTQ/FASTA for downstream tools. It starts with sensible defaults that users can override with additional flags when stricter filtering or transformation is needed. See below for more.
+`nuclease` is a fast and resource-frugal sequencing read preprocessor. It streams local or ENA FASTQ through a processing plan and emits cleaned FASTQ/FASTA for downstream tools. It starts with sensible defaults that users can override with additional flags when stricter filtering or transformation is needed.
 ";
 
 const AFTER_HELP: &str = "\
 Examples:
   nuclease --in reads.fastq.gz > cleaned.fastq
+
+  nuclease --in reads.fastq.gz --passthrough > validated.fastq
 
   nuclease --in1 reads_1.fastq.gz --in2 reads_2.fastq.gz \
     --out1 cleaned_1.fastq.gz --out2 cleaned_2.fastq.gz
@@ -108,6 +110,7 @@ impl fmt::Display for InvalidFastqPolicy {
     styles = STYLES,
     after_help = AFTER_HELP,
     arg_required_else_help = true,
+    override_usage = "nuclease [OPTIONS] (--ena <ENA> | --in <INPUT> | --in1 <IN1>)",
 )]
 #[command(group(
     ArgGroup::new("ingress")
