@@ -192,6 +192,7 @@ struct RunConfig {
     trim_min_q: u8,
     adapter_preset: AdapterPreset,
     merge_pairs: bool,
+    passthrough: bool,
     merge_min_overlap: usize,
     merge_max_mismatch_rate: f32,
     merge_min_correction_delta_q: u8,
@@ -211,6 +212,7 @@ impl From<&Cli> for RunConfig {
             trim_min_q: cli.trim_min_q,
             adapter_preset: cli.adapter_preset,
             merge_pairs: cli.merge_pairs,
+            passthrough: cli.passthrough,
             merge_min_overlap: cli.merge_min_overlap,
             merge_max_mismatch_rate: cli.merge_max_mismatch_rate,
             merge_min_correction_delta_q: cli.merge_min_correction_delta_q,
@@ -238,6 +240,10 @@ impl RunConfig {
         self.validate_layout(layout)?;
 
         let plan = Plan::<Logical>::new();
+        if self.passthrough {
+            return Ok(plan.orphan_policy(OrphanPolicy::DropPair).compile());
+        }
+
         let plan = if self.merge_pairs && layout == RunLayout::Paired {
             plan.merge_pairs(crate::pair_merge::MergePairsConfig {
                 min_overlap: self.merge_min_overlap,
@@ -906,6 +912,7 @@ mod tests {
             trim_min_q: 20,
             adapter_preset: AdapterPreset::IlluminaTruSeq,
             merge_pairs: false,
+            passthrough: false,
             merge_min_overlap: 10,
             merge_max_mismatch_rate: 0.2,
             merge_min_correction_delta_q: 0,

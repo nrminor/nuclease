@@ -53,6 +53,8 @@ Supported transforms are:
 - Illumina TruSeq adapter trimming (`--adapter-preset illumina-truseq`): trims detected 3' adapter overlap using the built-in TruSeq R1/R2 adapter catalog. Use `--adapter-preset none` to disable adapter trimming.
 - 3' quality trimming (`--trim-min-q`): trims low-quality suffixes using the configured Phred cutoff.
 
+Use `-p`/`--passthrough` to parse and validate input while emitting reads without filters or transforms. Passthrough output is produced by nuclease's normal FASTQ writer rather than copied byte-for-byte from the input, and it cannot be combined with `--merge-pairs`.
+
 For paired-end input, the CLI currently uses the `DropPair` orphan policy during paired processing: if one mate is rejected, the surviving mate is suppressed rather than emitted. With `--merge-pairs`, successfully merged pairs become single records and continue through the rest of the pipeline as single records. Pairs that cannot be merged continue through paired processing as the original mate pair. Because a merge-enabled run may contain a mix of merged single records and unmerged pairs, `--merge-pairs` requires paired input and single-stream output rather than split `--out1`/`--out2` files. The execution engine also has an internal `EmitOrphan` policy, but orphan emission is not exposed as a supported CLI/output mode yet.
 
 Local input can be single-end (`--in reads.fastq.gz`), interleaved paired-end (`--in reads.fastq.gz --paired`), or split paired-end (`--in1 reads_1.fastq.gz --in2 reads_2.fastq.gz`). Output uses stdout by default. `--out` writes the run's natural single stream to a file: ordinary reads for single-end input, or interleaved pairs for paired input. Paired output can also be split with `--out1`/`--out2`.

@@ -206,10 +206,21 @@ pub struct Cli {
     /// Attempt to merge paired-end reads before per-record filters.
     #[arg(
         long,
+        conflicts_with = "passthrough",
         help_heading = "Preprocessing",
         help = "Attempt to merge paired-end reads before trimming and filtering; requires paired input and single-stream output"
     )]
     pub merge_pairs: bool,
+
+    /// Emit validated reads without running preprocessing filters or transforms.
+    #[arg(
+        short = 'p',
+        long,
+        action = ArgAction::SetTrue,
+        help_heading = "Preprocessing",
+        help = "Emit validated input reads without running preprocessing filters or transforms"
+    )]
+    pub passthrough: bool,
 
     /// Minimum overlap length required before paired reads can merge.
     #[arg(
@@ -486,6 +497,7 @@ mod tests {
             trim_min_q: 20,
             adapter_preset: AdapterPreset::IlluminaTruSeq,
             merge_pairs: false,
+            passthrough: false,
             merge_min_overlap: 10,
             merge_max_mismatch_rate: 0.2,
             merge_min_correction_delta_q: 0,
@@ -524,6 +536,7 @@ mod tests {
             min_entropy: 0.0,
             adapter_preset: AdapterPreset::IlluminaTruSeq,
             merge_pairs: false,
+            passthrough: false,
             merge_min_overlap: 10,
             merge_max_mismatch_rate: 0.2,
             merge_min_correction_delta_q: 0,
@@ -560,6 +573,7 @@ mod tests {
             min_entropy: 0.0,
             adapter_preset: AdapterPreset::IlluminaTruSeq,
             merge_pairs: false,
+            passthrough: false,
             merge_min_overlap: 10,
             merge_max_mismatch_rate: 0.2,
             merge_min_correction_delta_q: 0,
