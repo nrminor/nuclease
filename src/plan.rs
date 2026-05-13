@@ -449,7 +449,7 @@ impl Plan<Execution> {
     fn execute_unit<'a>(
         &mut self,
         mut unit: ActiveUnit<'a>,
-        arena: &'a TransformArena,
+        arena: &'a mut TransformArena,
         stats: &mut ReadStats,
     ) -> Result<ExecutionOutcome<'a>> {
         let mut context = StepContext {

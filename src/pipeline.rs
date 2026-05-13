@@ -46,7 +46,7 @@ impl FastqRunLayout for SingleEnd {
 
 impl FastqRunLayout for PairedEnd {
     type Source = PairedSource;
-    type Readers = (Box<dyn std::io::Read + Send>, Box<dyn std::io::Read + Send>);
+    type Readers = PairedReaders;
     type Output = PairedOutputHandle;
 }
 
@@ -62,7 +62,16 @@ enum SingleSource {
 
 enum PairedSource {
     Ena { accession: String },
-    Local { input1: PathBuf, input2: PathBuf },
+    LocalInterleaved { input: PathBuf },
+    LocalSplit { input1: PathBuf, input2: PathBuf },
+}
+
+enum PairedReaders {
+    Interleaved(Box<dyn std::io::Read + Send>),
+    Split {
+        left: Box<dyn std::io::Read + Send>,
+        right: Box<dyn std::io::Read + Send>,
+    },
 }
 
 impl RunSource for SingleSource {
@@ -112,7 +121,8 @@ impl RunSource for PairedSource {
     fn input_label(&self) -> String {
         match self {
             Self::Ena { accession } => format!("ena:{accession}"),
-            Self::Local { input1, input2 } => {
+            Self::LocalInterleaved { input } => format!("local-interleaved:{}", input.display()),
+            Self::LocalSplit { input1, input2 } => {
                 format!("local-paired:{}|{}", input1.display(), input2.display())
             }
         }
@@ -127,7 +137,14 @@ impl RunSource for PairedSource {
                 input1: None,
                 input2: None,
             },
-            Self::Local { input1, input2 } => RunSummaryContext {
+            Self::LocalInterleaved { input } => RunSummaryContext {
+                ingress_mode: report::IngressMode::Local,
+                layout: RunLayout::Paired,
+                accession: None,
+                input1: Some(input.display().to_string()),
+                input2: None,
+            },
+            Self::LocalSplit { input1, input2 } => RunSummaryContext {
                 ingress_mode: report::IngressMode::Local,
                 layout: RunLayout::Paired,
                 accession: None,
@@ -145,7 +162,11 @@ impl PairedSource {
                 source: InputSource::Ena { accession },
                 mate: Some(mate),
             },
-            Self::Local { input1, input2 } => RecordProvenance {
+            Self::LocalInterleaved { input } => RecordProvenance {
+                source: InputSource::LocalInterleavedPaired { input },
+                mate: Some(mate),
+            },
+            Self::LocalSplit { input1, input2 } => RecordProvenance {
                 source: InputSource::LocalPaired { input1, input2 },
                 mate: Some(mate),
             },
@@ -206,7 +227,7 @@ impl RunConfig {
         if self.merge_pairs && layout == RunLayout::Single {
             bail!(
                 "--merge-pairs requires paired-end input\n\
-                 help: provide --in1 and --in2, or use an ENA accession with paired FASTQ files"
+                 help: provide --in1 and --in2, use --in with --paired, or use an ENA accession with paired FASTQ files"
             );
         }
 
@@ -253,15 +274,19 @@ pub fn run(cli: &Cli) -> Result<()> {
     let ui = cli.ui_policy();
 
     match cli.ingress().wrap_err(
-        "invalid input selection\nhelp: choose exactly one ingress mode: --ena ACCESSION, --in1 FASTQ, or --in1 FASTQ --in2 FASTQ",
+        "invalid input selection\nhelp: choose exactly one ingress mode: --ena ACCESSION, --in FASTQ, --in FASTQ --paired, or --in1 FASTQ --in2 FASTQ",
     )? {
         Ingress::LocalSingle { fastq } => {
             config.validate_layout(RunLayout::Single)?;
             SingleEndContext::open_local(fastq, cli.output_args())?.run(&config, &ui)
         }
-        Ingress::LocalPaired { r1, r2 } => {
+        Ingress::LocalInterleavedPaired { fastq } => {
             config.validate_layout(RunLayout::Paired)?;
-            PairedEndContext::open_local(r1, r2, cli.output_args())?.run(&config, &ui)
+            PairedEndContext::open_local_interleaved(fastq, cli.output_args())?.run(&config, &ui)
+        }
+        Ingress::LocalSplitPaired { r1, r2 } => {
+            config.validate_layout(RunLayout::Paired)?;
+            PairedEndContext::open_local_split(r1, r2, cli.output_args())?.run(&config, &ui)
         }
         Ingress::Ena { accession } => run_ena(&accession, cli.output_args(), &config, &ui),
     }
@@ -301,7 +326,7 @@ impl RunContext<SingleEnd> {
         let reader = File::open(&fastq).wrap_err_with(|| {
             format!(
                 "failed to open local single-end FASTQ input: {}\n\
-                 help: check that --in1 points to a readable FASTQ file on this machine",
+                 help: check that --in points to a readable FASTQ file on this machine",
                 fastq.display()
             )
         })?;
@@ -393,7 +418,26 @@ impl RunContext<SingleEnd> {
 }
 
 impl RunContext<PairedEnd> {
-    fn open_local(r1: PathBuf, r2: PathBuf, output_args: OutputArgs) -> Result<Self> {
+    fn open_local_interleaved(fastq: PathBuf, output_args: OutputArgs) -> Result<Self> {
+        let reader = File::open(&fastq).wrap_err_with(|| {
+            format!(
+                "failed to open local interleaved paired FASTQ input: {}\n\
+                 help: check that --in points to a readable interleaved FASTQ file",
+                fastq.display()
+            )
+        })?;
+        let output = output_args
+            .resolve_paired()
+            .wrap_err("failed to configure paired-end output")?;
+        Ok(Self {
+            source: PairedSource::LocalInterleaved { input: fastq },
+            readers: PairedReaders::Interleaved(Box::new(reader)),
+            output,
+            _layout: PhantomData,
+        })
+    }
+
+    fn open_local_split(r1: PathBuf, r2: PathBuf, output_args: OutputArgs) -> Result<Self> {
         let reader1 = File::open(&r1).wrap_err_with(|| {
             format!(
                 "failed to open local paired FASTQ input for read 1: {}\n\
@@ -412,11 +456,14 @@ impl RunContext<PairedEnd> {
             .resolve_paired()
             .wrap_err("failed to configure paired-end output")?;
         Ok(Self {
-            source: PairedSource::Local {
+            source: PairedSource::LocalSplit {
                 input1: r1,
                 input2: r2,
             },
-            readers: (Box::new(reader1), Box::new(reader2)),
+            readers: PairedReaders::Split {
+                left: Box::new(reader1),
+                right: Box::new(reader2),
+            },
             output,
             _layout: PhantomData,
         })
@@ -435,26 +482,27 @@ impl RunContext<PairedEnd> {
             source: PairedSource::Ena {
                 accession: accession.to_string(),
             },
-            readers: (Box::new(r1), Box::new(r2)),
+            readers: PairedReaders::Split {
+                left: Box::new(r1),
+                right: Box::new(r2),
+            },
             output,
             _layout: PhantomData,
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "paired run orchestration intentionally keeps split and interleaved parser loops local to RunContext"
+    )]
     fn run(self, config: &RunConfig, ui: &UiPolicy) -> Result<()> {
         let Self {
             source,
-            readers: (r1, r2),
+            readers,
             mut output,
             _layout,
         } = self;
         let mut plan = config.build_plan(RunLayout::Paired)?;
-        let mut parser_r1 = parse_fastx_reader(r1).wrap_err(
-        "failed to initialize FASTQ parser for read 1\nhelp: confirm --in1 is readable FASTQ and has the expected compression",
-    )?;
-        let mut parser_r2 = parse_fastx_reader(r2).wrap_err(
-        "failed to initialize FASTQ parser for read 2\nhelp: confirm --in2 is readable FASTQ and has the expected compression",
-    )?;
         let mut arena = TransformArena::new();
         let mut stats = read_stats(config)?;
         let mut progress = ProgressReporter::new(ui.progress_mode, config.progress_every);
@@ -462,38 +510,97 @@ impl RunContext<PairedEnd> {
         let input_label = source.input_label();
         let admission = FastqAdmission::<PairedEnd>::new(&source, config.invalid_fastq_policy);
 
-        loop {
-            let next_r1 = catch_parser_panic(&input_label, "left", &stats, || parser_r1.next())?;
-            let next_r2 = catch_parser_panic(&input_label, "right", &stats, || parser_r2.next())?;
+        match readers {
+            PairedReaders::Split { left, right } => {
+                let mut parser_r1 = parse_fastx_reader(left).wrap_err(
+                    "failed to initialize FASTQ parser for read 1\nhelp: confirm --in1 is readable FASTQ and has the expected compression",
+                )?;
+                let mut parser_r2 = parse_fastx_reader(right).wrap_err(
+                    "failed to initialize FASTQ parser for read 2\nhelp: confirm --in2 is readable FASTQ and has the expected compression",
+                )?;
 
-            match (next_r1, next_r2) {
-                (Some(record_r1), Some(record_r2)) => {
-                    let parsed_r1 = admission.parse("left", &mut stats, record_r1)?;
-                    let parsed_r2 = admission.parse("right", &mut stats, record_r2)?;
-                    let Some(pair) = admission.pair(&parsed_r1, &parsed_r2, &mut stats)? else {
+                loop {
+                    let next_r1 =
+                        catch_parser_panic(&input_label, "left", &stats, || parser_r1.next())?;
+                    let next_r2 =
+                        catch_parser_panic(&input_label, "right", &stats, || parser_r2.next())?;
+
+                    match (next_r1, next_r2) {
+                        (Some(record_r1), Some(record_r2)) => {
+                            let parsed_r1 = admission.parse("left", &mut stats, record_r1)?;
+                            let parsed_r2 = admission.parse("right", &mut stats, record_r2)?;
+                            let Some(pair) = admission.pair(&parsed_r1, &parsed_r2, &mut stats)?
+                            else {
+                                continue;
+                            };
+
+                            arena.reset();
+                            let outcome = plan.execute(pair, &mut arena, &mut stats)?;
+                            output.write_outcome(&outcome, &mut stats).wrap_err(
+                                "failed to write paired output record group\nhelp: check downstream pipe or output filesystem health",
+                            )?;
+                            progress.maybe_report(&stats);
+                        }
+                        (None, None) => break,
+                        _ => bail!(
+                            "paired FASTQ inputs have different record counts\n\
+                             source: {}\n\
+                             complete_pairs_seen: {}\n\
+                             reads_seen_before_failure: {}\n\
+                             help: confirm --in1 and --in2 are mates from the same run and were not independently filtered or truncated",
+                            input_label,
+                            stats.pairs_seen,
+                            stats.reads_seen,
+                        ),
+                    }
+                }
+            }
+            PairedReaders::Interleaved(reader) => {
+                let mut parser = parse_fastx_reader(reader).wrap_err(
+                    "failed to initialize FASTQ parser for interleaved paired input\nhelp: confirm --in is readable FASTQ and has the expected compression",
+                )?;
+                let mut left_buffer = InterleavedLeftBuffer::default();
+
+                loop {
+                    let next_left =
+                        catch_parser_panic(&input_label, "left", &stats, || parser.next())?;
+                    let Some(left_record) = next_left else {
+                        break;
+                    };
+
+                    let parsed_left = admission.parse("left", &mut stats, left_record)?;
+                    let left =
+                        admission.buffered_left_record(&parsed_left, &stats, &mut left_buffer)?;
+
+                    let next_right =
+                        catch_parser_panic(&input_label, "right", &stats, || parser.next())?;
+                    let Some(right_record) = next_right else {
+                        bail!(
+                            "interleaved paired FASTQ ended with an unpaired read\n\
+                             source: {}\n\
+                             complete_pairs_seen: {}\n\
+                             reads_seen_before_failure: {}\n\
+                             help: confirm --in contains adjacent read pairs and was not truncated",
+                            input_label,
+                            stats.pairs_seen,
+                            stats.reads_seen,
+                        );
+                    };
+                    let parsed_right = admission.parse("right", &mut stats, right_record)?;
+                    let right =
+                        admission.paired_record(&parsed_right, MateSide::Right, "right", &stats)?;
+
+                    let Some(pair) = admission.admit_pair(left, right, &mut stats)? else {
                         continue;
                     };
 
                     arena.reset();
-
                     let outcome = plan.execute(pair, &mut arena, &mut stats)?;
                     output.write_outcome(&outcome, &mut stats).wrap_err(
                         "failed to write paired output record group\nhelp: check downstream pipe or output filesystem health",
                     )?;
-
                     progress.maybe_report(&stats);
                 }
-                (None, None) => break,
-                _ => bail!(
-                    "paired FASTQ inputs have different record counts\n\
-                 source: {}\n\
-                 complete_pairs_seen: {}\n\
-                 reads_seen_before_failure: {}\n\
-                 help: confirm --in1 and --in2 are mates from the same run and were not independently filtered or truncated",
-                    input_label,
-                    stats.pairs_seen,
-                    stats.reads_seen,
-                ),
             }
         }
 
@@ -515,6 +622,32 @@ impl RunContext<PairedEnd> {
         })?;
         }
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct InterleavedLeftBuffer {
+    header: Vec<u8>,
+    sequence: Vec<u8>,
+    quality: Vec<u8>,
+}
+
+impl InterleavedLeftBuffer {
+    fn copy_from<'buffer>(
+        &'buffer mut self,
+        header: &[u8],
+        sequence: &[u8],
+        quality: &[u8],
+    ) -> RecordView<'buffer> {
+        self.header.clear();
+        self.sequence.clear();
+        self.quality.clear();
+
+        self.header.extend_from_slice(header);
+        self.sequence.extend_from_slice(sequence);
+        self.quality.extend_from_slice(quality);
+
+        RecordView::new(&self.header, &self.sequence, &self.quality)
     }
 }
 
@@ -612,29 +745,64 @@ impl FastqAdmission<'_, SingleEnd> {
     }
 }
 
-impl FastqAdmission<'_, PairedEnd> {
+impl<'source> FastqAdmission<'source, PairedEnd> {
     fn pair<'record>(
         &'record self,
         parsed_r1: &'record SequenceRecord<'_>,
         parsed_r2: &'record SequenceRecord<'_>,
         stats: &mut ReadStats,
     ) -> Result<Option<RecordPair<'record>>> {
+        let left = self.paired_record(parsed_r1, MateSide::Left, "left", stats)?;
+        let right = self.paired_record(parsed_r2, MateSide::Right, "right", stats)?;
+
+        self.admit_pair(left, right, stats)
+    }
+
+    fn paired_record<'record>(
+        &'record self,
+        parsed_record: &'record SequenceRecord<'_>,
+        mate: MateSide,
+        mate_label: &'static str,
+        stats: &ReadStats,
+    ) -> Result<RecordView<'record>> {
         let source = self.source.input_label();
-        let sequence_r1 = parsed_r1.raw_seq();
-        let sequence_r2 = parsed_r2.raw_seq();
-        let quality_r1 = parsed_r1
+        let sequence = parsed_record.raw_seq();
+        let quality = parsed_record
+            .qual()
+            .ok_or_else(|| missing_quality_error(&source, mate_label, stats))?;
+
+        Ok(RecordView::new(parsed_record.id(), sequence, quality)
+            .with_provenance(self.source.provenance(mate)))
+    }
+
+    fn buffered_left_record<'record>(
+        &'record self,
+        parsed_record: &SequenceRecord<'_>,
+        stats: &ReadStats,
+        buffer: &'record mut InterleavedLeftBuffer,
+    ) -> Result<RecordView<'record>>
+    where
+        'source: 'record,
+    {
+        let source = self.source.input_label();
+        let sequence = parsed_record.raw_seq();
+        let quality = parsed_record
             .qual()
             .ok_or_else(|| missing_quality_error(&source, "left", stats))?;
-        let quality_r2 = parsed_r2
-            .qual()
-            .ok_or_else(|| missing_quality_error(&source, "right", stats))?;
-        let left = RecordView::new(parsed_r1.id(), sequence_r1, quality_r1)
-            .with_provenance(self.source.provenance(MateSide::Left));
-        let right = RecordView::new(parsed_r2.id(), sequence_r2, quality_r2)
-            .with_provenance(self.source.provenance(MateSide::Right));
 
-        stats.record_seen(sequence_r1.len());
-        stats.record_seen(sequence_r2.len());
+        Ok(buffer
+            .copy_from(parsed_record.id(), sequence, quality)
+            .with_provenance(self.source.provenance(MateSide::Left)))
+    }
+
+    fn admit_pair<'record>(
+        &self,
+        left: RecordView<'record>,
+        right: RecordView<'record>,
+        stats: &mut ReadStats,
+    ) -> Result<Option<RecordPair<'record>>> {
+        stats.record_seen(left.sequence().len());
+        stats.record_seen(right.sequence().len());
         stats.pairs_seen += 1;
 
         left.validate_pair(right, self.policy, stats)
@@ -728,6 +896,8 @@ mod tests {
     fn test_cli() -> Cli {
         Cli {
             ena: None,
+            input: None,
+            paired: false,
             in1: None,
             in2: None,
             min_length: 50,
@@ -913,11 +1083,14 @@ mod tests {
         let ui = cli.ui_policy();
         let config = RunConfig::from(&cli);
         let error = PairedEndContext {
-            source: PairedSource::Local {
+            source: PairedSource::LocalSplit {
                 input1: "reads_1.fastq.gz".into(),
                 input2: "reads_2.fastq.gz".into(),
             },
-            readers: (Box::new(r1), Box::new(r2)),
+            readers: super::PairedReaders::Split {
+                left: Box::new(r1),
+                right: Box::new(r2),
+            },
             output,
             _layout: PhantomData,
         }

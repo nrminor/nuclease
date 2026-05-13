@@ -19,7 +19,7 @@ fn local_single_fastq_streams_cleaned_reads_and_writes_summary() {
 
     let output = nuclease()
         .args([
-            "--in1",
+            "--in",
             input.to_str().expect("fixture path should be UTF-8"),
             "--min-length",
             "4",
@@ -61,7 +61,7 @@ fn adapter_preset_defaults_to_illumina_truseq() {
 
     let output = nuclease()
         .args([
-            "--in1",
+            "--in",
             input.to_str().expect("fixture path should be UTF-8"),
             "--min-length",
             "1",
@@ -91,7 +91,7 @@ fn adapter_preset_none_skips_adapter_trimming() {
 
     let output = nuclease()
         .args([
-            "--in1",
+            "--in",
             input.to_str().expect("fixture path should be UTF-8"),
             "--adapter-preset",
             "none",
@@ -126,7 +126,7 @@ fn warn_drop_invalid_fastq_policy_does_not_recover_parser_error() {
 
     let output = nuclease()
         .args([
-            "--in1",
+            "--in",
             input.to_str().expect("fixture path should be UTF-8"),
             "--min-length",
             "4",
@@ -174,7 +174,7 @@ fn invalid_fastq_report_writes_fatal_parser_error_as_jsonl() {
 
     let output = nuclease()
         .args([
-            "--in1",
+            "--in",
             input.to_str().expect("fixture path should be UTF-8"),
             "--min-length",
             "4",
@@ -248,7 +248,7 @@ fn malformed_fastq_does_not_surface_raw_parser_slice_panic() {
 
     let output = nuclease()
         .args([
-            "--in1",
+            "--in",
             input.to_str().expect("fixture path should be UTF-8"),
             "--min-length",
             "1",
@@ -301,7 +301,55 @@ fn paired_fastq_streams_interleaved_reads_and_writes_summary() {
             input1.to_str().expect("read 1 path should be UTF-8"),
             "--in2",
             input2.to_str().expect("read 2 path should be UTF-8"),
-            "--interleaved",
+            "--interleaved-out",
+            "--min-length",
+            "4",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "--summary",
+            summary.to_str().expect("summary path should be UTF-8"),
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"@read1/1\nAAAA\n+\nIIII\n@read1/2\nTTTT\n+\nKKKK\n@read2/1\nCCCC\n+\nJJJJ\n@read2/2\nGGGG\n+\nLLLL\n"
+    );
+
+    let summary_json = fs::read_to_string(summary).expect("summary should be readable");
+    let summary: Value = serde_json::from_str(&summary_json).expect("summary should be JSON");
+    assert_eq!(summary["reads_seen"], 4);
+    assert_eq!(summary["reads_emitted"], 4);
+    assert_eq!(summary["pairs_seen"], 2);
+    assert_eq!(summary["pairs_emitted"], 2);
+}
+
+#[test]
+fn interleaved_paired_input_streams_pairs_and_writes_summary() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads_interleaved.fastq");
+    let summary = temp.path().join("summary.json");
+    fs::write(
+        &input,
+        b"@read1/1\nAAAA\n+\nIIII\n@read1/2\nTTTT\n+\nKKKK\n@read2/1\nCCCC\n+\nJJJJ\n@read2/2\nGGGG\n+\nLLLL\n",
+    )
+    .expect("interleaved fixture should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("input path should be UTF-8"),
+            "--paired",
+            "--interleaved-out",
             "--min-length",
             "4",
             "--trim-min-q",
@@ -357,7 +405,7 @@ fn paired_fastq_merge_pairs_emits_merged_record() {
             "--in2",
             input2.to_str().expect("read 2 path should be UTF-8"),
             "--merge-pairs",
-            "--interleaved",
+            "--interleaved-out",
             "--adapter-preset",
             "none",
             "--min-length",
@@ -398,6 +446,62 @@ fn paired_fastq_merge_pairs_emits_merged_record() {
 }
 
 #[test]
+fn interleaved_paired_input_can_merge_pairs() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads_interleaved.fastq");
+    fs::write(
+        &input,
+        concat!(
+            "@read-1/1\n",
+            "ACGTTGCAGTACGATCGTACGGAATTCGCCGATGACTGACCTAGGTCAGTACGATC\n",
+            "+\n",
+            "IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+            "@read-1/2\n",
+            "GATCGTACTGACCTAGGTCAGTCATCGGCGAATTCCGTACGATCGTACTGCAACGT\n",
+            "+\n",
+            "IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+        ),
+    )
+    .expect("interleaved fixture should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("input path should be UTF-8"),
+            "--paired",
+            "--merge-pairs",
+            "--interleaved-out",
+            "--adapter-preset",
+            "none",
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("FASTQ output should be UTF-8");
+    assert!(
+        stdout.starts_with("@read-1\n"),
+        "merged read should use normalized pair id as header: {stdout}"
+    );
+    assert_eq!(
+        stdout.matches('\n').count(),
+        4,
+        "merged interleaved pair should emit one FASTQ record: {stdout}"
+    );
+}
+
+#[test]
 fn paired_fastq_merge_pairs_keeps_unmerged_pair() {
     let temp = tempdir().expect("tempdir should be created");
     let input1 = temp.path().join("reads_1.fastq");
@@ -415,7 +519,7 @@ fn paired_fastq_merge_pairs_keeps_unmerged_pair() {
             "--in2",
             input2.to_str().expect("read 2 path should be UTF-8"),
             "--merge-pairs",
-            "--interleaved",
+            "--interleaved-out",
             "--adapter-preset",
             "none",
             "--min-length",
@@ -474,7 +578,7 @@ fn paired_fastq_merge_min_overlap_can_reject_shorter_overlap() {
             "--merge-pairs",
             "--merge-min-overlap",
             "80",
-            "--interleaved",
+            "--interleaved-out",
             "--adapter-preset",
             "none",
             "--min-length",
@@ -509,7 +613,7 @@ fn merge_pairs_rejects_single_end_input() {
 
     let output = nuclease()
         .args([
-            "--in1",
+            "--in",
             input.to_str().expect("input path should be UTF-8"),
             "--merge-pairs",
             "-qqq",
@@ -583,7 +687,7 @@ fn paired_fastq_count_mismatch_reports_source_and_progress() {
             input1.to_str().expect("read 1 path should be UTF-8"),
             "--in2",
             input2.to_str().expect("read 2 path should be UTF-8"),
-            "--interleaved",
+            "--interleaved-out",
             "--min-length",
             "4",
             "--trim-min-q",
@@ -625,7 +729,7 @@ fn paired_fastq_mate_id_mismatch_errors_by_default() {
             input1.to_str().expect("read 1 path should be UTF-8"),
             "--in2",
             input2.to_str().expect("read 2 path should be UTF-8"),
-            "--interleaved",
+            "--interleaved-out",
             "--min-length",
             "4",
             "--trim-min-q",
@@ -670,7 +774,7 @@ fn paired_fastq_mate_id_mismatch_warn_drop_continues_with_later_pairs() {
             input1.to_str().expect("read 1 path should be UTF-8"),
             "--in2",
             input2.to_str().expect("read 2 path should be UTF-8"),
-            "--interleaved",
+            "--interleaved-out",
             "--min-length",
             "4",
             "--trim-min-q",

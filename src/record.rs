@@ -201,6 +201,8 @@ pub enum InputSource<'a> {
     Ena { accession: &'a str },
     /// Record loaded from one local FASTQ file.
     LocalSingle { input: &'a Path },
+    /// Record loaded from one interleaved local paired FASTQ file.
+    LocalInterleavedPaired { input: &'a Path },
     /// Record loaded from one of two local paired FASTQ files.
     LocalPaired { input1: &'a Path, input2: &'a Path },
 }
@@ -417,6 +419,10 @@ impl<'a> RecordView<'a> {
                 source: InputSource::LocalSingle { input },
                 ..
             }) => format!("local:{}", input.display()),
+            Some(RecordProvenance {
+                source: InputSource::LocalInterleavedPaired { input },
+                ..
+            }) => format!("local-interleaved:{}", input.display()),
             Some(RecordProvenance {
                 source: InputSource::LocalPaired { input1, input2 },
                 ..

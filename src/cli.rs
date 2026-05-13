@@ -39,17 +39,20 @@ pub const INFO: &str = r"
 
 const AFTER_HELP: &str = "\
 Examples:
-  nuclease --in1 reads.fastq.gz > cleaned.fastq
+  nuclease --in reads.fastq.gz > cleaned.fastq
 
   nuclease --in1 reads_1.fastq.gz --in2 reads_2.fastq.gz \
     --out1 cleaned_1.fastq.gz --out2 cleaned_2.fastq.gz
 
+  nuclease --in reads.interleaved.fastq.gz --paired --interleaved-out \
+    > cleaned.interleaved.fastq
+
   nuclease --ena SRR35939766 --summary run-summary.json > cleaned.fastq
 
-  nuclease --in1 reads.fastq.gz --trim-min-q 20 --min-length 75 --min-entropy 1.2 \
+  nuclease --in reads.fastq.gz --trim-min-q 20 --min-length 75 --min-entropy 1.2 \
     > stricter.fastq
 
-  nuclease --in1 reads.fastq.gz | sourmash scripts singlesketch - --output reads.sig
+  nuclease --in reads.fastq.gz | sourmash scripts singlesketch - --output reads.sig
 ";
 
 pub const STYLES: Styles = Styles::styled()
@@ -110,19 +113,40 @@ impl fmt::Display for InvalidFastqPolicy {
 #[command(group(
     ArgGroup::new("ingress")
         .required(true)
-        .args(["ena", "in1"])
+        .args(["ena", "input", "in1"])
 ))]
 pub struct Cli {
     /// ENA run accession to resolve and stream.
     #[arg(long, help_heading = "Inputs", help = "ENA run accession to stream")]
     pub ena: Option<Accession>,
 
-    /// Local FASTQ input for read 1.
-    #[arg(long, help_heading = "Inputs", help = "Local FASTQ input for read 1")]
+    /// Local FASTQ input. Treated as single-end unless `--paired` is also passed.
+    #[arg(long = "in", help_heading = "Inputs", help = "Local FASTQ input")]
+    pub input: Option<PathBuf>,
+
+    /// Treat `--in` as interleaved paired-end FASTQ.
+    #[arg(
+        long,
+        requires = "input",
+        help_heading = "Inputs",
+        help = "Treat --in as interleaved paired-end FASTQ"
+    )]
+    pub paired: bool,
+
+    /// Local FASTQ input for split paired read 1.
+    #[arg(
+        long,
+        help_heading = "Inputs",
+        help = "Local FASTQ input for split paired read 1"
+    )]
     pub in1: Option<PathBuf>,
 
-    /// Local FASTQ input for read 2.
-    #[arg(long, help_heading = "Inputs", help = "Local FASTQ input for read 2")]
+    /// Local FASTQ input for split paired read 2.
+    #[arg(
+        long,
+        help_heading = "Inputs",
+        help = "Local FASTQ input for split paired read 2"
+    )]
     pub in2: Option<PathBuf>,
 
     /// Minimum post-trim read length.
@@ -227,7 +251,8 @@ pub struct Cli {
 
     /// Emit paired records as an interleaved output stream.
     #[arg(
-        long,
+        long = "interleaved-out",
+        alias = "interleaved",
         help_heading = "Outputs",
         help = "Write paired output as one interleaved stream"
     )]
@@ -322,8 +347,10 @@ pub enum Ingress {
     Ena { accession: Accession },
     /// Local single-end FASTQ ingress.
     LocalSingle { fastq: PathBuf },
-    /// Local paired-end FASTQ ingress.
-    LocalPaired { r1: PathBuf, r2: PathBuf },
+    /// Local interleaved paired-end FASTQ ingress.
+    LocalInterleavedPaired { fastq: PathBuf },
+    /// Local split paired-end FASTQ ingress.
+    LocalSplitPaired { r1: PathBuf, r2: PathBuf },
 }
 
 impl Cli {
@@ -386,17 +413,44 @@ impl Cli {
     /// Returns an error when the CLI-selected ingress arguments do not describe a supported
     /// combination.
     pub fn ingress(&self) -> Result<Ingress> {
-        match (&self.ena, &self.in1, &self.in2) {
-            (Some(accession), None, None) => Ok(Ingress::Ena {
+        if self.ena.is_some() && self.paired {
+            bail!(
+                "--paired applies only to local --in input; ENA layout is detected automatically"
+            );
+        }
+
+        if self.paired && self.input.is_none() {
+            bail!("--paired requires --in because split --in1/--in2 input is already paired");
+        }
+
+        if self.ena.is_some() && (self.input.is_some() || self.in1.is_some() || self.in2.is_some())
+        {
+            bail!("choose either --ena or local FASTQ input, not both");
+        }
+
+        if self.input.is_some() && (self.in1.is_some() || self.in2.is_some()) {
+            bail!("--in cannot be combined with --in1/--in2");
+        }
+
+        match (&self.ena, &self.input, &self.in1, &self.in2, self.paired) {
+            (Some(accession), None, None, None, false) => Ok(Ingress::Ena {
                 accession: accession.clone(),
             }),
-            (None, Some(in1), Some(in2)) => Ok(Ingress::LocalPaired {
+            (None, Some(input), None, None, true) => Ok(Ingress::LocalInterleavedPaired {
+                fastq: input.clone(),
+            }),
+            (None, Some(input), None, None, false) => Ok(Ingress::LocalSingle {
+                fastq: input.clone(),
+            }),
+            (None, None, Some(in1), Some(in2), _) => Ok(Ingress::LocalSplitPaired {
                 r1: in1.clone(),
                 r2: in2.clone(),
             }),
-            (None, Some(in1), None) => Ok(Ingress::LocalSingle { fastq: in1.clone() }),
-            (None, None, Some(_)) => bail!("--in2 requires --in1"),
-            _ => bail!("choose either --ena or local FASTQ input"),
+            (None, None, Some(_), None, _) => {
+                bail!("--in1 requires --in2; use --in for single-end input")
+            }
+            (None, None, None, Some(_), _) => bail!("--in2 requires --in1"),
+            _ => bail!("choose either --ena, --in, or --in1/--in2"),
         }
     }
 
@@ -432,7 +486,9 @@ mod tests {
     fn base_cli() -> Cli {
         Cli {
             ena: None,
-            in1: Some(PathBuf::from("reads.fastq.gz")),
+            input: Some(PathBuf::from("reads.fastq.gz")),
+            paired: false,
+            in1: None,
             in2: None,
             min_length: 50,
             max_ns: 4,
@@ -469,6 +525,8 @@ mod tests {
     fn ingress_returns_ena_variant_for_accession_input() -> Result<()> {
         let cli = Cli {
             ena: Some(Accession::new("SRR35939766")?),
+            input: None,
+            paired: false,
             in1: None,
             in2: None,
             min_length: 50,
@@ -504,6 +562,8 @@ mod tests {
     fn ingress_returns_local_paired_variant_when_both_fastqs_are_present() -> Result<()> {
         let cli = Cli {
             ena: None,
+            input: None,
+            paired: false,
             in1: Some(PathBuf::from("reads_1.fastq.gz")),
             in2: Some(PathBuf::from("reads_2.fastq.gz")),
             min_length: 50,
@@ -531,8 +591,37 @@ mod tests {
         };
 
         let ingress = cli.ingress()?;
-        assert!(matches!(ingress, Ingress::LocalPaired { .. }));
+        assert!(matches!(ingress, Ingress::LocalSplitPaired { .. }));
         Ok(())
+    }
+
+    #[test]
+    fn ingress_returns_local_single_variant_for_in_without_paired() -> Result<()> {
+        let ingress = base_cli().ingress()?;
+        assert!(matches!(ingress, Ingress::LocalSingle { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn ingress_returns_interleaved_paired_variant_for_in_with_paired() -> Result<()> {
+        let mut cli = base_cli();
+        cli.paired = true;
+
+        let ingress = cli.ingress()?;
+        assert!(matches!(ingress, Ingress::LocalInterleavedPaired { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn ingress_rejects_in1_without_in2() {
+        let mut cli = base_cli();
+        cli.input = None;
+        cli.in1 = Some(PathBuf::from("reads_1.fastq.gz"));
+
+        let error = cli
+            .ingress()
+            .expect_err("--in1 alone should no longer mean single-end input");
+        assert!(error.to_string().contains("--in1 requires --in2"));
     }
 
     #[test]

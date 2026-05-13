@@ -95,7 +95,7 @@ impl OutputArgs {
         if self.merge_pairs && (self.out1.is_some() || self.out2.is_some()) {
             bail!(
                 "--merge-pairs cannot be used with split paired output yet\n\
-                 help: merged and unmerged reads require one output stream; use --interleaved or --out"
+                 help: merged and unmerged reads require one output stream; use --interleaved-out or --out"
             );
         }
 
@@ -116,7 +116,7 @@ impl OutputArgs {
         match (&self.out, &self.out1, &self.out2, self.interleaved) {
             (_, _, _, true) => bail!(
                 "single-end ingress cannot be emitted as interleaved output\n\
-                 help: remove --interleaved, or provide paired input with --in1 and --in2"
+                  help: remove --interleaved-out, or provide paired input with --in --paired or --in1 and --in2"
             ),
             (None, None, None, false) => match (self.format, encoding) {
                 (OutputFormat::Fastq, OutputEncoding::Plain) => {
@@ -179,16 +179,16 @@ impl OutputArgs {
             (true, None, Some(_), Some(_)) => {
                 bail!(
                     "interleaved paired output uses stdout or --out, not --out1/--out2\n\
-                     help: either remove --interleaved for split paired files, or replace --out1/--out2 with --out"
+                     help: either remove --interleaved-out for split paired files, or replace --out1/--out2 with --out"
                 )
             }
             (false, None, None, None) => bail!(
                 "split paired output requires --out1 and --out2\n\
-                 help: provide both split output paths, or add --interleaved to write paired reads to stdout"
+                 help: provide both split output paths, or add --interleaved-out to write paired reads to stdout"
             ),
             (false, Some(_), _, _) => bail!(
                 "split paired output cannot use --out\n\
-                 help: use --out1/--out2 for split paired output, or add --interleaved when using --out"
+                 help: use --out1/--out2 for split paired output, or add --interleaved-out when using --out"
             ),
             (true, None, None, None) => match (self.format, encoding) {
                 (OutputFormat::Fastq, OutputEncoding::Plain) => {
@@ -257,7 +257,7 @@ impl OutputArgs {
             },
             _ => bail!(
                 "invalid paired output destination combination\n\
-                 help: paired output must be either split (--out1 and --out2) or interleaved (--interleaved with stdout or --out)"
+                 help: paired output must be either split (--out1 and --out2) or interleaved (--interleaved-out with stdout or --out)"
             ),
         }
     }
@@ -1062,7 +1062,7 @@ impl UnitOutput for PairedOutputHandle {
                 }
                 Self::Split(_) => bail!(
                     "split paired output cannot represent a merged single read\n\
-                     help: use --interleaved or --out when --merge-pairs is enabled"
+                      help: use --interleaved-out or --out when --merge-pairs is enabled"
                 ),
             },
             EmittedUnit::Pair(pair) => {
