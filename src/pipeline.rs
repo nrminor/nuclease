@@ -910,7 +910,6 @@ mod tests {
             merge_max_mismatch_rate: 0.2,
             merge_min_correction_delta_q: 0,
             min_entropy: 0.0,
-            interleaved: true,
             output_format: OutputFormat::Fastq,
             output_encoding: None,
             invalid_fastq_policy: InvalidFastqPolicy::Error,
@@ -1071,7 +1070,6 @@ mod tests {
         let r2 = Cursor::new(b"@r1/2\nTTTT\n+\nKKKK\n".as_slice());
 
         let output_args = OutputArgs::new(
-            true,
             OutputFormat::Fastq,
             Some(OutputEncoding::Plain),
             Some(out),

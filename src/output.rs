@@ -19,7 +19,6 @@ use crate::{
 /// Raw output arguments selected by the CLI before they are resolved into valid output handles.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OutputArgs {
-    interleaved: bool,
     format: OutputFormat,
     encoding: Option<OutputEncoding>,
     out: Option<PathBuf>,
@@ -31,7 +30,6 @@ pub struct OutputArgs {
 impl OutputArgs {
     /// Construct raw output arguments from CLI-provided selections.
     pub fn new(
-        interleaved: bool,
         format: OutputFormat,
         encoding: Option<OutputEncoding>,
         out: Option<PathBuf>,
@@ -39,7 +37,6 @@ impl OutputArgs {
         out2: Option<PathBuf>,
     ) -> Self {
         Self {
-            interleaved,
             format,
             encoding,
             out,
@@ -95,7 +92,7 @@ impl OutputArgs {
         if self.merge_pairs && (self.out1.is_some() || self.out2.is_some()) {
             bail!(
                 "--merge-pairs cannot be used with split paired output yet\n\
-                 help: merged and unmerged reads require one output stream; use --interleaved-out or --out"
+                 help: merged and unmerged reads require one output stream; use stdout or --out"
             );
         }
 
@@ -113,12 +110,8 @@ impl OutputArgs {
     /// combination or when the selected sink cannot be opened.
     pub fn resolve_single(self) -> Result<SingleOutputHandle> {
         let encoding = self.resolved_single_encoding();
-        match (&self.out, &self.out1, &self.out2, self.interleaved) {
-            (_, _, _, true) => bail!(
-                "single-end ingress cannot be emitted as interleaved output\n\
-                  help: remove --interleaved-out, or provide paired input with --in --paired or --in1 and --in2"
-            ),
-            (None, None, None, false) => match (self.format, encoding) {
+        match (&self.out, &self.out1, &self.out2) {
+            (None, None, None) => match (self.format, encoding) {
                 (OutputFormat::Fastq, OutputEncoding::Plain) => {
                     OutputBuilder::new().single().stdout().build()
                 }
@@ -135,7 +128,7 @@ impl OutputArgs {
                     .gzip()
                     .build(),
             },
-            (Some(path), None, None, false) => match (self.format, encoding) {
+            (Some(path), None, None) => match (self.format, encoding) {
                 (OutputFormat::Fastq, OutputEncoding::Plain) => {
                     OutputBuilder::new().single().file(path.clone()).build()
                 }
@@ -175,22 +168,8 @@ impl OutputArgs {
     pub fn resolve_paired(self) -> Result<PairedOutputHandle> {
         self.validate_paired_merge_output()?;
         let encoding = self.resolved_paired_encoding()?;
-        match (self.interleaved, &self.out, &self.out1, &self.out2) {
-            (true, None, Some(_), Some(_)) => {
-                bail!(
-                    "interleaved paired output uses stdout or --out, not --out1/--out2\n\
-                     help: either remove --interleaved-out for split paired files, or replace --out1/--out2 with --out"
-                )
-            }
-            (false, None, None, None) => bail!(
-                "split paired output requires --out1 and --out2\n\
-                 help: provide both split output paths, or add --interleaved-out to write paired reads to stdout"
-            ),
-            (false, Some(_), _, _) => bail!(
-                "split paired output cannot use --out\n\
-                 help: use --out1/--out2 for split paired output, or add --interleaved-out when using --out"
-            ),
-            (true, None, None, None) => match (self.format, encoding) {
+        match (&self.out, &self.out1, &self.out2) {
+            (None, None, None) => match (self.format, encoding) {
                 (OutputFormat::Fastq, OutputEncoding::Plain) => {
                     OutputBuilder::new().paired().interleaved_stdout().build()
                 }
@@ -211,7 +190,7 @@ impl OutputArgs {
                     .gzip()
                     .build(),
             },
-            (true, Some(path), None, None) => match (self.format, encoding) {
+            (Some(path), None, None) => match (self.format, encoding) {
                 (OutputFormat::Fastq, OutputEncoding::Plain) => OutputBuilder::new()
                     .paired()
                     .interleaved_file(path.clone())
@@ -233,7 +212,7 @@ impl OutputArgs {
                     .gzip()
                     .build(),
             },
-            (false, None, Some(r1), Some(r2)) => match (self.format, encoding) {
+            (None, Some(r1), Some(r2)) => match (self.format, encoding) {
                 (OutputFormat::Fastq, OutputEncoding::Plain) => OutputBuilder::new()
                     .paired()
                     .split_files(r1.clone(), r2.clone())
@@ -257,7 +236,7 @@ impl OutputArgs {
             },
             _ => bail!(
                 "invalid paired output destination combination\n\
-                 help: paired output must be either split (--out1 and --out2) or interleaved (--interleaved-out with stdout or --out)"
+                 help: paired output uses one stream by default (stdout or --out), or split streams with --out1 and --out2"
             ),
         }
     }
@@ -1062,7 +1041,7 @@ impl UnitOutput for PairedOutputHandle {
                 }
                 Self::Split(_) => bail!(
                     "split paired output cannot represent a merged single read\n\
-                      help: use --interleaved-out or --out when --merge-pairs is enabled"
+                      help: use stdout or --out when --merge-pairs is enabled"
                 ),
             },
             EmittedUnit::Pair(pair) => {
@@ -1141,7 +1120,6 @@ mod tests {
         let temp = tempdir()?;
         let out = temp.path().join("single.fastq");
         let output = OutputArgs::new(
-            false,
             OutputFormat::Fastq,
             Some(OutputEncoding::Plain),
             Some(out.clone()),
@@ -1162,7 +1140,6 @@ mod tests {
         let r1_path = temp.path().join("r1.fastq");
         let r2_path = temp.path().join("r2.fastq");
         let output = OutputArgs::new(
-            false,
             OutputFormat::Fastq,
             Some(OutputEncoding::Plain),
             None,
@@ -1220,7 +1197,6 @@ mod tests {
         let r2_path = temp.path().join("r2.fastq");
 
         let output = OutputArgs::new(
-            false,
             OutputFormat::Fastq,
             Some(OutputEncoding::Plain),
             None,
@@ -1253,7 +1229,6 @@ mod tests {
         let r2_path = temp.path().join("r2.fastq.gz");
 
         let output = OutputArgs::new(
-            false,
             OutputFormat::Fastq,
             Some(OutputEncoding::Gzip),
             None,
@@ -1285,14 +1260,7 @@ mod tests {
     fn single_output_infers_gzip_from_gz_path() -> Result<()> {
         let temp = tempdir()?;
         let out = temp.path().join("single.fastq.gz");
-        let output = OutputArgs::new(
-            false,
-            OutputFormat::Fastq,
-            None,
-            Some(out.clone()),
-            None,
-            None,
-        );
+        let output = OutputArgs::new(OutputFormat::Fastq, None, Some(out.clone()), None, None);
         let mut handle = output.resolve_single()?;
         handle.write_record(RecordView::new(b"single", b"ACGT", b"IIII"))?;
         handle.finish()?;
@@ -1304,7 +1272,6 @@ mod tests {
     #[test]
     fn paired_output_rejects_inconsistent_inferred_encodings() {
         let output = OutputArgs::new(
-            false,
             OutputFormat::Fastq,
             None,
             None,
@@ -1325,7 +1292,6 @@ mod tests {
     #[test]
     fn paired_output_rejects_split_output_when_merge_pairs_is_enabled() {
         let output = OutputArgs::new(
-            false,
             OutputFormat::Fastq,
             Some(OutputEncoding::Plain),
             None,

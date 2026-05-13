@@ -44,8 +44,7 @@ Examples:
   nuclease --in1 reads_1.fastq.gz --in2 reads_2.fastq.gz \
     --out1 cleaned_1.fastq.gz --out2 cleaned_2.fastq.gz
 
-  nuclease --in reads.interleaved.fastq.gz --paired --interleaved-out \
-    > cleaned.interleaved.fastq
+  nuclease --in reads.interleaved.fastq.gz --paired --out cleaned.interleaved.fastq.gz
 
   nuclease --ena SRR35939766 --summary run-summary.json > cleaned.fastq
 
@@ -249,15 +248,6 @@ pub struct Cli {
     )]
     pub invalid_fastq_policy: InvalidFastqPolicy,
 
-    /// Emit paired records as an interleaved output stream.
-    #[arg(
-        long = "interleaved-out",
-        alias = "interleaved",
-        help_heading = "Outputs",
-        help = "Write paired output as one interleaved stream"
-    )]
-    pub interleaved: bool,
-
     /// Output record format.
     #[arg(
         long,
@@ -277,12 +267,12 @@ pub struct Cli {
     )]
     pub output_encoding: Option<OutputEncoding>,
 
-    /// Single output path for single-end or interleaved paired output.
+    /// Write the run's natural single output stream to this path.
     #[arg(
         long,
         conflicts_with_all = ["out1", "out2"],
         help_heading = "Outputs",
-        help = "Write output to a single file instead of stdout"
+        help = "Write the natural single output stream to this file"
     )]
     pub out: Option<PathBuf>,
 
@@ -457,7 +447,6 @@ impl Cli {
     /// Convert CLI output flags into raw output arguments for typestate resolution.
     pub fn output_args(&self) -> OutputArgs {
         OutputArgs::new(
-            self.interleaved,
             self.output_format,
             self.output_encoding,
             self.out.clone(),
@@ -501,7 +490,6 @@ mod tests {
             merge_max_mismatch_rate: 0.2,
             merge_min_correction_delta_q: 0,
             invalid_fastq_policy: InvalidFastqPolicy::Error,
-            interleaved: false,
             output_format: OutputFormat::Fastq,
             output_encoding: None,
             out: None,
@@ -540,7 +528,6 @@ mod tests {
             merge_max_mismatch_rate: 0.2,
             merge_min_correction_delta_q: 0,
             invalid_fastq_policy: InvalidFastqPolicy::Error,
-            interleaved: false,
             output_format: OutputFormat::Fastq,
             output_encoding: Some(OutputEncoding::Plain),
             out: None,
@@ -577,7 +564,6 @@ mod tests {
             merge_max_mismatch_rate: 0.2,
             merge_min_correction_delta_q: 0,
             invalid_fastq_policy: InvalidFastqPolicy::Error,
-            interleaved: true,
             output_format: OutputFormat::Fastq,
             output_encoding: Some(OutputEncoding::Plain),
             out: None,

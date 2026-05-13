@@ -12,7 +12,6 @@ Here's what I mean:
 ```bash
 nuclease \
 --ena SRR35946892 \
---interleaved-out \
 --min-length 100 \
 --max-ns 0 \
 --min-mean-q 20 \
@@ -56,7 +55,7 @@ Supported transforms are:
 
 For paired-end input, the CLI currently uses the `DropPair` orphan policy during paired processing: if one mate is rejected, the surviving mate is suppressed rather than emitted. With `--merge-pairs`, successfully merged pairs become single records and continue through the rest of the pipeline as single records. Pairs that cannot be merged continue through paired processing as the original mate pair. Because a merge-enabled run may contain a mix of merged single records and unmerged pairs, `--merge-pairs` requires paired input and single-stream output rather than split `--out1`/`--out2` files. The execution engine also has an internal `EmitOrphan` policy, but orphan emission is not exposed as a supported CLI/output mode yet.
 
-Local input can be single-end (`--in reads.fastq.gz`), interleaved paired-end (`--in reads.fastq.gz --paired`), or split paired-end (`--in1 reads_1.fastq.gz --in2 reads_2.fastq.gz`). Paired output can be split with `--out1`/`--out2` or written as one stream with `--interleaved-out`.
+Local input can be single-end (`--in reads.fastq.gz`), interleaved paired-end (`--in reads.fastq.gz --paired`), or split paired-end (`--in1 reads_1.fastq.gz --in2 reads_2.fastq.gz`). Output uses stdout by default. `--out` writes the run's natural single stream to a file: ordinary reads for single-end input, or interleaved pairs for paired input. Paired output can also be split with `--out1`/`--out2`.
 
 Invalid FASTQ handling is controlled with `--invalid-fastq-policy`. Recoverable invalid records or pairs, such as mate ID mismatches, can fail immediately, warn and drop, or silently drop depending on the selected policy. Parser-level corruption that cannot be safely resynchronized is still reported through the same policy and optional `--invalid-fastq-report` JSONL file, but remains fatal.
 
