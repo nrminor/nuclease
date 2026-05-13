@@ -53,7 +53,37 @@ fn local_single_fastq_streams_cleaned_reads_and_writes_summary() {
 }
 
 #[test]
-fn adapter_preset_defaults_to_illumina_truseq() {
+fn adapter_preset_defaults_to_no_adapter_trimming() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    let fixture = b"@read1\nACGTAGATCGGAAG\n+\nIIIIIIIIIIIIII\n";
+    fs::write(&input, fixture).expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, fixture);
+}
+
+#[test]
+fn illumina_truseq_adapter_preset_trims_suffix_overlap() {
     let temp = tempdir().expect("tempdir should be created");
     let input = temp.path().join("reads.fastq");
     fs::write(&input, b"@read1\nACGTAGATCGGAAG\n+\nIIIIIIIIIIIIII\n")
@@ -63,6 +93,8 @@ fn adapter_preset_defaults_to_illumina_truseq() {
         .args([
             "--in",
             input.to_str().expect("fixture path should be UTF-8"),
+            "--adapter-preset",
+            "illumina-truseq",
             "--min-length",
             "1",
             "--trim-min-q",
@@ -112,6 +144,68 @@ fn adapter_preset_none_skips_adapter_trimming() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.stdout, fixture);
+}
+
+#[test]
+fn mgi_dnbseq_adapter_preset_trims_suffix_overlap() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    fs::write(&input, b"@read1\nACGTAAGTCGGAGG\n+\nIIIIIIIIIIIIII\n")
+        .expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--adapter-preset",
+            "mgi-dnbseq",
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"@read1\nACGT\n+\nIIII\n");
+}
+
+#[test]
+fn inert_long_read_catalogs_are_not_cli_adapter_presets() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    let fixture = b"@read1\nACGTAAGAAAGTTGTC\n+\nIIIIIIIIIIIIIIII\n";
+    fs::write(&input, fixture).expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--adapter-preset",
+            "ont-native-barcoding-v14",
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        !output.status.success(),
+        "inert preset should not be accepted"
+    );
 }
 
 #[test]

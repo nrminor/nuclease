@@ -2,8 +2,6 @@
 
 use wide::u8x16;
 
-use clap::ValueEnum;
-
 use crate::{
     plan::{
         BuildPlan, IntoExecutionStep, ReadTransform, TransformArena, TransformResult, TransformStep,
@@ -11,58 +9,12 @@ use crate::{
     record::RecordView,
 };
 
-/// Curated adapter catalogs available to trimming transforms.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AdapterCatalog {
-    IlluminaTruSeq,
-}
+pub(crate) mod catalog;
+mod catalogs;
 
-/// Adapter trimming presets exposed by the CLI.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum AdapterPreset {
-    /// Do not trim adapters.
-    None,
-    /// Trim Illumina `TruSeq` adapter overlap.
-    #[value(name = "illumina-truseq", alias = "illumina-tru-seq")]
-    IlluminaTruSeq,
-}
+pub use catalog::AdapterPreset;
+use catalog::{AdapterCatalog, AdapterEntry};
 
-impl AdapterPreset {
-    /// Return the curated adapter catalog for presets that trim adapters.
-    pub(crate) const fn catalog(self) -> Option<AdapterCatalog> {
-        match self {
-            Self::None => None,
-            Self::IlluminaTruSeq => Some(AdapterCatalog::illumina_truseq()),
-        }
-    }
-}
-
-impl AdapterCatalog {
-    /// Construct the curated Illumina `TruSeq` adapter preset.
-    pub(crate) const fn illumina_truseq() -> Self {
-        Self::IlluminaTruSeq
-    }
-
-    /// Return the raw adapter sequences included in this preset.
-    fn adapters(self) -> &'static [&'static [u8]] {
-        match self {
-            Self::IlluminaTruSeq => &[TRUSEQ_R1, TRUSEQ_R2],
-        }
-    }
-
-    /// Build the default overlap matcher used for this preset.
-    fn default_matcher(self) -> AdapterMatcher<'static> {
-        AdapterMatcher {
-            adapters: self.adapters(),
-            min_overlap: 8,
-            max_mismatch_numerator: 1,
-            max_mismatch_denominator: 8,
-        }
-    }
-}
-
-const TRUSEQ_R1: &[u8] = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
-const TRUSEQ_R2: &[u8] = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT";
 /// SIMD chunk width used by the bytewise adapter mismatch counter.
 const SIMD_LANES: usize = 16;
 
@@ -81,7 +33,7 @@ impl AdapterMatch {
 }
 
 struct AdapterMatcher<'a> {
-    adapters: &'a [&'a [u8]],
+    catalog: &'a AdapterCatalog,
     min_overlap: usize,
     max_mismatch_numerator: usize,
     max_mismatch_denominator: usize,
@@ -97,8 +49,8 @@ impl AdapterMatcher<'_> {
     fn best_match(&self, read: &[u8]) -> Option<AdapterMatch> {
         let mut best: Option<AdapterMatch> = None;
 
-        for adapter in self.adapters {
-            let Some(candidate) = self.best_match_for_adapter(read, adapter) else {
+        for entry in self.catalog.current_suffix_trim_entries() {
+            let Some(candidate) = self.best_match_for_adapter(read, entry) else {
                 continue;
             };
 
@@ -114,7 +66,8 @@ impl AdapterMatcher<'_> {
     }
 
     /// Return the best valid overlap between one read and one adapter sequence.
-    fn best_match_for_adapter(&self, read: &[u8], adapter: &[u8]) -> Option<AdapterMatch> {
+    fn best_match_for_adapter(&self, read: &[u8], entry: &AdapterEntry) -> Option<AdapterMatch> {
+        let adapter = entry.sequence.as_bytes();
         let max_overlap = read.len().min(adapter.len());
         let mut best: Option<AdapterMatch> = None;
 
@@ -252,17 +205,22 @@ impl AdapterMatcher<'_> {
 
 /// Read transform that trims known adapter sequence from the end of a read.
 pub(crate) struct AdapterTrim {
-    catalog: AdapterCatalog,
+    catalog: &'static AdapterCatalog,
 }
 
 impl AdapterTrim {
     /// Construct a new adapter trimmer backed by the provided curated catalog.
-    pub(crate) const fn new(catalog: AdapterCatalog) -> Self {
+    pub(crate) const fn new(catalog: &'static AdapterCatalog) -> Self {
         Self { catalog }
     }
 
     fn default_matcher(&self) -> AdapterMatcher<'_> {
-        self.catalog.default_matcher()
+        AdapterMatcher {
+            catalog: self.catalog,
+            min_overlap: 8,
+            max_mismatch_numerator: 1,
+            max_mismatch_denominator: 8,
+        }
     }
 }
 
@@ -307,7 +265,7 @@ impl IntoExecutionStep for AdapterTrim {
 /// Fluent extension trait adding the `.trim_adapters(...)` transform combinator to plans.
 pub(crate) trait TrimAdaptersTransform: BuildPlan {
     /// Trim adapter overlap using the matching strategy associated with the selected catalog.
-    fn trim_adapters(self, catalog: AdapterCatalog) -> Self {
+    fn trim_adapters(self, catalog: &'static AdapterCatalog) -> Self {
         self.step(AdapterTrim::new(catalog))
     }
 }
@@ -316,18 +274,15 @@ impl<T> TrimAdaptersTransform for T where T: BuildPlan {}
 
 #[cfg(test)]
 mod tests {
-    use super::{AdapterCatalog, AdapterMatcher};
+    use super::{AdapterMatcher, catalogs};
 
     #[test]
     fn overlap_match_prefers_longest_valid_candidate() {
-        let matcher = {
-            let adapters: &[&[u8]] = &[b"AGATCGGAAGAG"];
-            AdapterMatcher {
-                adapters,
-                min_overlap: 4,
-                max_mismatch_numerator: 1,
-                max_mismatch_denominator: 8,
-            }
+        let matcher = AdapterMatcher {
+            catalog: &catalogs::illumina::ILLUMINA_TRUSEQ,
+            min_overlap: 4,
+            max_mismatch_numerator: 1,
+            max_mismatch_denominator: 8,
         };
         let candidate = matcher
             .best_match(b"TTTTAGATCGGA")
@@ -339,28 +294,22 @@ mod tests {
 
     #[test]
     fn overlap_match_rejects_short_overlap() {
-        let matcher = {
-            let adapters: &[&[u8]] = &[b"AGATCGGAAGAG"];
-            AdapterMatcher {
-                adapters,
-                min_overlap: 8,
-                max_mismatch_numerator: 1,
-                max_mismatch_denominator: 8,
-            }
+        let matcher = AdapterMatcher {
+            catalog: &catalogs::illumina::ILLUMINA_TRUSEQ,
+            min_overlap: 8,
+            max_mismatch_numerator: 1,
+            max_mismatch_denominator: 8,
         };
         assert!(matcher.best_match(b"TTTTAGAT").is_none());
     }
 
     #[test]
     fn overlap_match_accepts_bounded_mismatches() {
-        let matcher = {
-            let adapters: &[&[u8]] = &[b"AGATCGGAAGAG"];
-            AdapterMatcher {
-                adapters,
-                min_overlap: 8,
-                max_mismatch_numerator: 1,
-                max_mismatch_denominator: 4,
-            }
+        let matcher = AdapterMatcher {
+            catalog: &catalogs::illumina::ILLUMINA_TRUSEQ,
+            min_overlap: 8,
+            max_mismatch_numerator: 1,
+            max_mismatch_denominator: 4,
         };
         let candidate = matcher
             .best_match(b"TTTTAGATCGTA")
@@ -372,9 +321,13 @@ mod tests {
 
     #[test]
     fn illumina_catalog_exposes_matcher() {
-        let trim_end = AdapterCatalog::illumina_truseq()
-            .default_matcher()
-            .find_trim_end(b"ACGTAGATCGGAAG");
+        let trim_end = AdapterMatcher {
+            catalog: &catalogs::illumina::ILLUMINA_TRUSEQ,
+            min_overlap: 8,
+            max_mismatch_numerator: 1,
+            max_mismatch_denominator: 8,
+        }
+        .find_trim_end(b"ACGTAGATCGGAAG");
         assert_eq!(trim_end, Some(4));
     }
 }

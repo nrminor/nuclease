@@ -50,10 +50,12 @@ Supported filters are:
 Supported transforms are:
 
 - Paired-read overlap merging (`--merge-pairs`): attempts to merge paired-end reads before per-record trimming and filtering. Merging is powered by [`libpairassembly`](https://github.com/nrminor/pairassembler), and can be tuned with `--merge-min-overlap`, `--merge-max-mismatch-rate`, and `--merge-min-correction-delta-q`.
-- Illumina TruSeq adapter trimming (`--adapter-preset illumina-truseq`): trims detected 3' adapter overlap using the built-in TruSeq R1/R2 adapter catalog. Use `--adapter-preset none` to disable adapter trimming.
+- Curated adapter catalog trimming (`--adapter-preset`; disabled by default): trims detected 3' adapter overlap using entries in the selected preset. Supported CLI presets currently include Illumina TruSeq, Nextera/tagmentation, TruSeq small RNA, stranded RNA ligation, ScriptSeq/TruSeq methylation, MGI/BGI/DNBSEQ, and QIAseq miRNA. Use `--adapter-preset illumina-truseq` for common Illumina TruSeq / fastp-like adapter trimming.
 - 3' quality trimming (`--trim-min-q`): trims low-quality suffixes using the configured Phred cutoff.
 
 Use `-p`/`--passthrough` to parse and validate input while emitting reads without filters or transforms. Passthrough output is produced by nuclease's normal FASTQ writer rather than copied byte-for-byte from the input, and it cannot be combined with `--merge-pairs`.
+
+Adapter presets are curated sequence catalogs, not adapter auto-detection. Adapter trimming is disabled unless a preset is selected explicitly. The current trimmer only exposes presets with entries that are safe for 3' suffix-overlap trimming. Long-read catalog entries that require 5' trimming, both-end matching, barcode interpretation, internal-adapter handling, read splitting, demultiplexing, or orientation correction are retained as structured catalog metadata until those algorithms are implemented, but are not exposed as CLI presets yet.
 
 For paired-end input, the CLI currently uses the `DropPair` orphan policy during paired processing: if one mate is rejected, the surviving mate is suppressed rather than emitted. With `--merge-pairs`, successfully merged pairs become single records and continue through the rest of the pipeline as single records. Pairs that cannot be merged continue through paired processing as the original mate pair. Because a merge-enabled run may contain a mix of merged single records and unmerged pairs, `--merge-pairs` requires paired input and single-stream output rather than split `--out1`/`--out2` files. The execution engine also has an internal `EmitOrphan` policy, but orphan emission is not exposed as a supported CLI/output mode yet.
 

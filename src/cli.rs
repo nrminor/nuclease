@@ -200,9 +200,9 @@ pub struct Cli {
     #[arg(
         long,
         value_enum,
-        default_value_t = AdapterPreset::IlluminaTruSeq,
+        default_value_t = AdapterPreset::None,
         help_heading = "Preprocessing",
-        help = "Adapter trimming preset to apply"
+        help = "Curated adapter preset to trim; defaults to no adapter trimming"
     )]
     pub adapter_preset: AdapterPreset,
 
@@ -498,7 +498,7 @@ mod tests {
             min_mean_q: 20.0,
             min_entropy: 0.0,
             trim_min_q: 20,
-            adapter_preset: AdapterPreset::IlluminaTruSeq,
+            adapter_preset: AdapterPreset::None,
             merge_pairs: false,
             passthrough: false,
             merge_min_overlap: 10,
@@ -537,7 +537,7 @@ mod tests {
             min_mean_q: 20.0,
             trim_min_q: 20,
             min_entropy: 0.0,
-            adapter_preset: AdapterPreset::IlluminaTruSeq,
+            adapter_preset: AdapterPreset::None,
             merge_pairs: false,
             passthrough: false,
             merge_min_overlap: 10,
@@ -574,7 +574,7 @@ mod tests {
             min_mean_q: 20.0,
             trim_min_q: 20,
             min_entropy: 0.0,
-            adapter_preset: AdapterPreset::IlluminaTruSeq,
+            adapter_preset: AdapterPreset::None,
             merge_pairs: false,
             passthrough: false,
             merge_min_overlap: 10,

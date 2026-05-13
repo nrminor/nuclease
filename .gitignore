@@ -17,6 +17,16 @@
 
 !src/
 !src/*.rs
+!src/adapter/
+!src/adapter/mod.rs
+!src/adapter/catalog.rs
+!src/adapter/catalogs/
+!src/adapter/catalogs/mod.rs
+!src/adapter/catalogs/illumina.rs
+!src/adapter/catalogs/mgi.rs
+!src/adapter/catalogs/ont.rs
+!src/adapter/catalogs/pacbio.rs
+!src/adapter/catalogs/qiaseq.rs
 
 !tests/
 !tests/*.rs

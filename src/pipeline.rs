@@ -910,7 +910,7 @@ mod tests {
             max_ns: 4,
             min_mean_q: 20.0,
             trim_min_q: 20,
-            adapter_preset: AdapterPreset::IlluminaTruSeq,
+            adapter_preset: AdapterPreset::None,
             merge_pairs: false,
             passthrough: false,
             merge_min_overlap: 10,
