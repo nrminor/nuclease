@@ -23,7 +23,7 @@ use crate::{
         BuildPlan, Execute, Execution, Logical, OrphanPolicy, Plan, RecordPair, TransformArena,
     },
     progress::ProgressReporter,
-    quality::QualityTrimTransform,
+    quality::{QualityBinCount, QualityBinTransform, QualityTrimTransform},
     record::{InputSource, InvalidFastqReport, MateSide, ReadStats, RecordProvenance, RecordView},
     report::{self, RunContext as RunSummaryContext, RunLayout},
 };
@@ -190,6 +190,7 @@ struct RunConfig {
     min_mean_q: f64,
     min_entropy: f64,
     trim_min_q: u8,
+    bin_qualities: Option<QualityBinCount>,
     adapter_preset: AdapterPreset,
     merge_pairs: bool,
     passthrough: bool,
@@ -210,6 +211,7 @@ impl From<&Cli> for RunConfig {
             min_mean_q: cli.min_mean_q,
             min_entropy: cli.min_entropy,
             trim_min_q: cli.trim_min_q,
+            bin_qualities: cli.bin_qualities,
             adapter_preset: cli.adapter_preset,
             merge_pairs: cli.merge_pairs,
             passthrough: cli.passthrough,
@@ -259,13 +261,18 @@ impl RunConfig {
             None => plan,
         };
 
-        Ok(plan
+        let plan = plan
             .quality_trim(self.trim_min_q)
             .min_length(self.min_length)
             .min_mean_q(self.min_mean_q)
-            .min_entropy(self.min_entropy)
-            .orphan_policy(OrphanPolicy::DropPair)
-            .compile())
+            .min_entropy(self.min_entropy);
+
+        let plan = match self.bin_qualities {
+            Some(count) => plan.quality_bin(count),
+            None => plan,
+        };
+
+        Ok(plan.orphan_policy(OrphanPolicy::DropPair).compile())
     }
 }
 
@@ -910,6 +917,7 @@ mod tests {
             max_ns: 4,
             min_mean_q: 20.0,
             trim_min_q: 20,
+            bin_qualities: None,
             adapter_preset: AdapterPreset::None,
             merge_pairs: false,
             passthrough: false,

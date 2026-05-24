@@ -179,6 +179,157 @@ fn mgi_dnbseq_adapter_preset_trims_suffix_overlap() {
 }
 
 #[test]
+fn bin_qualities_without_value_defaults_to_five_bins() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    fs::write(&input, b"@read1\nACG\n+\n!5I\n").expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--bin-qualities",
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"@read1\nACG\n+\n%5E\n");
+}
+
+#[test]
+fn bin_qualities_accepts_explicit_count_values() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    fs::write(&input, b"@read1\nACG\n+\n!5I\n").expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--bin-qualities",
+            "2",
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"@read1\nACG\n+\n+??\n");
+}
+
+#[test]
+fn bin_qualities_accepts_equals_form() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    fs::write(&input, b"@read1\nACG\n+\n!5I\n").expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--bin-qualities=3",
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"@read1\nACG\n+\n'5B\n");
+}
+
+#[test]
+fn bin_qualities_rejects_unsupported_count_at_parse_time() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    fs::write(&input, b"@read1\nACGT\n+\nIIII\n").expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--bin-qualities",
+            "4",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        !output.status.success(),
+        "unsupported bin count should fail"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("quality bin count must be one of 2, 3, or 5"),
+        "stderr should explain supported bin counts: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn bin_qualities_runs_after_mean_quality_filtering() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    fs::write(&input, b"@read1\nACGT\n+\n!!!!\n").expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--bin-qualities",
+            "2",
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "10",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"");
+}
+
+#[test]
 fn inert_long_read_catalogs_are_not_cli_adapter_presets() {
     let temp = tempdir().expect("tempdir should be created");
     let input = temp.path().join("reads.fastq");

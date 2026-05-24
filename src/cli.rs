@@ -22,6 +22,7 @@ use crate::{
     ena::Accession,
     output::{OutputArgs, OutputEncoding, OutputFormat},
     progress::ProgressMode,
+    quality::QualityBinCount,
 };
 
 pub const INFO: &str = r"
@@ -195,6 +196,17 @@ pub struct Cli {
         help = "3' quality trimming cutoff in Phred units"
     )]
     pub trim_min_q: u8,
+
+    /// Lossily bin FASTQ quality scores after quality-sensitive preprocessing.
+    #[arg(
+        long = "bin-qualities",
+        num_args = 0..=1,
+        default_missing_value = "5",
+        value_parser = clap::value_parser!(QualityBinCount),
+        help_heading = "Preprocessing",
+        help = "Lossily bin Phred+33 quality scores; defaults to 5 bins when no value is supplied"
+    )]
+    pub bin_qualities: Option<QualityBinCount>,
 
     /// Adapter trimming preset to apply.
     #[arg(
@@ -498,6 +510,7 @@ mod tests {
             min_mean_q: 20.0,
             min_entropy: 0.0,
             trim_min_q: 20,
+            bin_qualities: None,
             adapter_preset: AdapterPreset::None,
             merge_pairs: false,
             passthrough: false,
@@ -537,6 +550,7 @@ mod tests {
             min_mean_q: 20.0,
             trim_min_q: 20,
             min_entropy: 0.0,
+            bin_qualities: None,
             adapter_preset: AdapterPreset::None,
             merge_pairs: false,
             passthrough: false,
@@ -574,6 +588,7 @@ mod tests {
             min_mean_q: 20.0,
             trim_min_q: 20,
             min_entropy: 0.0,
+            bin_qualities: None,
             adapter_preset: AdapterPreset::None,
             merge_pairs: false,
             passthrough: false,

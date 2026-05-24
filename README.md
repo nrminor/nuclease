@@ -52,6 +52,7 @@ Supported transforms are:
 - Paired-read overlap merging (`--merge-pairs`): attempts to merge paired-end reads before per-record trimming and filtering. Merging is powered by [`libpairassembly`](https://github.com/nrminor/pairassembler), and can be tuned with `--merge-min-overlap`, `--merge-max-mismatch-rate`, and `--merge-min-correction-delta-q`.
 - Curated adapter catalog trimming (`--adapter-preset`; disabled by default): trims detected 3' adapter overlap using entries in the selected preset. Supported CLI presets currently include Illumina TruSeq, Nextera/tagmentation, TruSeq small RNA, stranded RNA ligation, ScriptSeq/TruSeq methylation, MGI/BGI/DNBSEQ, and QIAseq miRNA. Use `--adapter-preset illumina-truseq` for common Illumina TruSeq / fastp-like adapter trimming.
 - 3' quality trimming (`--trim-min-q`): trims low-quality suffixes using the configured Phred cutoff.
+- Quality-score binning (`--bin-qualities[=2|3|5]`; disabled by default): lossily remaps Phred+33 quality scores into 2, 3, or 5 platform-neutral bins after trimming, merging, and quality-sensitive filters have already run. Passing `--bin-qualities` without a value uses 5 bins.
 
 Use `-p`/`--passthrough` to parse and validate input while emitting reads without filters or transforms. Passthrough output is produced by nuclease's normal FASTQ writer rather than copied byte-for-byte from the input, and it cannot be combined with `--merge-pairs`.
 

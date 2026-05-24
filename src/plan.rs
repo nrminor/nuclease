@@ -51,6 +51,11 @@ impl TransformArena {
     pub fn alloc_slice_copy<'a>(&'a self, bytes: &[u8]) -> &'a [u8] {
         self.bump.alloc_slice_copy(bytes)
     }
+
+    /// Copy one byte slice into the arena and return a mutable view of the copied bytes.
+    pub fn alloc_slice_copy_mut<'a>(&'a self, bytes: &[u8]) -> &'a mut [u8] {
+        self.bump.alloc_slice_copy(bytes)
+    }
 }
 
 /// Typed rejection reason emitted by a read filter.
