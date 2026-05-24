@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use bumpalo::Bump;
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, bail};
 
 use crate::record::{ReadStats, RecordView};
 
@@ -206,6 +206,89 @@ pub(crate) trait ExecutionStep: Send {
     ) -> Result<StepOutcome<'a>>;
 }
 
+/// Source of active read units for whole-read-set transforms.
+#[allow(
+    dead_code,
+    reason = "read-set execution is scaffolded before concrete read-set transforms"
+)]
+pub(crate) trait ActiveUnitSource {
+    /// Return the next active unit, or `None` when the source is exhausted.
+    fn next_unit(&mut self) -> Result<Option<ActiveUnit<'_>>>;
+}
+
+/// Sink for active read units emitted by whole-read-set transforms.
+#[allow(
+    dead_code,
+    reason = "read-set execution is scaffolded before concrete read-set transforms"
+)]
+pub(crate) trait ActiveUnitSink {
+    /// Emit one active unit downstream.
+    fn emit_unit(&mut self, unit: ActiveUnit<'_>) -> Result<()>;
+}
+
+/// Contract for transforms that operate over a streamable read set.
+#[allow(
+    dead_code,
+    reason = "read-set execution is scaffolded before concrete read-set transforms"
+)]
+pub(crate) trait ReadSetTransform: Send + 'static {
+    /// Stable machine-readable transform code suitable for aggregation.
+    fn code(&self) -> &'static str;
+
+    /// Consume active units from `input` and emit transformed units to `output`.
+    ///
+    /// Units borrowed from `input` are short-lived. Implementations that need to retain or reorder
+    /// records must copy, spill, or otherwise store them using operation-owned storage.
+    fn transform_read_set(
+        &mut self,
+        input: &mut dyn ActiveUnitSource,
+        output: &mut dyn ActiveUnitSink,
+    ) -> Result<()>;
+}
+
+enum LogicalPlanItem {
+    PerUnit(Box<dyn ExecutionStep>),
+    #[allow(
+        dead_code,
+        reason = "read-set logical items are currently exercised by tests only"
+    )]
+    ReadSet(Box<dyn ReadSetTransform>),
+}
+
+enum PhysicalPlanItem {
+    PerUnitChain(PerUnitChain),
+    ReadSet(Box<dyn ReadSetTransform>),
+}
+
+struct PerUnitChain {
+    steps: Vec<Box<dyn ExecutionStep>>,
+}
+
+impl PerUnitChain {
+    fn new(steps: Vec<Box<dyn ExecutionStep>>) -> Self {
+        Self { steps }
+    }
+
+    fn push(&mut self, step: Box<dyn ExecutionStep>) {
+        self.steps.push(step);
+    }
+
+    fn execute_unit<'a>(
+        &mut self,
+        mut unit: ActiveUnit<'a>,
+        context: &mut StepContext<'a, '_>,
+    ) -> Result<StepOutcome<'a>> {
+        for step in &mut self.steps {
+            match step.apply(unit, context)? {
+                StepOutcome::Continue(next) => unit = next,
+                StepOutcome::Stop(outcome) => return Ok(StepOutcome::Stop(outcome)),
+            }
+        }
+
+        Ok(StepOutcome::Continue(unit))
+    }
+}
+
 /// Internal wrapper that turns a filter operation into a runtime step.
 pub(crate) struct FilterStep<F>(pub(crate) F);
 
@@ -343,7 +426,8 @@ pub(crate) trait IntoExecutionStep {
 
 /// Authored logical plan and compiled execution plan with typestate.
 pub(crate) struct Plan<S> {
-    steps: Vec<Box<dyn ExecutionStep>>,
+    logical_items: Vec<LogicalPlanItem>,
+    physical_items: Vec<PhysicalPlanItem>,
     orphan_policy: OrphanPolicy,
     _state: PhantomData<S>,
 }
@@ -352,7 +436,8 @@ impl Plan<Logical> {
     /// Construct a new empty logical plan.
     pub fn new() -> Self {
         Self {
-            steps: Vec::new(),
+            logical_items: Vec::new(),
+            physical_items: Vec::new(),
             orphan_policy: OrphanPolicy::default(),
             _state: PhantomData,
         }
@@ -369,6 +454,15 @@ pub(crate) trait BuildPlan: Sized {
     where
         O: IntoExecutionStep;
 
+    /// Append one whole-read-set transform to the plan.
+    #[allow(
+        dead_code,
+        reason = "read-set transforms are currently scaffolded for future features"
+    )]
+    fn read_set_transform<T>(self, transform: T) -> Self
+    where
+        T: ReadSetTransform;
+
     /// Set the orphan policy used by paired execution.
     fn orphan_policy(self, policy: OrphanPolicy) -> Self;
 
@@ -383,7 +477,17 @@ impl BuildPlan for Plan<Logical> {
     where
         O: IntoExecutionStep,
     {
-        self.steps.push(op.into_execution_step());
+        self.logical_items
+            .push(LogicalPlanItem::PerUnit(op.into_execution_step()));
+        self
+    }
+
+    fn read_set_transform<T>(mut self, transform: T) -> Self
+    where
+        T: ReadSetTransform,
+    {
+        self.logical_items
+            .push(LogicalPlanItem::ReadSet(Box::new(transform)));
         self
     }
 
@@ -393,9 +497,31 @@ impl BuildPlan for Plan<Logical> {
     }
 
     fn compile(self) -> Self::Execution {
+        let Plan {
+            logical_items,
+            orphan_policy,
+            ..
+        } = self;
+        let mut physical_items = Vec::with_capacity(logical_items.len());
+
+        for item in logical_items {
+            match item {
+                LogicalPlanItem::PerUnit(step) => match physical_items.last_mut() {
+                    Some(PhysicalPlanItem::PerUnitChain(chain)) => chain.push(step),
+                    _ => physical_items.push(PhysicalPlanItem::PerUnitChain(PerUnitChain::new(
+                        vec![step],
+                    ))),
+                },
+                LogicalPlanItem::ReadSet(transform) => {
+                    physical_items.push(PhysicalPlanItem::ReadSet(transform));
+                }
+            }
+        }
+
         Plan {
-            steps: self.steps,
-            orphan_policy: self.orphan_policy,
+            logical_items: Vec::new(),
+            physical_items,
+            orphan_policy,
             _state: PhantomData,
         }
     }
@@ -464,10 +590,20 @@ impl Plan<Execution> {
             rejection_count: 0,
         };
 
-        for step in &mut self.steps {
-            match step.apply(unit, &mut context)? {
-                StepOutcome::Continue(next) => unit = next,
-                StepOutcome::Stop(outcome) => return Ok(outcome),
+        for item in &mut self.physical_items {
+            match item {
+                PhysicalPlanItem::PerUnitChain(chain) => {
+                    match chain.execute_unit(unit, &mut context)? {
+                        StepOutcome::Continue(next) => unit = next,
+                        StepOutcome::Stop(outcome) => return Ok(outcome),
+                    }
+                }
+                PhysicalPlanItem::ReadSet(transform) => {
+                    bail!(
+                        "read-set transform `{}` requires whole-read-set execution",
+                        transform.code()
+                    );
+                }
             }
         }
 
@@ -503,11 +639,13 @@ impl<'a> Execute<'a, RecordPair<'a>> for Plan<Execution> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildPlan, Execute, ExecutionOutcome, FilterStep, IntoExecutionStep, Logical, OrphanPolicy,
-        Plan, ReadFilter, ReadTransform, RecordPair, RejectionReason, TransformArena,
+        ActiveUnitSink, ActiveUnitSource, BuildPlan, Execute, ExecutionOutcome, FilterStep,
+        IntoExecutionStep, Logical, OrphanPolicy, PhysicalPlanItem, Plan, ReadFilter,
+        ReadSetTransform, ReadTransform, RecordPair, RejectionReason, TransformArena,
         TransformResult, TransformStep,
     };
     use crate::record::{ReadStats, RecordView};
+    use color_eyre::eyre::Result;
 
     #[derive(Debug)]
     struct TooShort;
@@ -584,6 +722,22 @@ mod tests {
         }
     }
 
+    struct FakeReadSetTransform;
+
+    impl ReadSetTransform for FakeReadSetTransform {
+        fn code(&self) -> &'static str {
+            "fake_read_set"
+        }
+
+        fn transform_read_set(
+            &mut self,
+            _input: &mut dyn ActiveUnitSource,
+            _output: &mut dyn ActiveUnitSink,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
     fn record(sequence: &'static [u8]) -> RecordView<'static> {
         let quality = match sequence.len() {
             6 => b"IIIIII".as_slice(),
@@ -598,6 +752,63 @@ mod tests {
             .step(MinLength::new(4))
             .step(TrimPrefix::new(1))
             .compile();
+    }
+
+    #[test]
+    fn compile_groups_adjacent_per_unit_steps_around_read_set_transforms() {
+        let plan = Plan::<Logical>::new()
+            .step(MinLength::new(4))
+            .step(TrimPrefix::new(1))
+            .read_set_transform(FakeReadSetTransform)
+            .step(MinLength::new(3))
+            .compile();
+
+        assert_eq!(plan.physical_items.len(), 3);
+        assert!(matches!(
+            plan.physical_items[0],
+            PhysicalPlanItem::PerUnitChain(_)
+        ));
+        assert!(matches!(
+            plan.physical_items[1],
+            PhysicalPlanItem::ReadSet(_)
+        ));
+        assert!(matches!(
+            plan.physical_items[2],
+            PhysicalPlanItem::PerUnitChain(_)
+        ));
+    }
+
+    #[test]
+    fn streaming_only_plan_compiles_to_one_per_unit_chain() {
+        let plan = Plan::<Logical>::new()
+            .step(MinLength::new(4))
+            .step(TrimPrefix::new(1))
+            .compile();
+
+        assert_eq!(plan.physical_items.len(), 1);
+        assert!(matches!(
+            plan.physical_items[0],
+            PhysicalPlanItem::PerUnitChain(_)
+        ));
+    }
+
+    #[test]
+    fn per_unit_execution_rejects_read_set_transforms() {
+        let mut plan = Plan::<Logical>::new()
+            .read_set_transform(FakeReadSetTransform)
+            .compile();
+        let mut arena = TransformArena::new();
+        let mut stats = ReadStats::default();
+
+        let Err(error) = plan.execute(record(b"ACGT"), &mut arena, &mut stats) else {
+            panic!("per-unit execution should reject read-set transforms");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("read-set transform `fake_read_set` requires whole-read-set execution")
+        );
     }
 
     #[test]
