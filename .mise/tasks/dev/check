@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+#MISE description="Validate Nuclease development tools and host prerequisites"
+
+set -euo pipefail
+
+for tool in rustc cargo cargo-nextest git-cliff shellcheck; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        printf 'missing required development tool: %s\n' "$tool" >&2
+        exit 1
+    fi
+done
+
+rustc --version
+cargo --version
+cargo nextest --version
+git-cliff --version
+shellcheck --version
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    : "${SDKROOT:?mise did not configure the macOS SDK}"
+    : "${CC:?mise did not configure the macOS C compiler}"
+    : "${CXX:?mise did not configure the macOS C++ compiler}"
+    : "${AR:?mise did not configure the macOS archiver}"
+    : "${CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER:?mise did not configure the arm64 macOS Cargo linker}"
+    : "${CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER:?mise did not configure the x86_64 macOS Cargo linker}"
+
+    expected_cc="$(xcrun --sdk macosx --find clang)"
+    if [[ "$CC" != "$expected_cc" ]]; then
+        printf 'macOS C compiler mismatch: expected %s, observed %s\n' "$expected_cc" "$CC" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$SDKROOT/usr/lib/libiconv.tbd" ]]; then
+        printf 'macOS SDK does not provide libiconv: %s\n' "$SDKROOT" >&2
+        exit 1
+    fi
+
+    "$CC" --version
+else
+    command -v cc >/dev/null 2>&1 || {
+        printf '%s\n' "a host C compiler is required to build Nuclease" >&2
+        exit 1
+    }
+fi
+
+cargo metadata --locked --no-deps --format-version 1 >/dev/null

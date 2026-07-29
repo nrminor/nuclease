@@ -5,10 +5,17 @@
 !LICENSE
 !Cargo.toml
 !Cargo.lock
-!justfile
+!mise.toml
+!mise.lock
 !INSTALL.sh
 !cliff.toml
 !rust-toolchain.toml
+
+!.mise/
+!.mise/development-env.sh
+!.mise/tasks/
+!.mise/tasks/dev/
+!.mise/tasks/dev/check
 
 !.github/
 !.github/workflows/

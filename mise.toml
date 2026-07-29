@@ -1,0 +1,98 @@
+min_version = "2026.7.13"
+
+[settings]
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tools]
+"github:nextest-rs/nextest" = { version = "0.9.140", version_prefix = "cargo-nextest-" }
+git-cliff = "2.13.1"
+shellcheck = "0.11.0"
+
+[env]
+_.source = ".mise/development-env.sh"
+
+[tasks.check]
+description = "Run all pre-commit checks"
+run = [
+  { task = "fmt-check" },
+  { task = "lint" },
+  { task = "lint-shell" },
+  { task = "test" },
+  { task = "doc-check" },
+]
+
+[tasks.check-all]
+description = "Run all checks, including ignored tests"
+run = [
+  { task = "fmt-check" },
+  { task = "lint" },
+  { task = "lint-shell" },
+  { task = "test-all" },
+  { task = "doc-check" },
+]
+
+[tasks.fmt-check]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.fmt]
+description = "Format Rust sources"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Run Clippy with warnings denied"
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+[tasks.lint-shell]
+description = "Lint project shell scripts"
+run = "shellcheck INSTALL.sh .mise/development-env.sh .mise/tasks/dev/check"
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo nextest run --all-features --no-tests=pass"
+
+[tasks.test-all]
+description = "Run the test suite, including ignored tests"
+run = "cargo nextest run --all-features --run-ignored all --no-tests=pass"
+
+[tasks.test-verbose]
+description = "Run tests with uncaptured output"
+interactive = true
+run = "cargo nextest run --all-features --no-capture --no-tests=pass"
+
+[tasks.build]
+description = "Build Nuclease in debug mode"
+run = "cargo build"
+
+[tasks.build-release]
+description = "Build Nuclease with the release profile"
+run = "cargo build --release"
+
+[tasks.check-compile]
+description = "Check all targets and features without building artifacts"
+run = "cargo check --all-targets --all-features"
+
+[tasks.install]
+description = "Install Nuclease from this checkout"
+run = "cargo install --path=."
+
+[tasks.doc-check]
+description = "Build documentation without dependencies"
+run = "cargo doc --no-deps --document-private-items"
+
+[tasks.doc]
+description = "Build and open documentation"
+interactive = true
+run = "cargo doc --no-deps --open"
+
+[tasks.clean]
+description = "Remove Cargo build artifacts"
+run = "cargo clean"
+
+[tasks.update]
+description = "Update Cargo dependencies"
+run = "cargo update"
+
+[tasks.smoke]
+description = "Run the CLI help smoke test"
+run = "cargo run -- --help"
