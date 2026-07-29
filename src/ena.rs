@@ -743,17 +743,13 @@ fn io_error_from_reqwest(error: reqwest::Error) -> io::Error {
 mod tests {
     use std::{
         io::{Read as _, Write as _},
-        net::TcpListener,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
-        thread,
+        net::{SocketAddr, TcpListener, TcpStream},
+        thread::{self, JoinHandle},
         time::Duration,
     };
 
-    use color_eyre::Result;
-    use reqwest::blocking::Client;
+    use color_eyre::eyre::{Result, bail, ensure, eyre};
+    use reqwest::{StatusCode, blocking::Client};
     use url::Url;
 
     use super::{
@@ -866,10 +862,8 @@ mod tests {
     #[test]
     fn retrying_http_read_streams_initial_response_without_range() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let address = spawn_static_server(ServerMode::InitialOk {
-            payload: payload.clone(),
-        });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![Exchange::initial(&payload)])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -880,7 +874,9 @@ mod tests {
         );
 
         let mut output = Vec::new();
-        reader.read_to_end(&mut output)?;
+        let read_result = reader.read_to_end(&mut output);
+        server.finish()?;
+        read_result?;
 
         assert_eq!(output, payload);
         Ok(())
@@ -889,10 +885,8 @@ mod tests {
     #[test]
     fn retrying_http_read_requests_identity_encoding() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let address = spawn_static_server(ServerMode::InitialOk {
-            payload: payload.clone(),
-        });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![Exchange::initial(&payload)])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -903,7 +897,9 @@ mod tests {
         );
 
         let mut output = Vec::new();
-        reader.read_to_end(&mut output)?;
+        let read_result = reader.read_to_end(&mut output);
+        server.finish()?;
+        read_result?;
 
         assert_eq!(output, payload);
         Ok(())
@@ -912,11 +908,11 @@ mod tests {
     #[test]
     fn retrying_http_read_resumes_after_premature_eof() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let address = spawn_static_server(ServerMode::TruncatedThenResume {
-            payload: payload.clone(),
-            cut_points: vec![10],
-        });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(&payload, 0, 10),
+            Exchange::ranged(&payload, 10),
+        ])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -927,7 +923,9 @@ mod tests {
         );
 
         let mut output = Vec::new();
-        reader.read_to_end(&mut output)?;
+        let read_result = reader.read_to_end(&mut output);
+        server.finish()?;
+        read_result?;
 
         assert_eq!(output, payload);
         Ok(())
@@ -936,11 +934,12 @@ mod tests {
     #[test]
     fn retrying_http_read_resumes_across_multiple_premature_eofs() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let address = spawn_static_server(ServerMode::TruncatedThenResume {
-            payload: payload.clone(),
-            cut_points: vec![8, 18],
-        });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(&payload, 0, 8),
+            Exchange::promised_suffix(&payload, 8, 18),
+            Exchange::ranged(&payload, 18),
+        ])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -951,7 +950,9 @@ mod tests {
         );
 
         let mut output = Vec::new();
-        reader.read_to_end(&mut output)?;
+        let read_result = reader.read_to_end(&mut output);
+        server.finish()?;
+        read_result?;
 
         assert_eq!(output, payload);
         Ok(())
@@ -960,11 +961,11 @@ mod tests {
     #[test]
     fn retrying_http_read_errors_when_premature_eof_exhausts_retry_budget() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let address = spawn_static_server(ServerMode::AlwaysTruncated {
-            payload,
-            cut_point: 10,
-        });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(&payload, 0, 10),
+            Exchange::promised_suffix(&payload, 10, 10),
+        ])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -978,6 +979,7 @@ mod tests {
         let error = reader
             .read_to_end(&mut output)
             .expect_err("exhausted retry budget should fail");
+        server.finish()?;
 
         assert!(error.to_string().contains("retry budget exhausted"));
         Ok(())
@@ -987,11 +989,8 @@ mod tests {
     fn retrying_http_read_resumes_from_nonzero_offset_with_range() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
         let expected_offset = 10_usize;
-        let address = spawn_static_server(ServerMode::ResumeOk {
-            payload: payload.clone(),
-            expected_offset,
-        });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![Exchange::ranged(&payload, expected_offset)])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -1003,7 +1002,9 @@ mod tests {
         reader.next_byte_offset = expected_offset as u64;
 
         let mut output = Vec::new();
-        reader.read_to_end(&mut output)?;
+        let read_result = reader.read_to_end(&mut output);
+        server.finish()?;
+        read_result?;
 
         assert_eq!(output, payload[expected_offset..]);
         Ok(())
@@ -1013,11 +1014,10 @@ mod tests {
     fn retrying_http_read_rejects_bad_ranged_status() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
         let expected_offset = 10_usize;
-        let address = spawn_static_server(ServerMode::ResumeWrongStatus {
-            payload,
-            expected_offset,
-        });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![
+            Exchange::ranged(&payload, expected_offset).with_status(StatusCode::OK),
+        ])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -1030,6 +1030,7 @@ mod tests {
         let error = reader
             .open_response(Some(expected_offset as u64))
             .expect_err("bad ranged status should fail");
+        server.finish()?;
         assert!(
             error
                 .to_string()
@@ -1042,11 +1043,10 @@ mod tests {
     fn retrying_http_read_rejects_missing_content_range() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
         let expected_offset = 10_usize;
-        let address = spawn_static_server(ServerMode::ResumeMissingContentRange {
-            payload,
-            expected_offset,
-        });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![
+            Exchange::ranged(&payload, expected_offset).without_header("Content-Range"),
+        ])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -1059,6 +1059,7 @@ mod tests {
         let error = reader
             .open_response(Some(expected_offset as u64))
             .expect_err("missing content-range should fail");
+        server.finish()?;
         assert!(
             error
                 .to_string()
@@ -1083,11 +1084,18 @@ mod tests {
     fn retrying_http_read_rejects_wrong_ranged_start() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
         let expected_offset = 10_usize;
-        let address = spawn_static_server(ServerMode::ResumeWrongStart {
-            payload,
-            expected_offset,
-        });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![
+            Exchange::ranged(&payload, expected_offset).with_header(
+                "Content-Range",
+                format!(
+                    "bytes {}-{}/{}",
+                    expected_offset + 1,
+                    payload.len() - 1,
+                    payload.len()
+                ),
+            ),
+        ])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -1100,6 +1108,7 @@ mod tests {
         let error = reader
             .open_response(Some(expected_offset as u64))
             .expect_err("wrong ranged start should fail");
+        server.finish()?;
         assert!(error.to_string().contains("resumed at byte"));
         Ok(())
     }
@@ -1108,11 +1117,24 @@ mod tests {
     fn retrying_http_read_rejects_ranged_partial_suffix() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
         let expected_offset = 10_usize;
-        let address = spawn_static_server(ServerMode::ResumePartialSuffix {
-            payload,
-            expected_offset,
-        });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let partial_end = expected_offset + 4;
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(&payload, expected_offset, partial_end)
+                .with_header(
+                    "Content-Length",
+                    (partial_end - expected_offset).to_string(),
+                )
+                .with_header(
+                    "Content-Range",
+                    format!(
+                        "bytes {}-{}/{}",
+                        expected_offset,
+                        partial_end - 1,
+                        payload.len()
+                    ),
+                ),
+        ])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -1125,6 +1147,7 @@ mod tests {
         let error = reader
             .open_response(Some(expected_offset as u64))
             .expect_err("partial ranged suffix should fail");
+        server.finish()?;
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("partial suffix"));
         Ok(())
@@ -1134,11 +1157,13 @@ mod tests {
     fn retrying_http_read_rejects_ranged_content_length_mismatch() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
         let expected_offset = 10_usize;
-        let address = spawn_static_server(ServerMode::ResumeWrongContentLength {
-            payload,
-            expected_offset,
-        });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![
+            Exchange::ranged(&payload, expected_offset).with_header(
+                "Content-Length",
+                (payload.len() - expected_offset - 1).to_string(),
+            ),
+        ])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -1151,6 +1176,7 @@ mod tests {
         let error = reader
             .open_response(Some(expected_offset as u64))
             .expect_err("ranged content-length mismatch should fail");
+        server.finish()?;
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("Content-Length"));
         Ok(())
@@ -1159,8 +1185,10 @@ mod tests {
     #[test]
     fn retrying_http_read_rejects_unexpected_content_encoding() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let address = spawn_static_server(ServerMode::InitialUnexpectedContentEncoding { payload });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![
+            Exchange::initial(&payload).with_header("Content-Encoding", "gzip"),
+        ])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -1174,6 +1202,7 @@ mod tests {
         let error = reader
             .read_to_end(&mut output)
             .expect_err("unexpected content encoding should fail");
+        server.finish()?;
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("Content-Encoding"));
@@ -1183,9 +1212,10 @@ mod tests {
     #[test]
     fn retrying_http_read_does_not_retry_invalid_response_headers() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let (address, requests_seen) =
-            spawn_counted_static_server(ServerMode::InitialUnexpectedContentEncoding { payload });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![
+            Exchange::initial(&payload).with_header("Content-Encoding", "gzip"),
+        ])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -1199,9 +1229,9 @@ mod tests {
         let error = reader
             .read_to_end(&mut output)
             .expect_err("invalid response headers should fail without retrying");
+        server.finish()?;
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(requests_seen.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
@@ -1209,11 +1239,8 @@ mod tests {
     fn retrying_http_read_rejects_changed_total_size() -> Result<()> {
         let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
         let expected_offset = 10_usize;
-        let address = spawn_static_server(ServerMode::ResumeOk {
-            payload: payload.clone(),
-            expected_offset,
-        });
-        let url = FastqUrl(Url::parse(&format!("http://{address}/reads.fastq.gz"))?);
+        let server = TestServer::spawn(vec![Exchange::ranged(&payload, expected_offset)])?;
+        let url = server.fastq_url()?;
         let client = Client::builder().build()?;
         let mut reader = RetryingHttpRead::new(
             client,
@@ -1227,406 +1254,289 @@ mod tests {
         let error = reader
             .open_response(Some(expected_offset as u64))
             .expect_err("changed total size should fail");
+        server.finish()?;
         assert!(error.to_string().contains("total size changed"));
         Ok(())
     }
 
-    enum ServerMode {
-        InitialOk {
-            payload: Vec<u8>,
-        },
-        ResumeOk {
-            payload: Vec<u8>,
-            expected_offset: usize,
-        },
-        ResumeWrongStatus {
-            payload: Vec<u8>,
-            expected_offset: usize,
-        },
-        ResumeMissingContentRange {
-            payload: Vec<u8>,
-            expected_offset: usize,
-        },
-        ResumeWrongStart {
-            payload: Vec<u8>,
-            expected_offset: usize,
-        },
-        ResumePartialSuffix {
-            payload: Vec<u8>,
-            expected_offset: usize,
-        },
-        ResumeWrongContentLength {
-            payload: Vec<u8>,
-            expected_offset: usize,
-        },
-        InitialUnexpectedContentEncoding {
-            payload: Vec<u8>,
-        },
-        TruncatedThenResume {
-            payload: Vec<u8>,
-            cut_points: Vec<usize>,
-        },
-        AlwaysTruncated {
-            payload: Vec<u8>,
-            cut_point: usize,
-        },
+    #[test]
+    fn scripted_server_reports_request_range_mismatches() -> Result<()> {
+        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+        let server = TestServer::spawn(vec![Exchange::ranged(&payload, 10)])?;
+        let url = server.fastq_url()?;
+        let client = Client::builder().build()?;
+
+        let request_result = client
+            .get(url.as_str())
+            .header("Accept-Encoding", "identity")
+            .send();
+        assert!(request_result.is_err());
+
+        let error = server
+            .finish()
+            .expect_err("request mismatch should reach the owning test");
+        assert!(error.to_string().contains("expected `bytes=10-`"));
+        assert!(error.to_string().contains("observed `<missing>`"));
+        Ok(())
     }
 
-    fn spawn_static_server(mode: ServerMode) -> String {
-        spawn_counted_static_server(mode).0
+    const FASTQ_TARGET: &str = "/reads.fastq.gz";
+    const SHUTDOWN_TARGET: &str = "/__nuclease_test_shutdown";
+    const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
+
+    struct TestServer {
+        address: SocketAddr,
+        thread: Option<JoinHandle<Result<()>>>,
     }
 
-    fn spawn_counted_static_server(mode: ServerMode) -> (String, Arc<AtomicUsize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-        let address = listener.local_addr().expect("server address");
-        let requests_seen = Arc::new(AtomicUsize::new(0));
-        let requests_seen_thread = Arc::clone(&requests_seen);
+    impl TestServer {
+        fn spawn(exchanges: Vec<Exchange>) -> Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?;
+            let thread = thread::spawn(move || serve_exchanges(&listener, exchanges));
 
-        thread::spawn(move || {
-            let request_limit = match &mode {
-                ServerMode::TruncatedThenResume { cut_points, .. } => cut_points.len() + 1,
-                ServerMode::AlwaysTruncated { .. }
-                | ServerMode::InitialUnexpectedContentEncoding { .. } => 4,
-                _ => 1,
-            };
+            Ok(Self {
+                address,
+                thread: Some(thread),
+            })
+        }
 
-            for stream in listener.incoming().take(request_limit) {
-                let mut stream = stream.expect("accept stream");
-                let request_index = requests_seen_thread.fetch_add(1, Ordering::SeqCst);
-                serve_static_request(&mut stream, &mode, request_index);
-            }
-        });
+        fn fastq_url(&self) -> Result<FastqUrl> {
+            Ok(FastqUrl(Url::parse(&format!(
+                "http://{}{}",
+                self.address, FASTQ_TARGET
+            ))?))
+        }
 
-        (format!("127.0.0.1:{}", address.port()), requests_seen)
+        fn finish(mut self) -> Result<()> {
+            let shutdown_result = request_shutdown(self.address);
+            let server_result = self
+                .thread
+                .take()
+                .ok_or_else(|| eyre!("test server thread was already joined"))?
+                .join()
+                .map_err(|_| eyre!("test server thread panicked"))?;
+
+            server_result?;
+            shutdown_result?;
+            Ok(())
+        }
     }
 
-    fn serve_static_request(
-        stream: &mut std::net::TcpStream,
-        mode: &ServerMode,
-        request_index: usize,
-    ) {
-        let request = read_http_request(stream);
-        assert!(
-            request
-                .to_ascii_lowercase()
-                .contains("accept-encoding: identity")
-        );
-
-        match mode {
-            ServerMode::InitialOk { payload } => serve_initial_ok(stream, &request, payload),
-            ServerMode::ResumeOk {
-                payload,
-                expected_offset,
-            } => serve_resume_ok(stream, &request, payload, *expected_offset),
-            ServerMode::ResumeWrongStatus {
-                payload,
-                expected_offset,
-            } => serve_resume_wrong_status(stream, &request, payload, *expected_offset),
-            ServerMode::ResumeMissingContentRange {
-                payload,
-                expected_offset,
-            } => serve_resume_missing_content_range(stream, &request, payload, *expected_offset),
-            ServerMode::ResumeWrongStart {
-                payload,
-                expected_offset,
-            } => serve_resume_wrong_start(stream, &request, payload, *expected_offset),
-            ServerMode::ResumePartialSuffix {
-                payload,
-                expected_offset,
-            } => serve_resume_partial_suffix(stream, &request, payload, *expected_offset),
-            ServerMode::ResumeWrongContentLength {
-                payload,
-                expected_offset,
-            } => serve_resume_wrong_content_length(stream, &request, payload, *expected_offset),
-            ServerMode::InitialUnexpectedContentEncoding { payload } => {
-                serve_initial_unexpected_content_encoding(stream, &request, payload);
-            }
-            ServerMode::TruncatedThenResume {
-                payload,
-                cut_points,
-            } => serve_truncated_then_resume(stream, &request, payload, cut_points, request_index),
-            ServerMode::AlwaysTruncated { payload, cut_point } => {
-                serve_always_truncated(stream, &request, payload, *cut_point, request_index);
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            if let Some(thread) = self.thread.take() {
+                let _ = request_shutdown(self.address);
+                let _ = thread.join();
             }
         }
     }
 
-    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
-        let mut request = [0_u8; 2048];
-        let bytes_read = stream.read(&mut request).expect("read request");
-        String::from_utf8_lossy(&request[..bytes_read]).into_owned()
+    struct Exchange {
+        expected_target: String,
+        expected_range_offset: Option<u64>,
+        status: StatusCode,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
     }
 
-    fn serve_initial_ok(stream: &mut std::net::TcpStream, request: &str, payload: &[u8]) {
-        assert!(request.starts_with("GET /reads.fastq.gz HTTP/1.1"));
-        assert!(!request.contains("Range: bytes="));
-        write_initial_response(stream, payload, payload.len());
-    }
+    impl Exchange {
+        fn initial(payload: &[u8]) -> Self {
+            Self::promised_suffix(payload, 0, payload.len())
+        }
 
-    fn serve_resume_ok(
-        stream: &mut std::net::TcpStream,
-        request: &str,
-        payload: &[u8],
-        expected_offset: usize,
-    ) {
-        assert!(request.contains(&format!("bytes={expected_offset}-")));
-        write_range_response(stream, payload, expected_offset, payload.len(), true);
-    }
+        fn ranged(payload: &[u8], offset: usize) -> Self {
+            Self::promised_suffix(payload, offset, payload.len())
+        }
 
-    fn serve_resume_wrong_status(
-        stream: &mut std::net::TcpStream,
-        request: &str,
-        payload: &[u8],
-        expected_offset: usize,
-    ) {
-        assert!(request.contains(&format!("bytes={expected_offset}-")));
-        write_initial_response(
-            stream,
-            &payload[expected_offset..],
-            payload.len() - expected_offset,
-        );
-    }
-
-    fn serve_resume_missing_content_range(
-        stream: &mut std::net::TcpStream,
-        request: &str,
-        payload: &[u8],
-        expected_offset: usize,
-    ) {
-        assert!(request.contains(&format!("bytes={expected_offset}-")));
-        write_range_response(stream, payload, expected_offset, payload.len(), false);
-    }
-
-    fn serve_resume_wrong_start(
-        stream: &mut std::net::TcpStream,
-        request: &str,
-        payload: &[u8],
-        expected_offset: usize,
-    ) {
-        assert!(request.contains(&format!("bytes={expected_offset}-")));
-        write_range_response_with_start(
-            stream,
-            payload,
-            expected_offset,
-            payload.len(),
-            expected_offset + 1,
-        );
-    }
-
-    fn serve_resume_partial_suffix(
-        stream: &mut std::net::TcpStream,
-        request: &str,
-        payload: &[u8],
-        expected_offset: usize,
-    ) {
-        assert!(request.contains(&format!("bytes={expected_offset}-")));
-        let partial_end = expected_offset + 4;
-        let content_range = format!(
-            "Content-Range: bytes {}-{}/{}\r\n",
-            expected_offset,
-            partial_end - 1,
-            payload.len()
-        );
-        write_range_response_with_header(
-            stream,
-            payload,
-            expected_offset,
-            partial_end,
-            partial_end - expected_offset,
-            &content_range,
-        );
-    }
-
-    fn serve_resume_wrong_content_length(
-        stream: &mut std::net::TcpStream,
-        request: &str,
-        payload: &[u8],
-        expected_offset: usize,
-    ) {
-        assert!(request.contains(&format!("bytes={expected_offset}-")));
-        let content_range = format!(
-            "Content-Range: bytes {}-{}/{}\r\n",
-            expected_offset,
-            payload.len() - 1,
-            payload.len()
-        );
-        write_range_response_with_header(
-            stream,
-            payload,
-            expected_offset,
-            payload.len(),
-            payload.len() - expected_offset - 1,
-            &content_range,
-        );
-    }
-
-    fn serve_initial_unexpected_content_encoding(
-        stream: &mut std::net::TcpStream,
-        request: &str,
-        payload: &[u8],
-    ) {
-        assert!(request.starts_with("GET /reads.fastq.gz HTTP/1.1"));
-        assert!(!request.contains("Range: bytes="));
-        let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Encoding: gzip\r\nAccept-Ranges: bytes\r\nContent-Type: application/x-gzip\r\nConnection: close\r\n\r\n",
-            payload.len()
-        );
-        stream.write_all(header.as_bytes()).expect("write header");
-        stream.write_all(payload).expect("write payload");
-        stream.flush().expect("flush response");
-    }
-
-    fn serve_truncated_then_resume(
-        stream: &mut std::net::TcpStream,
-        request: &str,
-        payload: &[u8],
-        cut_points: &[usize],
-        request_index: usize,
-    ) {
-        let offset = if request_index == 0 {
-            assert!(!request.contains("Range: bytes="));
-            0
-        } else {
-            let offset = cut_points[request_index - 1];
-            assert!(request.contains(&format!("bytes={offset}-")));
-            offset
-        };
-        let response_end = cut_points
-            .get(request_index)
-            .copied()
-            .unwrap_or(payload.len());
-        write_byte_range_response(stream, payload, offset, response_end);
-    }
-
-    fn serve_always_truncated(
-        stream: &mut std::net::TcpStream,
-        request: &str,
-        payload: &[u8],
-        cut_point: usize,
-        request_index: usize,
-    ) {
-        let offset = if request_index == 0 {
-            assert!(!request.contains("Range: bytes="));
-            0
-        } else {
-            assert!(request.contains(&format!("bytes={cut_point}-")));
-            cut_point
-        };
-        write_byte_range_response(stream, payload, offset, cut_point);
-    }
-
-    fn write_initial_response(
-        stream: &mut std::net::TcpStream,
-        payload: &[u8],
-        content_length: usize,
-    ) {
-        let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nAccept-Ranges: bytes\r\nContent-Type: application/x-gzip\r\nConnection: close\r\n\r\n"
-        );
-        stream.write_all(header.as_bytes()).expect("write header");
-        stream.write_all(payload).expect("write payload");
-        stream.flush().expect("flush response");
-    }
-
-    fn write_range_response(
-        stream: &mut std::net::TcpStream,
-        payload: &[u8],
-        offset: usize,
-        response_end: usize,
-        include_content_range: bool,
-    ) {
-        let content_range = if include_content_range {
-            format!(
-                "Content-Range: bytes {}-{}/{}\r\n",
-                offset,
-                payload.len() - 1,
-                payload.len()
-            )
-        } else {
-            String::new()
-        };
-        write_range_response_with_header(
-            stream,
-            payload,
-            offset,
-            response_end,
-            response_end - offset,
-            &content_range,
-        );
-    }
-
-    fn write_range_response_with_start(
-        stream: &mut std::net::TcpStream,
-        payload: &[u8],
-        offset: usize,
-        response_end: usize,
-        content_range_start: usize,
-    ) {
-        let content_range = format!(
-            "Content-Range: bytes {}-{}/{}\r\n",
-            content_range_start,
-            payload.len() - 1,
-            payload.len()
-        );
-        write_range_response_with_header(
-            stream,
-            payload,
-            offset,
-            response_end,
-            response_end - offset,
-            &content_range,
-        );
-    }
-
-    fn write_range_response_with_header(
-        stream: &mut std::net::TcpStream,
-        payload: &[u8],
-        offset: usize,
-        response_end: usize,
-        content_length: usize,
-        content_range: &str,
-    ) {
-        let body = &payload[offset..response_end];
-        let header = format!(
-            "HTTP/1.1 206 Partial Content\r\nContent-Length: {content_length}\r\nAccept-Ranges: bytes\r\n{content_range}Content-Type: application/x-gzip\r\nConnection: close\r\n\r\n"
-        );
-        stream.write_all(header.as_bytes()).expect("write header");
-        stream.write_all(body).expect("write payload");
-        stream.flush().expect("flush response");
-    }
-
-    fn write_byte_range_response(
-        stream: &mut std::net::TcpStream,
-        payload: &[u8],
-        offset: usize,
-        response_end: usize,
-    ) {
-        let status = if offset == 0 {
-            "HTTP/1.1 200 OK"
-        } else {
-            "HTTP/1.1 206 Partial Content"
-        };
-        let body = &payload[offset..response_end];
-        let content_range = if offset == 0 {
-            String::new()
-        } else {
-            format!(
-                "Content-Range: bytes {}-{}/{}\r\n",
-                offset,
-                payload.len() - 1,
-                payload.len()
-            )
-        };
-        let header = format!(
-            "{status}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\n{content_range}Content-Type: application/x-gzip\r\nConnection: close\r\n\r\n",
-            if offset == 0 {
-                payload.len()
+        fn promised_suffix(payload: &[u8], offset: usize, delivered_end: usize) -> Self {
+            let status = if offset == 0 {
+                StatusCode::OK
             } else {
-                payload.len() - offset
+                StatusCode::PARTIAL_CONTENT
+            };
+            let mut headers = vec![
+                (
+                    "Content-Length".to_owned(),
+                    (payload.len() - offset).to_string(),
+                ),
+                ("Accept-Ranges".to_owned(), "bytes".to_owned()),
+                ("Content-Type".to_owned(), "application/x-gzip".to_owned()),
+            ];
+            if offset > 0 {
+                headers.push((
+                    "Content-Range".to_owned(),
+                    format!("bytes {}-{}/{}", offset, payload.len() - 1, payload.len()),
+                ));
             }
+
+            Self {
+                expected_target: FASTQ_TARGET.to_owned(),
+                expected_range_offset: (offset > 0).then_some(offset as u64),
+                status,
+                headers,
+                body: payload[offset..delivered_end].to_vec(),
+            }
+        }
+
+        fn with_status(mut self, status: StatusCode) -> Self {
+            self.status = status;
+            self
+        }
+
+        fn with_header(mut self, name: &str, value: impl Into<String>) -> Self {
+            let value = value.into();
+            if let Some((_, existing)) = self
+                .headers
+                .iter_mut()
+                .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            {
+                *existing = value;
+            } else {
+                self.headers.push((name.to_owned(), value));
+            }
+            self
+        }
+
+        fn without_header(mut self, name: &str) -> Self {
+            self.headers
+                .retain(|(header, _)| !header.eq_ignore_ascii_case(name));
+            self
+        }
+
+        fn serve(self, stream: &mut TcpStream, request: &[u8]) -> Result<()> {
+            self.verify_request(request)?;
+            self.write_response(stream)
+        }
+
+        fn verify_request(&self, request: &[u8]) -> Result<()> {
+            let request = std::str::from_utf8(request)?;
+            let mut lines = request.split("\r\n");
+            let request_line = lines
+                .next()
+                .ok_or_else(|| eyre!("HTTP request did not include a request line"))?;
+            ensure!(
+                request_line == format!("GET {} HTTP/1.1", self.expected_target),
+                "unexpected HTTP request line: expected `GET {} HTTP/1.1`, observed `{request_line}`",
+                self.expected_target
+            );
+
+            let mut accept_encoding = None;
+            let mut range = None;
+            for line in lines.take_while(|line| !line.is_empty()) {
+                let Some((name, value)) = line.split_once(':') else {
+                    bail!("malformed HTTP request header: {line}");
+                };
+                let value = value.trim();
+                if name.eq_ignore_ascii_case("Accept-Encoding") {
+                    ensure!(
+                        accept_encoding.replace(value).is_none(),
+                        "HTTP request repeated Accept-Encoding"
+                    );
+                } else if name.eq_ignore_ascii_case("Range") {
+                    ensure!(
+                        range.replace(value).is_none(),
+                        "HTTP request repeated Range"
+                    );
+                }
+            }
+
+            ensure!(
+                accept_encoding.is_some_and(|value| value.eq_ignore_ascii_case("identity")),
+                "HTTP request did not use Accept-Encoding: identity"
+            );
+            match self.expected_range_offset {
+                Some(offset) => ensure!(
+                    range == Some(format!("bytes={offset}-").as_str()),
+                    "unexpected Range header: expected `bytes={offset}-`, observed `{}`",
+                    range.unwrap_or("<missing>")
+                ),
+                None => ensure!(
+                    range.is_none(),
+                    "unexpected Range header on initial request: {}",
+                    range.unwrap_or("<missing>")
+                ),
+            }
+
+            Ok(())
+        }
+
+        fn write_response(&self, stream: &mut TcpStream) -> Result<()> {
+            let reason = self.status.canonical_reason().unwrap_or("Unknown");
+            let mut response = format!("HTTP/1.1 {} {reason}\r\n", self.status.as_u16());
+            for (name, value) in &self.headers {
+                response.push_str(name);
+                response.push_str(": ");
+                response.push_str(value);
+                response.push_str("\r\n");
+            }
+            response.push_str("Connection: close\r\n\r\n");
+
+            stream.write_all(response.as_bytes())?;
+            stream.write_all(&self.body)?;
+            stream.flush()?;
+            Ok(())
+        }
+    }
+
+    fn serve_exchanges(listener: &TcpListener, exchanges: Vec<Exchange>) -> Result<()> {
+        for (index, exchange) in exchanges.into_iter().enumerate() {
+            let (mut stream, _) = listener.accept()?;
+            let request = read_http_request(&mut stream)?;
+            ensure!(
+                !is_shutdown_request(&request),
+                "test server was shut down before scripted exchange {} arrived",
+                index + 1
+            );
+            exchange.serve(&mut stream, &request)?;
+        }
+
+        let (mut stream, _) = listener.accept()?;
+        let request = read_http_request(&mut stream)?;
+        ensure!(
+            is_shutdown_request(&request),
+            "test server received an unexpected request after its script was exhausted: {}",
+            String::from_utf8_lossy(&request)
+                .split("\r\n")
+                .next()
+                .unwrap_or("<missing request line>")
         );
-        stream.write_all(header.as_bytes()).expect("write header");
-        stream.write_all(body).expect("write payload");
-        stream.flush().expect("flush response");
+        Ok(())
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut request = Vec::with_capacity(1024);
+        let mut chunk = [0_u8; 512];
+
+        loop {
+            let bytes_read = stream.read(&mut chunk)?;
+            ensure!(
+                bytes_read > 0,
+                "HTTP client closed before completing request headers"
+            );
+            request.extend_from_slice(&chunk[..bytes_read]);
+            ensure!(
+                request.len() <= MAX_REQUEST_HEADER_BYTES,
+                "HTTP request headers exceeded {MAX_REQUEST_HEADER_BYTES} bytes"
+            );
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(request);
+            }
+        }
+    }
+
+    fn is_shutdown_request(request: &[u8]) -> bool {
+        request.starts_with(format!("GET {SHUTDOWN_TARGET} HTTP/1.1\r\n").as_bytes())
+    }
+
+    fn request_shutdown(address: SocketAddr) -> Result<()> {
+        let mut stream = TcpStream::connect(address)?;
+        write!(
+            stream,
+            "GET {SHUTDOWN_TARGET} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        )?;
+        stream.flush()?;
+        Ok(())
     }
 }
