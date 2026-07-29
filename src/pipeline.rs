@@ -15,7 +15,7 @@ use needletail::{errors::ParseError, parse_fastx_reader, parser::SequenceRecord}
 use crate::{
     adapter::{AdapterPreset, TrimAdaptersTransform},
     cli::{Cli, Ingress, InvalidFastqPolicy, UiPolicy},
-    ena::{Accession, EnaClient, FastqUrlsByLayout},
+    ena::{Accession, EnaClient, EnaInput},
     filter::{MaxNsFilter, MinEntropyFilter, MinLengthFilter, MinMeanQualityFilter},
     output::{OutputArgs, PairedOutputHandle, SingleOutputHandle, UnitOutput},
     pair_merge::MergePairsTransform,
@@ -313,23 +313,30 @@ fn run_ena(
 ) -> Result<()> {
     let client =
         EnaClient::new().wrap_err("failed to construct ENA HTTP client for FASTQ streaming")?;
-    let layout = client.lookup_fastq_urls(accession).wrap_err_with(|| {
+    let input = client.resolve(accession).wrap_err_with(|| {
         format!(
-            "failed to resolve ENA FASTQ URLs for accession {accession}\n\
+            "failed to resolve ENA FASTQ input for accession {accession}\n\
              help: confirm this is a run accession with public FASTQ files in ENA"
         )
     })?;
 
-    match layout {
-        FastqUrlsByLayout::Single(url) => {
+    match input {
+        EnaInput::Single(fastq) => {
             config.validate_layout(RunLayout::Single)?;
-            SingleEndContext::open_ena(accession, client.open_retrying_stream(url), output_args)?
-                .run(config, ui)
+            let stream = client
+                .stream(fastq)
+                .wrap_err("failed to open and validate single-end ENA FASTQ stream")?;
+            SingleEndContext::open_ena(accession, stream, output_args)?.run(config, ui)
         }
-        FastqUrlsByLayout::Paired(urls) => {
+        EnaInput::Paired { left, right } => {
             config.validate_layout(RunLayout::Paired)?;
-            let (r1, r2) = client.open_retrying_paired_streams(urls);
-            PairedEndContext::open_ena(accession, r1, r2, output_args)?.run(config, ui)
+            let left = client
+                .stream(left)
+                .wrap_err("failed to open and validate left ENA FASTQ stream")?;
+            let right = client
+                .stream(right)
+                .wrap_err("failed to open and validate right ENA FASTQ stream")?;
+            PairedEndContext::open_ena(accession, left, right, output_args)?.run(config, ui)
         }
     }
 }

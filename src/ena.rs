@@ -1,16 +1,27 @@
 //! ENA accession modeling, file-report resolution, and retrying HTTP byte-stream readers.
 
-use std::{fmt, io, ops::Range, str::FromStr, thread, time::Duration};
+use std::{
+    fmt,
+    io::{self, Read as _},
+    ops::Range,
+    str::FromStr,
+    thread,
+    time::Duration,
+};
 
 use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
+use md5::{Digest as _, Md5};
 use reqwest::{
     StatusCode,
     blocking::{Client, Response},
     header::{
-        ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, HeaderValue, RANGE,
+        ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+        HeaderValue, RANGE,
     },
 };
 use url::Url;
+
+use crate::record::MateSide;
 
 const ENA_FILEREPORT_BASE_URL: &str = "https://www.ebi.ac.uk/ena/portal/api/filereport";
 
@@ -52,67 +63,161 @@ impl FromStr for Accession {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Validated HTTPS URL for a gzipped FASTQ resource.
-pub struct FastqUrl(Url);
+/// One resolved ENA compressed FASTQ with catalogue integrity metadata.
+pub(crate) struct EnaFastq {
+    accession: Accession,
+    mate: Option<MateSide>,
+    url: Url,
+    expected_bytes: u64,
+    expected_md5: [u8; 16],
+}
 
-impl FastqUrl {
-    /// Construct a validated HTTPS FASTQ URL ending in `.fastq.gz`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the URL is empty, invalid, not HTTPS, or does not point at a
-    /// gzipped FASTQ path.
-    pub fn new(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        if value.is_empty() {
-            bail!("FASTQ URL must not be empty");
-        }
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// A supported single- or paired-end ENA input after metadata validation.
+pub(crate) enum EnaInput {
+    /// One single-end compressed FASTQ.
+    Single(EnaFastq),
+    /// Two distinct compressed FASTQ mates.
+    Paired { left: EnaFastq, right: EnaFastq },
+}
 
-        let url = Url::parse(&value)?;
-        ensure!(url.scheme() == "https", "FASTQ URL must use https");
+impl EnaInput {
+    fn from_filereport(accession: &Accession, body: &str) -> Result<Self> {
+        let mut lines = body.lines();
+        let header = lines
+            .next()
+            .ok_or_else(|| eyre!("ENA filereport response was empty for accession {accession}"))?;
+        let row = lines.next().ok_or_else(|| {
+            eyre!("ENA filereport did not return a data row for accession {accession}")
+        })?;
         ensure!(
-            url.path().ends_with(".fastq.gz"),
-            "FASTQ URL path must end with .fastq.gz"
+            lines.next().is_none(),
+            "ENA filereport returned more than one run row for accession {accession}"
         );
 
-        Ok(Self(url))
+        let names = header.split('\t').collect::<Vec<_>>();
+        let values = row.split('\t').collect::<Vec<_>>();
+        ensure!(
+            names.len() == values.len(),
+            "ENA filereport row shape did not match its header for accession {accession}"
+        );
+
+        let returned_accession = required_filereport_field(&names, &values, "run_accession")?;
+        let layout = required_filereport_field(&names, &values, "library_layout")?;
+        let urls = required_filereport_field(&names, &values, "fastq_ftp")?;
+        let byte_counts = required_filereport_field(&names, &values, "fastq_bytes")?;
+        let md5s = required_filereport_field(&names, &values, "fastq_md5")?;
+
+        ensure!(
+            returned_accession == accession.as_str(),
+            "ENA filereport returned accession {returned_accession} while resolving {accession}"
+        );
+
+        let urls = urls.split(';').collect::<Vec<_>>();
+        let byte_counts = byte_counts.split(';').collect::<Vec<_>>();
+        let md5s = md5s.split(';').collect::<Vec<_>>();
+        ensure!(
+            urls.len() == byte_counts.len() && urls.len() == md5s.len(),
+            "ENA FASTQ URL, byte-count, and MD5 cardinalities differ for accession {accession}"
+        );
+
+        let fastqs = urls
+            .into_iter()
+            .zip(byte_counts)
+            .zip(md5s)
+            .map(|((url, bytes), md5)| {
+                let expected_bytes = bytes
+                    .parse()
+                    .wrap_err_with(|| format!("ENA fastq_bytes value was not numeric: {bytes}"))?;
+                Ok(EnaFastq {
+                    accession: accession.clone(),
+                    mate: None,
+                    url: parse_ena_fastq_url(url)?,
+                    expected_bytes,
+                    expected_md5: parse_md5_bytes(md5)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        match layout {
+            "SINGLE" => {
+                let [single]: [EnaFastq; 1] = fastqs.try_into().map_err(|files: Vec<_>| {
+                    eyre!(
+                        "ENA SINGLE layout returned {} FASTQ files for accession {accession}",
+                        files.len()
+                    )
+                })?;
+                Ok(Self::Single(single))
+            }
+            "PAIRED" => {
+                let [mut left, mut right]: [EnaFastq; 2] =
+                    fastqs.try_into().map_err(|files: Vec<_>| {
+                        eyre!(
+                            "ENA PAIRED layout returned {} FASTQ files for accession {accession}",
+                            files.len()
+                        )
+                    })?;
+                ensure!(
+                    left.url != right.url,
+                    "ENA paired FASTQ URLs must be distinct for accession {accession}"
+                );
+                left.mate = Some(MateSide::Left);
+                right.mate = Some(MateSide::Right);
+                Ok(Self::Paired { left, right })
+            }
+            other => bail!("ENA returned unsupported library_layout: {other}"),
+        }
     }
+}
 
-    /// Borrow the normalized URL as a string slice.
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
+fn required_filereport_field<'a>(
+    names: &[&str],
+    values: &[&'a str],
+    required: &str,
+) -> Result<&'a str> {
+    let value = names
+        .iter()
+        .position(|name| *name == required)
+        .and_then(|index| values.get(index))
+        .copied()
+        .ok_or_else(|| eyre!("ENA filereport response did not include {required}"))?;
+    ensure!(
+        !value.is_empty(),
+        "ENA filereport field {required} was empty"
+    );
+    Ok(value)
+}
+
+fn parse_ena_fastq_url(value: &str) -> Result<Url> {
+    ensure!(!value.is_empty(), "ENA FASTQ URL must not be empty");
+    let url = match Url::parse(value) {
+        Ok(url) => url,
+        Err(url::ParseError::RelativeUrlWithoutBase) => Url::parse(&format!("https://{value}"))?,
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(url.scheme() == "https", "ENA FASTQ URL must use https");
+    ensure!(
+        url.path().ends_with(".fastq.gz"),
+        "ENA FASTQ URL path must end with .fastq.gz"
+    );
+    Ok(url)
+}
+
+fn parse_md5_bytes(value: &str) -> Result<[u8; 16]> {
+    ensure!(
+        value.len() == 32,
+        "ENA fastq_md5 value must contain 32 hexadecimal characters"
+    );
+    let mut digest = [0_u8; 16];
+    for (output, pair) in digest.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        let pair = std::str::from_utf8(pair)?;
+        *output = u8::from_str_radix(pair, 16)
+            .wrap_err_with(|| format!("ENA fastq_md5 value was not hexadecimal: {value}"))?;
     }
+    Ok(digest)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Distinct paired FASTQ URLs representing mate 1 and mate 2.
-pub struct PairedFastqUrls {
-    r1: FastqUrl,
-    r2: FastqUrl,
-}
-
-impl PairedFastqUrls {
-    /// Construct paired FASTQ URLs while enforcing that the two mates differ.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the mate URLs are identical.
-    pub fn new(r1: FastqUrl, r2: FastqUrl) -> Result<Self> {
-        ensure!(r1 != r2, "paired FASTQ URLs must be distinct");
-        Ok(Self { r1, r2 })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// FASTQ URLs returned by ENA, grouped by inferred layout.
-pub enum FastqUrlsByLayout {
-    /// Single-end FASTQ layout.
-    Single(FastqUrl),
-    /// Paired-end FASTQ layout.
-    Paired(PairedFastqUrls),
-}
-
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 /// Blocking ENA client for metadata lookup and resumable HTTP stream construction.
 pub struct EnaClient {
     http: Client,
@@ -143,20 +248,23 @@ impl EnaClient {
         })
     }
 
-    /// Resolve an ENA accession into validated FASTQ URLs grouped by layout.
+    /// Resolve an ENA accession into a validated single- or paired-end input.
     ///
     /// # Errors
     ///
-    /// Returns an error when the filereport request fails, returns malformed data, or yields an
-    /// unsupported FASTQ URL layout.
-    pub fn lookup_fastq_urls(&self, accession: &Accession) -> Result<FastqUrlsByLayout> {
+    /// Returns an error when the filereport request fails, returns malformed data, or describes
+    /// an unsupported FASTQ arrangement.
+    pub(crate) fn resolve(&self, accession: &Accession) -> Result<EnaInput> {
         let response = self
             .http
             .get(ENA_FILEREPORT_BASE_URL)
             .query(&[
                 ("accession", accession.as_str()),
                 ("result", "read_run"),
-                ("fields", "run_accession,fastq_ftp,library_layout"),
+                (
+                    "fields",
+                    "run_accession,library_layout,fastq_ftp,fastq_bytes,fastq_md5",
+                ),
             ])
             .send()
             .wrap_err_with(|| {
@@ -168,75 +276,85 @@ impl EnaClient {
             })?;
 
         let body = response_text_or_error(response)?;
-        let fastq_ftp_field = extract_fastq_ftp_field(accession, &body)?;
-        parse_fastq_urls_by_layout(&fastq_ftp_field).wrap_err_with(|| {
+        EnaInput::from_filereport(accession, &body).wrap_err_with(|| {
             format!(
-                "ENA filereport fastq_ftp field could not be interpreted for accession {accession}\n\
-                 fastq_ftp: {fastq_ftp_field}\n\
-                 help: nuclease currently supports one FASTQ URL for single-end runs or two FASTQ URLs for paired-end runs"
+                "ENA filereport could not be resolved for accession {accession}\n\
+                 help: nuclease requires one single-end FASTQ or two distinct paired-end FASTQs with aligned byte-count and MD5 metadata"
             )
         })
     }
 
-    /// Open a retrying byte stream for one FASTQ URL.
-    pub fn open_retrying_stream(&self, url: FastqUrl) -> RetryingHttpRead {
-        RetryingHttpRead::new(
-            self.http.clone(),
-            url,
-            self.max_retries,
-            self.initial_backoff,
-            self.max_backoff,
-        )
-    }
-
-    /// Open retrying byte streams for paired FASTQ URLs.
-    pub fn open_retrying_paired_streams(
-        &self,
-        urls: PairedFastqUrls,
-    ) -> (RetryingHttpRead, RetryingHttpRead) {
-        let r1 = self.open_retrying_stream(urls.r1);
-        let r2 = self.open_retrying_stream(urls.r2);
-        (r1, r2)
+    /// Open and preflight a resolved ENA FASTQ stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the initial response cannot be opened or does not match the
+    /// catalogue metadata and gzip shape.
+    pub(crate) fn stream(&self, fastq: EnaFastq) -> Result<EnaStream> {
+        Ok(EnaStream::open(self.clone(), fastq)?)
     }
 }
 
-/// Blocking `Read` implementation that resumes ENA HTTP downloads with ranged reconnects.
-pub struct RetryingHttpRead {
-    http: Client,
-    url: FastqUrl,
+/// Blocking ENA FASTQ stream with ranged reconnects and compressed-object verification.
+pub(crate) struct EnaStream {
+    client: EnaClient,
+    fastq: EnaFastq,
     body: Option<ActiveResponse>,
-    next_byte_offset: u64,
-    expected_total_bytes: Option<u64>,
-    max_retries: u32,
+    compressed_offset: u64,
+    digest: Md5,
+    prefix: [u8; 2],
+    prefix_delivered: usize,
     retries_remaining: u32,
-    initial_backoff: Duration,
     current_backoff: Duration,
-    max_backoff: Duration,
+    integrity_verified: bool,
+    terminal_failure: bool,
     saw_eof: bool,
 }
 
-impl RetryingHttpRead {
-    /// Construct a retrying ENA reader with an explicit retry budget and backoff policy.
-    pub fn new(
-        http: Client,
-        url: FastqUrl,
-        max_retries: u32,
-        initial_backoff: Duration,
-        max_backoff: Duration,
-    ) -> Self {
-        Self {
-            http,
-            url,
+impl EnaStream {
+    fn open(client: EnaClient, fastq: EnaFastq) -> io::Result<Self> {
+        let current_backoff = client.initial_backoff;
+        let retries_remaining = client.max_retries;
+        let mut stream = Self {
+            client,
+            fastq,
             body: None,
-            next_byte_offset: 0,
-            expected_total_bytes: None,
-            max_retries,
-            retries_remaining: max_retries,
-            initial_backoff,
-            current_backoff: initial_backoff,
-            max_backoff,
+            compressed_offset: 0,
+            digest: Md5::new(),
+            prefix: [0; 2],
+            prefix_delivered: 0,
+            retries_remaining,
+            current_backoff,
+            integrity_verified: false,
+            terminal_failure: false,
             saw_eof: false,
+        };
+
+        loop {
+            if let Err(error) = stream.ensure_connected() {
+                stream.retry_or_return(error)?;
+                continue;
+            }
+
+            let Some(body) = stream.body.as_mut() else {
+                return Err(io::Error::other(
+                    "missing ENA response body during preflight",
+                ));
+            };
+            match body.read_exact(&mut stream.prefix) {
+                Ok(()) => break,
+                Err(error) => stream.retry_or_return(error)?,
+            }
         }
+
+        if stream.prefix != [0x1f, 0x8b] {
+            return Err(invalid_data(format!(
+                "ENA FASTQ for {} did not begin with gzip magic: {:02x} {:02x}",
+                stream.fastq.accession, stream.prefix[0], stream.prefix[1]
+            )));
+        }
+
+        Ok(stream)
     }
 
     fn ensure_connected(&mut self) -> io::Result<()> {
@@ -244,144 +362,40 @@ impl RetryingHttpRead {
             return Ok(());
         }
 
-        let response = if self.next_byte_offset == 0 {
-            self.open_response(None)?
-        } else {
-            self.open_response(Some(self.next_byte_offset))?
-        };
-        self.body = Some(response);
-        Ok(())
-    }
-
-    fn open_response(&mut self, offset: Option<u64>) -> io::Result<ActiveResponse> {
         let mut request = self
+            .client
             .http
-            .get(self.url.as_str())
+            .get(self.fastq.url.clone())
             .header(ACCEPT_ENCODING, "identity");
-        if let Some(offset) = offset {
-            request = request.header(RANGE, format!("bytes={offset}-"));
+        if self.compressed_offset > 0 {
+            request = request.header(RANGE, format!("bytes={}-", self.compressed_offset));
         }
 
-        let response = request.send().map_err(io_error_from_reqwest)?;
-        let span = match offset {
-            None => self.validate_initial_response(&response)?,
-            Some(expected_offset) => self.validate_ranged_response(&response, expected_offset)?,
+        let response = request.send().map_err(io::Error::other)?;
+        let body = if self.compressed_offset == 0 {
+            ActiveResponse::initial(response, &self.fastq)?
+        } else {
+            ActiveResponse::resumed(response, &self.fastq, self.compressed_offset)?
         };
-        Ok(ActiveResponse::new(response, span))
-    }
-
-    fn validate_initial_response(&mut self, response: &Response) -> io::Result<Range<u64>> {
-        if response.status() != StatusCode::OK {
-            return Err(io::Error::other(format!(
-                "initial ENA stream request failed with status {}",
-                response.status()
-            )));
-        }
-        validate_identity_content_encoding(response)?;
-
-        let Some(content_length) = response.headers().get(CONTENT_LENGTH) else {
-            return Err(invalid_data(
-                "initial ENA stream response did not include Content-Length",
-            ));
-        };
-        let total = parse_u64_header(content_length, "Content-Length")?;
-        self.remember_expected_total(total)?;
-
-        Ok(0..total)
-    }
-
-    fn validate_ranged_response(
-        &mut self,
-        response: &Response,
-        expected_offset: u64,
-    ) -> io::Result<Range<u64>> {
-        if response.status() != StatusCode::PARTIAL_CONTENT {
-            let message = format!(
-                "ranged ENA stream request failed with status {}",
-                response.status()
-            );
-            return if response.status().is_success() {
-                Err(invalid_data(message))
-            } else {
-                Err(io::Error::other(message))
-            };
-        }
-        validate_identity_content_encoding(response)?;
-
-        let Some(content_range) = response.headers().get(CONTENT_RANGE) else {
-            return Err(invalid_data(
-                "ranged ENA stream response did not include Content-Range",
-            ));
-        };
-        let content_range = content_range
-            .to_str()
-            .map_err(|_| invalid_data("Content-Range header was not valid UTF-8"))?;
-        let parsed = parse_content_range(content_range)?;
-        if parsed.start != expected_offset {
-            return Err(invalid_data(format!(
-                "ranged ENA stream resumed at byte {}, expected byte {}",
-                parsed.start, expected_offset
-            )));
-        }
-        if parsed.end < parsed.start {
-            return Err(invalid_data(format!(
-                "ranged ENA stream returned invalid Content-Range: {content_range}"
-            )));
-        }
-        if parsed.end.checked_add(1) != Some(parsed.total) {
-            return Err(invalid_data(format!(
-                "ranged ENA stream returned partial suffix Content-Range {content_range}; expected byte range to end at {}",
-                parsed.total.saturating_sub(1)
-            )));
-        }
-
-        let Some(content_length) = response.headers().get(CONTENT_LENGTH) else {
-            return Err(invalid_data(
-                "ranged ENA stream response did not include Content-Length",
-            ));
-        };
-        let observed_len = parse_u64_header(content_length, "Content-Length")?;
-        let expected_len = parsed.end - parsed.start + 1;
-        if observed_len != expected_len {
-            return Err(invalid_data(format!(
-                "ranged ENA stream Content-Length was {observed_len}, expected {expected_len} from Content-Range {content_range}"
-            )));
-        }
-
-        self.remember_expected_total(parsed.total)?;
-
-        Ok(parsed.start..parsed.end + 1)
-    }
-
-    fn remember_expected_total(&mut self, total: u64) -> io::Result<()> {
-        match self.expected_total_bytes {
-            Some(expected) if expected != total => Err(invalid_data(format!(
-                "ENA stream total size changed across retries: first saw {expected} bytes, then saw {total} bytes"
-            ))),
-            Some(_) => Ok(()),
-            None => {
-                self.expected_total_bytes = Some(total);
-                Ok(())
-            }
-        }
-    }
-
-    fn has_reached_expected_eof(&self) -> bool {
-        match self.expected_total_bytes {
-            Some(total) => self.next_byte_offset == total,
-            None => true,
-        }
+        self.body = Some(body);
+        Ok(())
     }
 
     fn retry_or_return(&mut self, error: io::Error) -> io::Result<()> {
         if !Self::should_retry_io_error(&error) {
             return Err(error);
         }
+        if self.retries_remaining == 0 {
+            return Err(io::Error::other("ENA stream retry budget exhausted"));
+        }
 
-        self.consume_retry_budget()?;
-        self.drop_connection();
+        self.retries_remaining -= 1;
+        self.body = None;
         thread::sleep(self.current_backoff);
-        self.advance_backoff();
+        self.current_backoff = self
+            .current_backoff
+            .saturating_mul(2)
+            .min(self.client.max_backoff);
         Ok(())
     }
 
@@ -398,26 +412,90 @@ impl RetryingHttpRead {
         )
     }
 
-    fn consume_retry_budget(&mut self) -> io::Result<()> {
-        if self.retries_remaining == 0 {
-            return Err(io::Error::other("ENA stream retry budget exhausted"));
+    fn reset_backoff_after_success(&mut self) {
+        self.retries_remaining = self.client.max_retries;
+        self.current_backoff = self.client.initial_backoff;
+    }
+
+    fn account(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let byte_count = u64::try_from(bytes.len())
+            .map_err(|_| invalid_data("ENA read length did not fit in u64"))?;
+        let next_offset = self
+            .compressed_offset
+            .checked_add(byte_count)
+            .ok_or_else(|| invalid_data("ENA compressed byte offset overflowed"))?;
+        if next_offset > self.fastq.expected_bytes {
+            self.terminal_failure = true;
+            return Err(invalid_data(format!(
+                "ENA stream for {} exceeded catalogue size of {} bytes",
+                self.fastq.accession, self.fastq.expected_bytes
+            )));
         }
 
-        self.retries_remaining -= 1;
+        self.digest.update(bytes);
+        if next_offset == self.fastq.expected_bytes {
+            let observed = self.digest.clone().finalize();
+            if observed.as_slice() != self.fastq.expected_md5 {
+                self.terminal_failure = true;
+                return Err(invalid_data(format!(
+                    "ENA compressed MD5 mismatch for {} after {next_offset} bytes",
+                    self.fastq.accession
+                )));
+            }
+            self.integrity_verified = true;
+        }
+
+        self.compressed_offset = next_offset;
+        self.reset_backoff_after_success();
         Ok(())
     }
+}
 
-    fn reset_backoff_after_success(&mut self) {
-        self.retries_remaining = self.max_retries;
-        self.current_backoff = self.initial_backoff;
-    }
+impl io::Read for EnaStream {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.saw_eof {
+            return Ok(0);
+        }
+        if self.terminal_failure {
+            return Err(invalid_data(
+                "ENA stream previously failed integrity validation",
+            ));
+        }
 
-    fn drop_connection(&mut self) {
-        self.body = None;
-    }
+        if self.prefix_delivered < self.prefix.len() {
+            let pending = &self.prefix[self.prefix_delivered..];
+            let count = pending.len().min(output.len());
+            output[..count].copy_from_slice(&pending[..count]);
+            self.account(&output[..count])?;
+            self.prefix_delivered += count;
+            return Ok(count);
+        }
 
-    fn advance_backoff(&mut self) {
-        self.current_backoff = self.current_backoff.saturating_mul(2).min(self.max_backoff);
+        loop {
+            if let Err(error) = self.ensure_connected() {
+                self.retry_or_return(error)?;
+                continue;
+            }
+
+            let Some(body) = self.body.as_mut() else {
+                return Err(io::Error::other("missing ENA response body"));
+            };
+            match body.read(output) {
+                Ok(0) if self.integrity_verified => {
+                    self.saw_eof = true;
+                    return Ok(0);
+                }
+                Ok(0) => self.retry_or_return(io::Error::from(io::ErrorKind::UnexpectedEof))?,
+                Ok(count) => {
+                    self.account(&output[..count])?;
+                    return Ok(count);
+                }
+                Err(error) => self.retry_or_return(error)?,
+            }
+        }
     }
 }
 
@@ -429,6 +507,112 @@ struct ActiveResponse {
 }
 
 impl ActiveResponse {
+    fn initial(response: Response, fastq: &EnaFastq) -> io::Result<Self> {
+        if response.status() != StatusCode::OK {
+            return Err(io::Error::other(format!(
+                "initial ENA stream request for {} failed with status {}",
+                fastq.accession,
+                response.status()
+            )));
+        }
+        validate_identity_content_encoding(&response)?;
+
+        let content_length = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .ok_or_else(|| {
+                invalid_data("initial ENA stream response did not include Content-Length")
+            })
+            .and_then(|value| parse_u64_header(value, "Content-Length"))?;
+        if content_length != fastq.expected_bytes {
+            return Err(invalid_data(format!(
+                "ENA Content-Length was {content_length}, catalogue expected {} for {}",
+                fastq.expected_bytes, fastq.accession
+            )));
+        }
+
+        if response.url().path().ends_with('/') {
+            return Err(invalid_data(format!(
+                "ENA FASTQ for {} redirected to a directory URL: {}",
+                fastq.accession,
+                response.url()
+            )));
+        }
+        if response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
+        {
+            return Err(invalid_data(format!(
+                "ENA FASTQ response for {} was HTML",
+                fastq.accession
+            )));
+        }
+
+        Ok(Self::new(response, 0..fastq.expected_bytes))
+    }
+
+    fn resumed(response: Response, fastq: &EnaFastq, expected_offset: u64) -> io::Result<Self> {
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            let message = format!(
+                "ranged ENA stream request for {} failed with status {}",
+                fastq.accession,
+                response.status()
+            );
+            return if response.status().is_success() {
+                Err(invalid_data(message))
+            } else {
+                Err(io::Error::other(message))
+            };
+        }
+        validate_identity_content_encoding(&response)?;
+
+        let content_range = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .ok_or_else(|| {
+                invalid_data("ranged ENA stream response did not include Content-Range")
+            })?
+            .to_str()
+            .map_err(|_| invalid_data("Content-Range header was not valid UTF-8"))?;
+        let parsed = parse_content_range(content_range)?;
+        if parsed.start != expected_offset {
+            return Err(invalid_data(format!(
+                "ranged ENA stream resumed at byte {}, expected byte {expected_offset}",
+                parsed.start
+            )));
+        }
+        if parsed.end < parsed.start || parsed.end.checked_add(1) != Some(parsed.total) {
+            return Err(invalid_data(format!(
+                "ranged ENA stream returned partial suffix Content-Range {content_range}"
+            )));
+        }
+        if parsed.total != fastq.expected_bytes {
+            return Err(invalid_data(format!(
+                "ranged ENA stream total was {}, catalogue expected {} for {}",
+                parsed.total, fastq.expected_bytes, fastq.accession
+            )));
+        }
+
+        let content_length = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .ok_or_else(|| {
+                invalid_data("ranged ENA stream response did not include Content-Length")
+            })
+            .and_then(|value| parse_u64_header(value, "Content-Length"))?;
+        let expected_length = parsed.end - parsed.start + 1;
+        if content_length != expected_length {
+            return Err(invalid_data(format!(
+                "ranged ENA stream Content-Length was {content_length}, expected {expected_length} from Content-Range {content_range}"
+            )));
+        }
+
+        Ok(Self::new(response, parsed.start..parsed.end + 1))
+    }
+
     fn new(response: Response, promised: Range<u64>) -> Self {
         Self {
             response,
@@ -556,67 +740,6 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-fn extract_fastq_ftp_field(accession: &Accession, body: &str) -> Result<String> {
-    let mut lines = body.lines();
-    let Some(header) = lines.next() else {
-        bail!(
-            "ENA filereport response was empty for accession {accession}\n\
-             help: confirm the accession is public and points to a run, not a study or sample"
-        );
-    };
-    let Some(row) = lines.next() else {
-        bail!(
-            "ENA filereport did not return a data row for accession {accession}\n\
-             help: ENA may not have public FASTQ files for this run, or the accession may not be run-level"
-        );
-    };
-
-    let header_fields = header.split('\t').collect::<Vec<_>>();
-    let row_fields = row.split('\t').collect::<Vec<_>>();
-    ensure!(
-        header_fields.len() == row_fields.len(),
-        "ENA filereport row shape did not match header for accession {accession}\n\
-         header_fields: {} row_fields: {}\n\
-         help: this usually indicates an unexpected ENA API response shape",
-        header_fields.len(),
-        row_fields.len(),
-    );
-
-    let mut run_accession = None;
-    let mut fastq_ftp = None;
-    let mut library_layout = None;
-
-    for (name, value) in header_fields.iter().zip(row_fields.iter()) {
-        match *name {
-            "run_accession" => run_accession = Some(*value),
-            "fastq_ftp" => fastq_ftp = Some(*value),
-            "library_layout" => library_layout = Some(*value),
-            _ => {}
-        }
-    }
-
-    ensure!(
-        run_accession == Some(accession.as_str()),
-        "ENA filereport returned an unexpected run accession while resolving {accession}\n\
-         returned: {}\n\
-         help: retry the request; if it repeats, ENA may have returned a stale or malformed row",
-        run_accession.unwrap_or("<missing>"),
-    );
-    ensure!(
-        library_layout.is_some(),
-        "ENA filereport response did not include library_layout"
-    );
-
-    fastq_ftp
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            eyre!(
-                "ENA filereport response did not include fastq_ftp for accession {accession}\n\
-                 help: nuclease needs ENA-hosted FASTQ URLs; this run may only expose submitted BAM/CRAM or other file types"
-            )
-        })
-}
-
 fn response_text_or_error(response: Response) -> Result<String> {
     let status = response.status();
     ensure!(
@@ -625,45 +748,6 @@ fn response_text_or_error(response: Response) -> Result<String> {
          help: this is a metadata lookup failure before FASTQ streaming starts"
     );
     Ok(response.text()?)
-}
-
-/// Parse ENA `fastq_ftp` fields into validated FASTQ URLs grouped by layout.
-///
-/// # Errors
-///
-/// Returns an error when the field is empty, contains invalid FASTQ URLs, or yields an
-/// unsupported number of FASTQ URLs.
-pub fn parse_fastq_urls_by_layout(fastq_ftp_field: &str) -> Result<FastqUrlsByLayout> {
-    let urls = fastq_ftp_field
-        .split(';')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            if value.starts_with("https://") {
-                FastqUrl::new(value)
-            } else {
-                FastqUrl::new(format!("https://{value}"))
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    match urls.as_slice() {
-        [single] => Ok(FastqUrlsByLayout::Single(single.clone())),
-        [r1, r2] => Ok(FastqUrlsByLayout::Paired(PairedFastqUrls::new(
-            r1.clone(),
-            r2.clone(),
-        )?)),
-        [] => bail!(
-            "ENA fastq_ftp field did not contain any FASTQ URLs\n\
-             help: this run may not have generated FASTQ files available in ENA"
-        ),
-        _ => bail!(
-            "ENA fastq_ftp field contained an unsupported number of FASTQ URLs\n\
-             observed_url_count: {}\n\
-             help: nuclease currently supports single-end runs with 1 URL and paired-end runs with 2 URLs; choose a specific run with a simpler layout or download/stage the desired FASTQs locally",
-            urls.len(),
-        ),
-    }
 }
 
 fn validate_run_accession(value: &str) -> Result<()> {
@@ -685,64 +769,10 @@ fn validate_run_accession(value: &str) -> Result<()> {
     Ok(())
 }
 
-impl io::Read for RetryingHttpRead {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        if self.saw_eof {
-            return Ok(0);
-        }
-
-        loop {
-            if let Err(error) = self.ensure_connected() {
-                self.retry_or_return(error)?;
-                continue;
-            }
-
-            let Some(body) = self.body.as_mut() else {
-                return Err(io::Error::other("missing ENA response body"));
-            };
-
-            match body.read(buf) {
-                Ok(0) => {
-                    if self.has_reached_expected_eof() {
-                        self.saw_eof = true;
-                        return Ok(0);
-                    }
-
-                    self.retry_or_return(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "ENA stream ended early at byte {} of expected {}",
-                            self.next_byte_offset,
-                            self.expected_total_bytes
-                                .map_or_else(|| "unknown".to_owned(), |total| total.to_string())
-                        ),
-                    ))?;
-                }
-                Ok(n) => {
-                    self.next_byte_offset += n as u64;
-                    self.reset_backoff_after_success();
-                    return Ok(n);
-                }
-                Err(error) => {
-                    self.retry_or_return(error)?;
-                }
-            }
-        }
-    }
-}
-
-fn io_error_from_reqwest(error: reqwest::Error) -> io::Error {
-    io::Error::other(error)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{Read as _, Write as _},
+        io::{self, Read as _, Write as _},
         net::{SocketAddr, TcpListener, TcpStream},
         thread::{self, JoinHandle},
         time::Duration,
@@ -752,10 +782,48 @@ mod tests {
     use reqwest::{StatusCode, blocking::Client};
     use url::Url;
 
-    use super::{
-        Accession, EnaClient, FastqUrl, FastqUrlsByLayout, PairedFastqUrls, RetryingHttpRead,
-        extract_fastq_ftp_field, parse_content_range, parse_fastq_urls_by_layout,
-    };
+    use crate::record::MateSide;
+
+    use super::{Accession, EnaClient, EnaFastq, EnaInput};
+
+    const TEST_FASTQ_BYTES: &[u8] = b"\x1f\x8babcdefghijklmnopqrstuvwxyz";
+    const TEST_FASTQ_MD5: [u8; 16] = [
+        0x45, 0x74, 0x41, 0xa3, 0x09, 0xc8, 0xfa, 0xc3, 0xf5, 0xc0, 0x59, 0xf2, 0x9b, 0x5f, 0x35,
+        0x60,
+    ];
+
+    fn test_fastq(server: &TestServer) -> Result<EnaFastq> {
+        Ok(EnaFastq {
+            accession: Accession::new("SRR35939766")?,
+            mate: None,
+            url: Url::parse(&format!("http://{}{}", server.address, FASTQ_TARGET))?,
+            expected_bytes: TEST_FASTQ_BYTES.len() as u64,
+            expected_md5: TEST_FASTQ_MD5,
+        })
+    }
+
+    fn test_client(max_retries: u32) -> Result<EnaClient> {
+        let mut client = EnaClient::new()?;
+        client.max_retries = max_retries;
+        client.initial_backoff = Duration::from_millis(1);
+        client.max_backoff = Duration::from_millis(2);
+        Ok(client)
+    }
+
+    fn stream_error_after_partial(second_exchange: Exchange) -> Result<io::Error> {
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10),
+            second_exchange,
+        ])?;
+        let fastq = test_fastq(&server)?;
+        let mut stream = test_client(1)?.stream(fastq)?;
+        let mut output = Vec::new();
+        let error = stream
+            .read_to_end(&mut output)
+            .expect_err("invalid ranged response should fail");
+        server.finish()?;
+        Ok(error)
+    }
 
     #[test]
     fn accession_accepts_valid_run_ids() -> Result<()> {
@@ -773,496 +841,469 @@ mod tests {
     }
 
     #[test]
-    fn paired_fastq_urls_keep_mates_distinct() -> Result<()> {
-        let paired = PairedFastqUrls::new(
-            FastqUrl::new("https://example.test/read_1.fastq.gz")?,
-            FastqUrl::new("https://example.test/read_2.fastq.gz")?,
-        )?;
-
-        assert_eq!(paired.r1.as_str(), "https://example.test/read_1.fastq.gz");
-        assert_eq!(paired.r2.as_str(), "https://example.test/read_2.fastq.gz");
-        Ok(())
-    }
-
-    #[test]
-    fn fastq_url_rejects_non_https_and_non_fastq_gz_urls() {
-        assert!(FastqUrl::new("http://example.test/read_1.fastq.gz").is_err());
-        assert!(FastqUrl::new("https://example.test/read_1.fastq").is_err());
-        assert!(FastqUrl::new("https://example.test/").is_err());
-    }
-
-    #[test]
-    fn paired_fastq_urls_reject_identical_mates() -> Result<()> {
-        let mate = FastqUrl::new("https://example.test/read_1.fastq.gz")?;
-        assert!(PairedFastqUrls::new(mate.clone(), mate).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn fastq_urls_by_layout_can_represent_paired_urls() -> Result<()> {
-        let urls = FastqUrlsByLayout::Paired(PairedFastqUrls::new(
-            FastqUrl::new("https://example.test/read_1.fastq.gz")?,
-            FastqUrl::new("https://example.test/read_2.fastq.gz")?,
-        )?);
-
-        assert!(matches!(urls, FastqUrlsByLayout::Paired(_)));
-        Ok(())
-    }
-
-    #[test]
-    fn parse_fastq_urls_by_layout_accepts_single_url() -> Result<()> {
-        let urls = parse_fastq_urls_by_layout("ftp.sra.ebi.ac.uk/vol1/fastq/SRR1.fastq.gz")?;
-
-        assert!(matches!(urls, FastqUrlsByLayout::Single(_)));
-        Ok(())
-    }
-
-    #[test]
-    fn parse_fastq_urls_by_layout_accepts_paired_urls() -> Result<()> {
-        let urls = parse_fastq_urls_by_layout(
-            "ftp.sra.ebi.ac.uk/vol1/fastq/SRR1_1.fastq.gz;ftp.sra.ebi.ac.uk/vol1/fastq/SRR1_2.fastq.gz",
-        )?;
-
-        assert!(matches!(urls, FastqUrlsByLayout::Paired(_)));
-        Ok(())
-    }
-
-    #[test]
-    fn parse_fastq_urls_by_layout_rejects_more_than_two_urls() {
-        let result = parse_fastq_urls_by_layout(
-            "ftp.sra.ebi.ac.uk/a.fastq.gz;ftp.sra.ebi.ac.uk/b.fastq.gz;ftp.sra.ebi.ac.uk/c.fastq.gz",
-        );
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn extract_fastq_ftp_field_reads_ena_tsv_row() -> Result<()> {
+    fn filereport_resolves_valid_single_end_input() -> Result<()> {
         let accession = Accession::new("SRR35939766")?;
         let body = concat!(
-            "run_accession\tfastq_ftp\tlibrary_layout\n",
-            "SRR35939766\t",
-            "ftp.sra.ebi.ac.uk/vol1/fastq/SRR359/066/SRR35939766/SRR35939766_1.fastq.gz;",
-            "ftp.sra.ebi.ac.uk/vol1/fastq/SRR359/066/SRR35939766/SRR35939766_2.fastq.gz\t",
-            "PAIRED\n"
+            "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+            "SRR35939766\tSINGLE\t",
+            "ftp.sra.ebi.ac.uk/vol1/fastq/SRR35939766.fastq.gz\t",
+            "26\td41d8cd98f00b204e9800998ecf8427e\n"
         );
 
-        let fastq_ftp = extract_fastq_ftp_field(&accession, body)?;
-        assert!(fastq_ftp.contains("SRR35939766_1.fastq.gz"));
-        assert!(fastq_ftp.contains("SRR35939766_2.fastq.gz"));
+        let input = EnaInput::from_filereport(&accession, body)?;
+        let EnaInput::Single(fastq) = input else {
+            bail!("expected single-end ENA input");
+        };
+
+        assert_eq!(fastq.accession, accession);
+        assert_eq!(fastq.mate, None);
+        assert_eq!(fastq.expected_bytes, 26);
+        assert_eq!(
+            fastq.expected_md5,
+            [
+                0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+                0x42, 0x7e,
+            ]
+        );
+        assert_eq!(
+            fastq.url.as_str(),
+            "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR35939766.fastq.gz"
+        );
         Ok(())
     }
 
     #[test]
-    fn ena_client_is_constructible() -> Result<()> {
-        let _client = EnaClient::new()?;
-        Ok(())
-    }
-
-    #[test]
-    fn retrying_http_read_streams_initial_response_without_range() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let server = TestServer::spawn(vec![Exchange::initial(&payload)])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            1,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
+    fn filereport_resolves_valid_paired_end_input() -> Result<()> {
+        let accession = Accession::new("SRR35939766")?;
+        let body = concat!(
+            "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+            "SRR35939766\tPAIRED\t",
+            "ftp.sra.ebi.ac.uk/vol1/fastq/SRR35939766_1.fastq.gz;",
+            "ftp.sra.ebi.ac.uk/vol1/fastq/SRR35939766_2.fastq.gz\t",
+            "17;19\t",
+            "d41d8cd98f00b204e9800998ecf8427e;",
+            "0cc175b9c0f1b6a831c399e269772661\n"
         );
 
-        let mut output = Vec::new();
-        let read_result = reader.read_to_end(&mut output);
-        server.finish()?;
-        read_result?;
+        let input = EnaInput::from_filereport(&accession, body)?;
+        let EnaInput::Paired { left, right } = input else {
+            bail!("expected paired-end ENA input");
+        };
 
-        assert_eq!(output, payload);
-        Ok(())
-    }
-
-    #[test]
-    fn retrying_http_read_requests_identity_encoding() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let server = TestServer::spawn(vec![Exchange::initial(&payload)])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            1,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
+        assert_eq!(left.mate, Some(MateSide::Left));
+        assert_eq!(right.mate, Some(MateSide::Right));
+        assert_eq!(left.expected_bytes, 17);
+        assert_eq!(right.expected_bytes, 19);
+        assert_eq!(
+            left.url.as_str(),
+            "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR35939766_1.fastq.gz"
         );
-
-        let mut output = Vec::new();
-        let read_result = reader.read_to_end(&mut output);
-        server.finish()?;
-        read_result?;
-
-        assert_eq!(output, payload);
+        assert_eq!(
+            right.url.as_str(),
+            "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR35939766_2.fastq.gz"
+        );
+        assert_eq!(
+            left.expected_md5,
+            [
+                0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+                0x42, 0x7e,
+            ]
+        );
+        assert_eq!(
+            right.expected_md5,
+            [
+                0x0c, 0xc1, 0x75, 0xb9, 0xc0, 0xf1, 0xb6, 0xa8, 0x31, 0xc3, 0x99, 0xe2, 0x69, 0x77,
+                0x26, 0x61,
+            ]
+        );
         Ok(())
     }
 
     #[test]
-    fn retrying_http_read_resumes_after_premature_eof() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    fn ena_stream_replays_gzip_prefix_and_verifies_md5() -> Result<()> {
         let server = TestServer::spawn(vec![
-            Exchange::promised_suffix(&payload, 0, 10),
-            Exchange::ranged(&payload, 10),
+            Exchange::initial(TEST_FASTQ_BYTES)
+                .with_header("Content-Type", "application/octet-stream"),
         ])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            2,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-        );
+        let fastq = test_fastq(&server)?;
+        let client = test_client(1)?;
 
+        let mut stream = client.stream(fastq)?;
         let mut output = Vec::new();
-        let read_result = reader.read_to_end(&mut output);
+        let read_result = stream.read_to_end(&mut output);
         server.finish()?;
         read_result?;
 
-        assert_eq!(output, payload);
+        assert_eq!(output, TEST_FASTQ_BYTES);
         Ok(())
     }
 
     #[test]
-    fn retrying_http_read_resumes_across_multiple_premature_eofs() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    fn ena_stream_retries_when_initial_body_ends_before_gzip_prefix() -> Result<()> {
         let server = TestServer::spawn(vec![
-            Exchange::promised_suffix(&payload, 0, 8),
-            Exchange::promised_suffix(&payload, 8, 18),
-            Exchange::ranged(&payload, 18),
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 1),
+            Exchange::initial(TEST_FASTQ_BYTES),
         ])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            3,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-        );
+        let fastq = test_fastq(&server)?;
 
+        let mut stream = test_client(1)?.stream(fastq)?;
         let mut output = Vec::new();
-        let read_result = reader.read_to_end(&mut output);
+        let read_result = stream.read_to_end(&mut output);
         server.finish()?;
         read_result?;
 
-        assert_eq!(output, payload);
+        assert_eq!(output, TEST_FASTQ_BYTES);
         Ok(())
     }
 
     #[test]
-    fn retrying_http_read_errors_when_premature_eof_exhausts_retry_budget() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    fn filereport_rejects_malformed_required_fields() -> Result<()> {
+        let accession = Accession::new("SRR35939766")?;
+        let cases = [
+            (
+                concat!(
+                    "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+                    "SRR35939766\tSINGLE\tftp.sra.ebi.ac.uk/a.fastq.gz\tnot-a-number\t",
+                    "d41d8cd98f00b204e9800998ecf8427e\n"
+                ),
+                "not numeric",
+            ),
+            (
+                concat!(
+                    "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+                    "SRR35939766\tSINGLE\tftp://example.test/a.fastq.gz\t12\t",
+                    "d41d8cd98f00b204e9800998ecf8427e\n"
+                ),
+                "non-HTTPS URL scheme",
+            ),
+            (
+                concat!(
+                    "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+                    "SRR35939766\tSINGLE\tftp.sra.ebi.ac.uk/a.fastq.gz\t12\tbad-md5\n"
+                ),
+                "32 hexadecimal",
+            ),
+            (
+                concat!(
+                    "run_accession\tlibrary_layout\tfastq_ftp\tfastq_md5\n",
+                    "SRR35939766\tSINGLE\tftp.sra.ebi.ac.uk/a.fastq.gz\t",
+                    "d41d8cd98f00b204e9800998ecf8427e\n"
+                ),
+                "did not include fastq_bytes",
+            ),
+            (
+                concat!(
+                    "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+                    "SRR35939766\tSINGLE\tftp.sra.ebi.ac.uk/a.fastq.gz\t12\t\n"
+                ),
+                "fastq_md5 was empty",
+            ),
+            (
+                concat!(
+                    "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+                    "SRR35939766\tSINGLE\tftp.sra.ebi.ac.uk/a.fastq.gz\t12\t",
+                    "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n"
+                ),
+                "was not hexadecimal",
+            ),
+        ];
+
+        for (body, case) in cases {
+            assert!(
+                EnaInput::from_filereport(&accession, body).is_err(),
+                "accepted malformed filereport case: {case}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn filereport_rejects_inconsistent_run_metadata() -> Result<()> {
+        let accession = Accession::new("SRR35939766")?;
+        let cases = [
+            (
+                concat!(
+                    "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+                    "SRR35939766\tPAIRED\tftp.sra.ebi.ac.uk/a.fastq.gz;",
+                    "ftp.sra.ebi.ac.uk/b.fastq.gz\t12\t",
+                    "d41d8cd98f00b204e9800998ecf8427e;0cc175b9c0f1b6a831c399e269772661\n"
+                ),
+                "cardinalities differ",
+            ),
+            (
+                concat!(
+                    "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+                    "SRR35939766\tSINGLE\tftp.sra.ebi.ac.uk/a.fastq.gz;",
+                    "ftp.sra.ebi.ac.uk/b.fastq.gz\t12;13\t",
+                    "d41d8cd98f00b204e9800998ecf8427e;0cc175b9c0f1b6a831c399e269772661\n"
+                ),
+                "SINGLE layout returned 2 FASTQ files",
+            ),
+            (
+                concat!(
+                    "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+                    "SRR35939766\tPAIRED\tftp.sra.ebi.ac.uk/a.fastq.gz;",
+                    "ftp.sra.ebi.ac.uk/a.fastq.gz\t12;12\t",
+                    "d41d8cd98f00b204e9800998ecf8427e;d41d8cd98f00b204e9800998ecf8427e\n"
+                ),
+                "must be distinct",
+            ),
+            (
+                concat!(
+                    "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+                    "ERR123456\tSINGLE\tftp.sra.ebi.ac.uk/a.fastq.gz\t12\t",
+                    "d41d8cd98f00b204e9800998ecf8427e\n"
+                ),
+                "while resolving SRR35939766",
+            ),
+            (
+                concat!(
+                    "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+                    "SRR35939766\tSINGLE\tftp.sra.ebi.ac.uk/a.fastq.gz\t12\t",
+                    "d41d8cd98f00b204e9800998ecf8427e\n",
+                    "SRR35939766\tSINGLE\tftp.sra.ebi.ac.uk/b.fastq.gz\t13\t",
+                    "0cc175b9c0f1b6a831c399e269772661\n"
+                ),
+                "more than one run row",
+            ),
+        ];
+
+        for (body, case) in cases {
+            assert!(
+                EnaInput::from_filereport(&accession, body).is_err(),
+                "accepted malformed filereport case: {case}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_rejects_catalogue_content_length_mismatch_during_open() -> Result<()> {
         let server = TestServer::spawn(vec![
-            Exchange::promised_suffix(&payload, 0, 10),
-            Exchange::promised_suffix(&payload, 10, 10),
+            Exchange::initial(TEST_FASTQ_BYTES)
+                .with_header("Content-Length", (TEST_FASTQ_BYTES.len() - 1).to_string()),
         ])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            1,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
+        let fastq = test_fastq(&server)?;
+
+        let Err(error) = test_client(1)?.stream(fastq) else {
+            bail!("catalogue size mismatch should fail during stream opening");
+        };
+        server.finish()?;
+
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidData)
         );
+        assert!(error.to_string().contains("catalogue expected"));
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_rejects_missing_content_length_during_open() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::initial(TEST_FASTQ_BYTES).without_header("Content-Length"),
+        ])?;
+        let fastq = test_fastq(&server)?;
+
+        let Err(error) = test_client(3)?.stream(fastq) else {
+            bail!("missing Content-Length should fail during stream opening");
+        };
+        server.finish()?;
+
+        assert!(error.to_string().contains("Content-Length"));
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_rejects_html_content_type_during_open() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::initial(TEST_FASTQ_BYTES)
+                .with_header("Content-Type", "text/html; charset=utf-8"),
+        ])?;
+        let fastq = test_fastq(&server)?;
+
+        let Err(error) = test_client(1)?.stream(fastq) else {
+            bail!("HTML should fail during stream opening");
+        };
+        server.finish()?;
+
+        assert!(error.to_string().contains("was HTML"));
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_rejects_transformed_content_encoding_during_open() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::initial(TEST_FASTQ_BYTES).with_header("Content-Encoding", "gzip"),
+        ])?;
+        let fastq = test_fastq(&server)?;
+
+        let Err(error) = test_client(3)?.stream(fastq) else {
+            bail!("transformed Content-Encoding should fail during stream opening");
+        };
+        server.finish()?;
+
+        assert!(error.to_string().contains("Content-Encoding"));
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_rejects_wrong_gzip_magic_during_open() -> Result<()> {
+        let payload = b"NOabcdefghijklmnopqrstuvwxyz";
+        assert_eq!(payload.len(), TEST_FASTQ_BYTES.len());
+        let server = TestServer::spawn(vec![Exchange::initial(payload)])?;
+        let fastq = test_fastq(&server)?;
+
+        let Err(error) = test_client(1)?.stream(fastq) else {
+            bail!("wrong gzip magic should fail during stream opening");
+        };
+        server.finish()?;
+
+        assert!(error.to_string().contains("gzip magic"));
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_rejects_compressed_md5_mismatch() -> Result<()> {
+        let server = TestServer::spawn(vec![Exchange::initial(TEST_FASTQ_BYTES)])?;
+        let mut fastq = test_fastq(&server)?;
+        fastq.expected_md5 = [0; 16];
+        let mut stream = test_client(1)?.stream(fastq)?;
 
         let mut output = Vec::new();
-        let error = reader
+        let error = stream
             .read_to_end(&mut output)
-            .expect_err("exhausted retry budget should fail");
+            .expect_err("compressed MD5 mismatch should fail");
         server.finish()?;
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("MD5 mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_resumes_after_premature_eof() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10),
+            Exchange::ranged(TEST_FASTQ_BYTES, 10),
+        ])?;
+        let fastq = test_fastq(&server)?;
+        let mut stream = test_client(2)?.stream(fastq)?;
+
+        let mut output = Vec::new();
+        let read_result = stream.read_to_end(&mut output);
+        server.finish()?;
+        read_result?;
+
+        assert_eq!(output, TEST_FASTQ_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_resumes_across_multiple_premature_eofs() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 8),
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 8, 18),
+            Exchange::ranged(TEST_FASTQ_BYTES, 18),
+        ])?;
+        let fastq = test_fastq(&server)?;
+        let mut stream = test_client(3)?.stream(fastq)?;
+
+        let mut output = Vec::new();
+        let read_result = stream.read_to_end(&mut output);
+        server.finish()?;
+        read_result?;
+
+        assert_eq!(output, TEST_FASTQ_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_reports_exhausted_retry_budget() -> Result<()> {
+        let error =
+            stream_error_after_partial(Exchange::promised_suffix(TEST_FASTQ_BYTES, 10, 10))?;
 
         assert!(error.to_string().contains("retry budget exhausted"));
         Ok(())
     }
 
     #[test]
-    fn retrying_http_read_resumes_from_nonzero_offset_with_range() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let expected_offset = 10_usize;
-        let server = TestServer::spawn(vec![Exchange::ranged(&payload, expected_offset)])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            1,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-        );
-        reader.next_byte_offset = expected_offset as u64;
-
-        let mut output = Vec::new();
-        let read_result = reader.read_to_end(&mut output);
-        server.finish()?;
-        read_result?;
-
-        assert_eq!(output, payload[expected_offset..]);
-        Ok(())
-    }
-
-    #[test]
-    fn retrying_http_read_rejects_bad_ranged_status() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let expected_offset = 10_usize;
-        let server = TestServer::spawn(vec![
-            Exchange::ranged(&payload, expected_offset).with_status(StatusCode::OK),
-        ])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            1,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-        );
-
-        let error = reader
-            .open_response(Some(expected_offset as u64))
-            .expect_err("bad ranged status should fail");
-        server.finish()?;
-        assert!(
-            error
-                .to_string()
-                .contains("ranged ENA stream request failed with status")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn retrying_http_read_rejects_missing_content_range() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let expected_offset = 10_usize;
-        let server = TestServer::spawn(vec![
-            Exchange::ranged(&payload, expected_offset).without_header("Content-Range"),
-        ])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            1,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-        );
-
-        let error = reader
-            .open_response(Some(expected_offset as u64))
-            .expect_err("missing content-range should fail");
-        server.finish()?;
-        assert!(
-            error
-                .to_string()
-                .contains("ranged ENA stream response did not include Content-Range")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn content_range_parser_requires_start_end_and_total() -> Result<()> {
-        let parsed = parse_content_range("bytes 10-25/26")?;
-
-        assert_eq!(parsed.start, 10);
-        assert_eq!(parsed.end, 25);
-        assert_eq!(parsed.total, 26);
-        assert!(parse_content_range("items 10-25/26").is_err());
-        assert!(parse_content_range("bytes 10-25/*").is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn retrying_http_read_rejects_wrong_ranged_start() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let expected_offset = 10_usize;
-        let server = TestServer::spawn(vec![
-            Exchange::ranged(&payload, expected_offset).with_header(
-                "Content-Range",
-                format!(
-                    "bytes {}-{}/{}",
-                    expected_offset + 1,
-                    payload.len() - 1,
-                    payload.len()
-                ),
+    fn ena_stream_rejects_invalid_ranged_responses() -> Result<()> {
+        let cases = [
+            (
+                Exchange::ranged(TEST_FASTQ_BYTES, 10).with_status(StatusCode::OK),
+                "failed with status",
             ),
-        ])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            1,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-        );
-
-        let error = reader
-            .open_response(Some(expected_offset as u64))
-            .expect_err("wrong ranged start should fail");
-        server.finish()?;
-        assert!(error.to_string().contains("resumed at byte"));
-        Ok(())
-    }
-
-    #[test]
-    fn retrying_http_read_rejects_ranged_partial_suffix() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let expected_offset = 10_usize;
-        let partial_end = expected_offset + 4;
-        let server = TestServer::spawn(vec![
-            Exchange::promised_suffix(&payload, expected_offset, partial_end)
-                .with_header(
-                    "Content-Length",
-                    (partial_end - expected_offset).to_string(),
-                )
-                .with_header(
+            (
+                Exchange::ranged(TEST_FASTQ_BYTES, 10).without_header("Content-Range"),
+                "did not include Content-Range",
+            ),
+            (
+                Exchange::ranged(TEST_FASTQ_BYTES, 10).with_header(
                     "Content-Range",
-                    format!(
-                        "bytes {}-{}/{}",
-                        expected_offset,
-                        partial_end - 1,
-                        payload.len()
-                    ),
+                    format!("bytes 11-27/{}", TEST_FASTQ_BYTES.len()),
                 ),
-        ])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            1,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-        );
-
-        let error = reader
-            .open_response(Some(expected_offset as u64))
-            .expect_err("partial ranged suffix should fail");
-        server.finish()?;
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("partial suffix"));
-        Ok(())
-    }
-
-    #[test]
-    fn retrying_http_read_rejects_ranged_content_length_mismatch() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let expected_offset = 10_usize;
-        let server = TestServer::spawn(vec![
-            Exchange::ranged(&payload, expected_offset).with_header(
-                "Content-Length",
-                (payload.len() - expected_offset - 1).to_string(),
+                "resumed at byte",
             ),
-        ])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            1,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-        );
+            (
+                Exchange::ranged(TEST_FASTQ_BYTES, 10).with_header(
+                    "Content-Range",
+                    format!("bytes 10-20/{}", TEST_FASTQ_BYTES.len()),
+                ),
+                "partial suffix",
+            ),
+            (
+                Exchange::ranged(TEST_FASTQ_BYTES, 10).with_header("Content-Length", "17"),
+                "Content-Length",
+            ),
+            (
+                Exchange::ranged(TEST_FASTQ_BYTES, 10).with_header(
+                    "Content-Range",
+                    format!("bytes 10-28/{}", TEST_FASTQ_BYTES.len() + 1),
+                ),
+                "catalogue expected",
+            ),
+        ];
 
-        let error = reader
-            .open_response(Some(expected_offset as u64))
-            .expect_err("ranged content-length mismatch should fail");
-        server.finish()?;
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("Content-Length"));
+        for (exchange, expected_message) in cases {
+            let error = stream_error_after_partial(exchange)?;
+            assert!(
+                error.to_string().contains(expected_message),
+                "expected `{expected_message}` in `{error}`"
+            );
+        }
         Ok(())
     }
 
     #[test]
-    fn retrying_http_read_rejects_unexpected_content_encoding() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let server = TestServer::spawn(vec![
-            Exchange::initial(&payload).with_header("Content-Encoding", "gzip"),
-        ])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            1,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-        );
+    fn ena_stream_rejects_directory_redirect_during_open() -> Result<()> {
+        let redirect = Exchange {
+            expected_target: FASTQ_TARGET.to_owned(),
+            expected_range_offset: None,
+            status: StatusCode::FOUND,
+            headers: vec![
+                ("Location".to_owned(), "/".to_owned()),
+                ("Content-Length".to_owned(), "0".to_owned()),
+            ],
+            body: Vec::new(),
+        };
+        let mut directory = Exchange::initial(TEST_FASTQ_BYTES);
+        directory.expected_target = "/".to_owned();
+        let server = TestServer::spawn(vec![redirect, directory])?;
+        let fastq = test_fastq(&server)?;
 
-        let mut output = Vec::new();
-        let error = reader
-            .read_to_end(&mut output)
-            .expect_err("unexpected content encoding should fail");
+        let Err(error) = test_client(1)?.stream(fastq) else {
+            bail!("directory redirect should fail during stream opening");
+        };
         server.finish()?;
 
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("Content-Encoding"));
-        Ok(())
-    }
-
-    #[test]
-    fn retrying_http_read_does_not_retry_invalid_response_headers() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let server = TestServer::spawn(vec![
-            Exchange::initial(&payload).with_header("Content-Encoding", "gzip"),
-        ])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            3,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-        );
-
-        let mut output = Vec::new();
-        let error = reader
-            .read_to_end(&mut output)
-            .expect_err("invalid response headers should fail without retrying");
-        server.finish()?;
-
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        Ok(())
-    }
-
-    #[test]
-    fn retrying_http_read_rejects_changed_total_size() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let expected_offset = 10_usize;
-        let server = TestServer::spawn(vec![Exchange::ranged(&payload, expected_offset)])?;
-        let url = server.fastq_url()?;
-        let client = Client::builder().build()?;
-        let mut reader = RetryingHttpRead::new(
-            client,
-            url,
-            1,
-            Duration::from_millis(1),
-            Duration::from_millis(2),
-        );
-        reader.expected_total_bytes = Some(payload.len() as u64 + 1);
-
-        let error = reader
-            .open_response(Some(expected_offset as u64))
-            .expect_err("changed total size should fail");
-        server.finish()?;
-        assert!(error.to_string().contains("total size changed"));
+        assert!(error.to_string().contains("directory URL"));
         Ok(())
     }
 
     #[test]
     fn scripted_server_reports_request_range_mismatches() -> Result<()> {
-        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
-        let server = TestServer::spawn(vec![Exchange::ranged(&payload, 10)])?;
+        let server = TestServer::spawn(vec![Exchange::ranged(TEST_FASTQ_BYTES, 10)])?;
         let url = server.fastq_url()?;
         let client = Client::builder().build()?;
 
@@ -1301,11 +1342,11 @@ mod tests {
             })
         }
 
-        fn fastq_url(&self) -> Result<FastqUrl> {
-            Ok(FastqUrl(Url::parse(&format!(
+        fn fastq_url(&self) -> Result<Url> {
+            Ok(Url::parse(&format!(
                 "http://{}{}",
                 self.address, FASTQ_TARGET
-            ))?))
+            ))?)
         }
 
         fn finish(mut self) -> Result<()> {
