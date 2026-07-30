@@ -4,9 +4,10 @@ use std::marker::PhantomData;
 
 use bumpalo::Bump;
 
-use color_eyre::eyre::{Result, bail};
-
-use crate::record::{ReadStats, RecordView};
+use crate::{
+    error::{InternalError, Result},
+    record::{ReadStats, RecordView},
+};
 
 /// Typestate marker for a logical preprocessing plan still being authored.
 pub(crate) struct Logical;
@@ -70,7 +71,7 @@ pub(crate) trait ReadFilter: Send + Sync + 'static {
     type Reason: RejectionReason;
 
     /// Evaluate the filter on one borrowed record view.
-    fn evaluate(&self, record: &RecordView<'_>) -> Result<(), Self::Reason>;
+    fn evaluate(&self, record: &RecordView<'_>) -> std::result::Result<(), Self::Reason>;
 }
 
 /// Contract for read transforms that may rewrite one record using the transform arena.
@@ -599,10 +600,13 @@ impl Plan<Execution> {
                     }
                 }
                 PhysicalPlanItem::ReadSet(transform) => {
-                    bail!(
-                        "read-set transform `{}` requires whole-read-set execution",
-                        transform.code()
-                    );
+                    return Err(InternalError::PlanInvariant {
+                        detail: format!(
+                            "read-set transform `{}` requires whole-read-set execution",
+                            transform.code()
+                        ),
+                    }
+                    .into());
                 }
             }
         }
@@ -644,7 +648,10 @@ mod tests {
         ReadSetTransform, ReadTransform, RecordPair, RejectionReason, TransformArena,
         TransformResult, TransformStep,
     };
-    use crate::record::{ReadStats, RecordView};
+    use crate::{
+        error::{InternalError, RunError},
+        record::{ReadStats, RecordView},
+    };
     use color_eyre::eyre::Result;
 
     #[derive(Debug)]
@@ -733,7 +740,7 @@ mod tests {
             &mut self,
             _input: &mut dyn ActiveUnitSource,
             _output: &mut dyn ActiveUnitSink,
-        ) -> Result<()> {
+        ) -> crate::error::Result<()> {
             Ok(())
         }
     }
@@ -804,11 +811,11 @@ mod tests {
             panic!("per-unit execution should reject read-set transforms");
         };
 
-        assert!(
-            error
-                .to_string()
-                .contains("read-set transform `fake_read_set` requires whole-read-set execution")
-        );
+        assert!(matches!(
+            error,
+            RunError::Internal(InternalError::PlanInvariant { detail })
+                if detail.contains("fake_read_set")
+        ));
     }
 
     #[test]

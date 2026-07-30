@@ -13,13 +13,13 @@ use clap::{
         styling::{AnsiColor, Effects},
     },
 };
-use color_eyre::eyre::{Result, bail, eyre};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
     adapter::AdapterPreset,
     ena::Accession,
+    error::{InternalError, Result},
     output::{OutputArgs, OutputEncoding, OutputFormat},
     progress::ProgressMode,
     quality::QualityBinCount,
@@ -122,6 +122,7 @@ pub struct Cli {
     /// ENA run accession to resolve and stream.
     #[arg(
         long,
+        conflicts_with_all = ["input", "in1", "in2", "paired"],
         help_heading = "Inputs",
         help = "ENA run accession to resolve and stream",
         long_help = "\
@@ -132,13 +133,19 @@ and verifies files that are read to completion. Use -v to show reconnects."
     pub ena: Option<Accession>,
 
     /// Local FASTQ input. Treated as single-end unless `--paired` is also passed.
-    #[arg(long = "in", help_heading = "Inputs", help = "Local FASTQ input")]
+    #[arg(
+        long = "in",
+        conflicts_with_all = ["ena", "in1", "in2"],
+        help_heading = "Inputs",
+        help = "Local FASTQ input"
+    )]
     pub input: Option<PathBuf>,
 
     /// Treat `--in` as interleaved paired-end FASTQ.
     #[arg(
         long,
         requires = "input",
+        conflicts_with_all = ["ena", "in1", "in2"],
         help_heading = "Inputs",
         help = "Treat --in as interleaved paired-end FASTQ"
     )]
@@ -147,6 +154,8 @@ and verifies files that are read to completion. Use -v to show reconnects."
     /// Local FASTQ input for split paired read 1.
     #[arg(
         long,
+        requires = "in2",
+        conflicts_with_all = ["ena", "input"],
         help_heading = "Inputs",
         help = "Local FASTQ input for split paired read 1"
     )]
@@ -155,6 +164,8 @@ and verifies files that are read to completion. Use -v to show reconnects."
     /// Local FASTQ input for split paired read 2.
     #[arg(
         long,
+        requires = "in1",
+        conflicts_with_all = ["ena", "input"],
         help_heading = "Inputs",
         help = "Local FASTQ input for split paired read 2"
     )]
@@ -229,7 +240,7 @@ and verifies files that are read to completion. Use -v to show reconnects."
     /// Attempt to merge paired-end reads before per-record filters.
     #[arg(
         long,
-        conflicts_with = "passthrough",
+        conflicts_with_all = ["passthrough", "out1", "out2"],
         help_heading = "Preprocessing",
         help = "Attempt to merge paired-end reads before trimming and filtering; requires paired input and single-stream output"
     )]
@@ -392,7 +403,7 @@ impl Cli {
             .with_env_filter(filter)
             .with_writer(io::stderr)
             .try_init()
-            .map_err(|error| eyre!("failed to initialize tracing subscriber: {error}"))
+            .map_err(|source| InternalError::Tracing { source }.into())
     }
 
     /// Derive logging, summary, and progress behavior from quiet/verbose flags and terminal state.
@@ -437,25 +448,6 @@ impl Cli {
     /// Returns an error when the CLI-selected ingress arguments do not describe a supported
     /// combination.
     pub fn ingress(&self) -> Result<Ingress> {
-        if self.ena.is_some() && self.paired {
-            bail!(
-                "--paired applies only to local --in input; ENA layout is detected automatically"
-            );
-        }
-
-        if self.paired && self.input.is_none() {
-            bail!("--paired requires --in because split --in1/--in2 input is already paired");
-        }
-
-        if self.ena.is_some() && (self.input.is_some() || self.in1.is_some() || self.in2.is_some())
-        {
-            bail!("choose either --ena or local FASTQ input, not both");
-        }
-
-        if self.input.is_some() && (self.in1.is_some() || self.in2.is_some()) {
-            bail!("--in cannot be combined with --in1/--in2");
-        }
-
         match (&self.ena, &self.input, &self.in1, &self.in2, self.paired) {
             (Some(accession), None, None, None, false) => Ok(Ingress::Ena {
                 accession: accession.clone(),
@@ -470,11 +462,10 @@ impl Cli {
                 r1: in1.clone(),
                 r2: in2.clone(),
             }),
-            (None, None, Some(_), None, _) => {
-                bail!("--in1 requires --in2; use --in for single-end input")
+            _ => Err(InternalError::CliInvariant {
+                detail: "ingress arguments violated Clap's requires/conflicts contract".to_owned(),
             }
-            (None, None, None, Some(_), _) => bail!("--in2 requires --in1"),
-            _ => bail!("choose either --ena, --in, or --in1/--in2"),
+            .into()),
         }
     }
 
@@ -487,7 +478,6 @@ impl Cli {
             self.out1.clone(),
             self.out2.clone(),
         )
-        .with_merge_pairs(self.merge_pairs)
     }
 }
 
@@ -495,6 +485,7 @@ impl Cli {
 mod tests {
     use std::path::PathBuf;
 
+    use clap::{Parser, error::ErrorKind};
     use color_eyre::Result;
     use tracing::level_filters::LevelFilter;
 
@@ -639,15 +630,100 @@ mod tests {
     }
 
     #[test]
-    fn ingress_rejects_in1_without_in2() {
-        let mut cli = base_cli();
-        cli.input = None;
-        cli.in1 = Some(PathBuf::from("reads_1.fastq.gz"));
+    fn clap_rejects_statically_invalid_ingress_relationships() {
+        for arguments in [
+            vec!["nuclease"],
+            vec!["nuclease", "--in1", "reads_1.fastq.gz"],
+            vec!["nuclease", "--in2", "reads_2.fastq.gz"],
+            vec!["nuclease", "--ena", "SRR35939766", "--in", "reads.fastq.gz"],
+            vec![
+                "nuclease",
+                "--ena",
+                "SRR35939766",
+                "--in1",
+                "reads_1.fastq.gz",
+                "--in2",
+                "reads_2.fastq.gz",
+            ],
+            vec![
+                "nuclease",
+                "--in",
+                "reads.fastq.gz",
+                "--in1",
+                "reads_1.fastq.gz",
+                "--in2",
+                "reads_2.fastq.gz",
+            ],
+            vec!["nuclease", "--ena", "SRR35939766", "--paired"],
+            vec![
+                "nuclease",
+                "--in1",
+                "reads_1.fastq.gz",
+                "--in2",
+                "reads_2.fastq.gz",
+                "--paired",
+            ],
+            vec![
+                "nuclease",
+                "--in1",
+                "reads_1.fastq.gz",
+                "--in2",
+                "reads_2.fastq.gz",
+                "--out",
+                "clean.fastq",
+                "--out1",
+                "clean_1.fastq",
+                "--out2",
+                "clean_2.fastq",
+            ],
+            vec![
+                "nuclease",
+                "--in1",
+                "reads_1.fastq.gz",
+                "--in2",
+                "reads_2.fastq.gz",
+                "--merge-pairs",
+                "--out1",
+                "clean_1.fastq",
+                "--out2",
+                "clean_2.fastq",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+    }
 
-        let error = cli
-            .ingress()
-            .expect_err("--in1 alone should no longer mean single-end input");
-        assert!(error.to_string().contains("--in1 requires --in2"));
+    #[test]
+    fn clap_accepts_each_supported_ingress_shape() {
+        for arguments in [
+            vec!["nuclease", "--ena", "SRR35939766"],
+            vec!["nuclease", "--in", "reads.fastq.gz"],
+            vec!["nuclease", "--in", "reads.fastq.gz", "--paired"],
+            vec![
+                "nuclease",
+                "--in1",
+                "reads_1.fastq.gz",
+                "--in2",
+                "reads_2.fastq.gz",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_ok());
+        }
+    }
+
+    #[test]
+    fn clap_rejects_invalid_accession_syntax_as_a_value_error() {
+        for accession in ["SRR", "XYZ123", "SRRabc", "PRJNA1247874"] {
+            let error = Cli::try_parse_from(["nuclease", "--ena", accession])
+                .expect_err("invalid run accession should fail during Clap parsing");
+
+            assert_eq!(error.kind(), ErrorKind::ValueValidation);
+            assert!(
+                error
+                    .to_string()
+                    .contains("use an SRR, ERR, or DRR run accession followed by digits")
+            );
+        }
     }
 
     #[test]

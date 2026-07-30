@@ -1,12 +1,23 @@
 //! Core record and accounting types shared across ingress, parsing, and output layers.
 
-use std::{collections::BTreeMap, fs::File, io::BufWriter, io::Write as _, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::BufWriter,
+    path::{Path, PathBuf},
+};
 
-use color_eyre::eyre::{Result, bail};
 use serde::Serialize;
 use tracing::warn;
 
-use crate::{cli::InvalidFastqPolicy, plan::RecordPair};
+use crate::{
+    cli::InvalidFastqPolicy,
+    error::{
+        EnaContentProblem, IndeterminateInputError, InternalError, IoError, MalformedInputError,
+        ReportWriteError, Result, RunError,
+    },
+    plan::RecordPair,
+};
 
 const INVALID_FASTQ_SAMPLE_LIMIT: usize = 20;
 const INVALID_FASTQ_WARNING_LIMIT: u64 = 5;
@@ -55,6 +66,7 @@ pub struct InvalidFastqEvent {
 /// Newline-delimited JSON writer for invalid FASTQ events.
 #[derive(Debug)]
 pub struct InvalidFastqReport {
+    path: PathBuf,
     writer: BufWriter<File>,
 }
 
@@ -65,21 +77,57 @@ impl InvalidFastqReport {
     ///
     /// Returns an error when the destination file cannot be created.
     pub fn create(path: &Path) -> Result<Self> {
+        let writer = File::create(path).map_err(|source| IoError::CreateReport {
+            report_kind: "invalid FASTQ JSONL",
+            path: path.to_path_buf(),
+            source,
+        })?;
         Ok(Self {
-            writer: BufWriter::new(File::create(path)?),
+            path: path.to_path_buf(),
+            writer: BufWriter::new(writer),
         })
     }
 
     fn write_event(&mut self, event: &InvalidFastqEvent) -> Result<()> {
-        serde_json::to_writer(&mut self.writer, event)?;
-        self.writer.write_all(b"\n")?;
-        if event.fatal {
-            // Fatal parser events explain why the run is about to exit. Flush those diagnostics
-            // before returning the error so failed-job artifacts do not depend on normal teardown.
-            self.writer.flush()?;
-        }
-        Ok(())
+        write_invalid_fastq_event_to(&mut self.writer, &self.path, event)
     }
+
+    fn finish(&mut self) -> Result<()> {
+        finalize_invalid_fastq_report(&mut self.writer, &self.path)
+    }
+}
+
+fn write_invalid_fastq_event_to(
+    writer: &mut impl std::io::Write,
+    path: &Path,
+    event: &InvalidFastqEvent,
+) -> Result<()> {
+    serde_json::to_writer(&mut *writer, event)
+        .map_err(|source| classify_json_error(path, source))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|source| IoError::WriteReport {
+            report_kind: "invalid FASTQ JSONL",
+            path: path.to_path_buf(),
+            source: ReportWriteError::Bytes(source),
+        })?;
+    if event.fatal {
+        // Fatal parser events explain why the run is about to exit. Flush those diagnostics
+        // before returning the error so failed-job artifacts do not depend on normal teardown.
+        finalize_invalid_fastq_report(writer, path)?;
+    }
+    Ok(())
+}
+
+fn finalize_invalid_fastq_report(writer: &mut impl std::io::Write, path: &Path) -> Result<()> {
+    writer.flush().map_err(|source| {
+        IoError::FinalizeReport {
+            report_kind: "invalid FASTQ JSONL",
+            path: path.to_path_buf(),
+            source,
+        }
+        .into()
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -283,12 +331,12 @@ impl<'a> RecordView<'a> {
     /// Returns an error when the provided sequence and quality slices are not the same length.
     pub fn with_sequence_and_quality(self, sequence: &'a [u8], quality: &'a [u8]) -> Result<Self> {
         if sequence.len() != quality.len() {
-            bail!(
-                "replacement sequence and quality lengths differ header={} sequence_len={} quality_len={}",
-                String::from_utf8_lossy(self.header),
-                sequence.len(),
-                quality.len(),
-            );
+            return Err(InternalError::ReplacementLength {
+                header: String::from_utf8_lossy(self.header).into_owned(),
+                sequence_len: sequence.len(),
+                quality_len: quality.len(),
+            }
+            .into());
         }
 
         Ok(Self {
@@ -312,14 +360,7 @@ impl<'a> RecordView<'a> {
         stats.record_invalid_read(policy, |context| context.length_mismatch(self))?;
 
         match policy {
-            InvalidFastqPolicy::Error => bail!(
-                "invalid FASTQ record source={} mate={} header={} sequence_len={} quality_len={}",
-                self.source_display(),
-                self.mate_display(),
-                String::from_utf8_lossy(self.header()),
-                self.sequence.len(),
-                self.quality.len(),
-            ),
+            InvalidFastqPolicy::Error => Err(self.record_length_error()),
             InvalidFastqPolicy::WarnDrop => {
                 self.warn_invalid_record(stats);
                 Ok(None)
@@ -350,14 +391,7 @@ impl<'a> RecordView<'a> {
                 context.paired_header_mismatch(left, right)
             })?;
             match policy {
-                InvalidFastqPolicy::Error => bail!(
-                    "paired FASTQ headers do not agree source={} left_mate={} right_mate={} left_header={} right_header={}",
-                    left.source_display(),
-                    left.mate_display(),
-                    right.mate_display(),
-                    String::from_utf8_lossy(left.header()),
-                    String::from_utf8_lossy(right.header()),
-                ),
+                InvalidFastqPolicy::Error => Err(left.mate_identifier_error(right)),
                 InvalidFastqPolicy::WarnDrop => {
                     left.warn_invalid_pair(right, stats);
                     Ok(None)
@@ -379,6 +413,62 @@ impl<'a> RecordView<'a> {
             );
         } else if stats.should_emit_invalid_fastq_suppressed_notice() {
             warn!("further invalid FASTQ warnings suppressed");
+        }
+    }
+
+    fn record_length_error(self) -> RunError {
+        if let Some(accession) = self.ena_accession() {
+            return IndeterminateInputError::Content {
+                accession: accession.to_owned(),
+                problem: EnaContentProblem::RecordLength {
+                    mate: self.mate_display(),
+                    header: String::from_utf8_lossy(self.header()).into_owned(),
+                    sequence_len: self.sequence.len(),
+                    quality_len: self.quality.len(),
+                },
+            }
+            .into();
+        }
+
+        MalformedInputError::RecordLength {
+            source_label: self.source_display(),
+            mate: self.mate_display(),
+            header: String::from_utf8_lossy(self.header()).into_owned(),
+            sequence_len: self.sequence.len(),
+            quality_len: self.quality.len(),
+        }
+        .into()
+    }
+
+    fn mate_identifier_error(self, mate: Self) -> RunError {
+        if let Some(accession) = self.ena_accession() {
+            return IndeterminateInputError::Content {
+                accession: accession.to_owned(),
+                problem: EnaContentProblem::MateIdentifier {
+                    left_header: String::from_utf8_lossy(self.header()).into_owned(),
+                    right_header: String::from_utf8_lossy(mate.header()).into_owned(),
+                },
+            }
+            .into();
+        }
+
+        MalformedInputError::MateIdentifier {
+            source_label: self.source_display(),
+            left_mate: self.mate_display(),
+            right_mate: mate.mate_display(),
+            left_header: String::from_utf8_lossy(self.header()).into_owned(),
+            right_header: String::from_utf8_lossy(mate.header()).into_owned(),
+        }
+        .into()
+    }
+
+    fn ena_accession(self) -> Option<&'a str> {
+        match self.provenance() {
+            Some(RecordProvenance {
+                source: InputSource::Ena { accession },
+                ..
+            }) => Some(accession),
+            _ => None,
         }
     }
 
@@ -437,6 +527,23 @@ impl<'a> RecordView<'a> {
             Some(MateSide::Right) => "right",
             None => "single",
         }
+    }
+}
+
+fn classify_json_error(path: &Path, source: serde_json::Error) -> RunError {
+    if source.io_error_kind().is_some() {
+        IoError::WriteReport {
+            report_kind: "invalid FASTQ JSONL",
+            path: path.to_path_buf(),
+            source: ReportWriteError::Json(source),
+        }
+        .into()
+    } else {
+        InternalError::SerializeReport {
+            report_kind: "invalid FASTQ JSONL",
+            source,
+        }
+        .into()
     }
 }
 
@@ -551,6 +658,14 @@ impl ReadStats {
         self.invalid_fastq_report = Some(report);
     }
 
+    /// Flush the optional invalid-FASTQ report before a successful run returns.
+    pub fn finish_invalid_fastq_report(&mut self) -> Result<()> {
+        if let Some(report) = &mut self.invalid_fastq_report {
+            report.finish()?;
+        }
+        Ok(())
+    }
+
     /// Increment the application count for one transform.
     pub fn record_transform(&mut self, code: &'static str) {
         *self.transform_counts.entry(code).or_default() += 1;
@@ -601,14 +716,88 @@ impl ReadStats {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        io::{self, Write},
+        path::Path,
+    };
 
     use tempfile::tempdir;
 
     use super::{
-        InputSource, InvalidFastqReport, MateSide, ReadStats, RecordProvenance, RecordView,
+        InputSource, InvalidFastqContext, InvalidFastqReport, MateSide, ReadStats,
+        RecordProvenance, RecordView, finalize_invalid_fastq_report, write_invalid_fastq_event_to,
     };
-    use crate::cli::InvalidFastqPolicy;
+    use crate::{
+        cli::InvalidFastqPolicy,
+        error::{
+            EnaContentProblem, IndeterminateInputError, IoError, MalformedInputError,
+            ReportWriteError, RunError,
+        },
+    };
+
+    struct FailingWriter {
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    struct NewlineFailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "test write failure",
+                ))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "test flush failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Write for NewlineFailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes == b"\n" {
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "test newline failure",
+                ))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn fatal_event() -> super::InvalidFastqEvent {
+        InvalidFastqContext {
+            reads_seen: 1,
+            pairs_seen: None,
+            policy: InvalidFastqPolicy::Error,
+        }
+        .parse_error(
+            "local:reads.fastq",
+            "single",
+            "UnequalLengths".to_owned(),
+            "sequence and quality lengths differ".to_owned(),
+            Some(1),
+        )
+    }
 
     #[test]
     fn pair_key_strips_slash_mate_suffix() {
@@ -644,6 +833,96 @@ mod tests {
             .expect("drop policy should not error");
         assert!(pair.is_none());
         assert_eq!(stats.invalid_pairs, 1);
+    }
+
+    #[test]
+    fn record_length_error_classification_respects_origin() {
+        let mut local_stats = ReadStats::default();
+        let local = RecordView::new(b"read1", b"ACGT", b"I").with_provenance(RecordProvenance {
+            source: InputSource::LocalSingle {
+                input: Path::new("reads.fastq"),
+            },
+            mate: None,
+        });
+        let Err(local_error) = local.validate(InvalidFastqPolicy::Error, &mut local_stats) else {
+            panic!("local length mismatch should fail");
+        };
+        assert!(matches!(
+            local_error,
+            RunError::MalformedInput(error)
+                if matches!(*error, MalformedInputError::RecordLength { .. })
+        ));
+
+        let mut ena_stats = ReadStats::default();
+        let ena = RecordView::new(b"read1", b"ACGT", b"I").with_provenance(RecordProvenance {
+            source: InputSource::Ena {
+                accession: "SRR35939766",
+            },
+            mate: None,
+        });
+        let Err(ena_error) = ena.validate(InvalidFastqPolicy::Error, &mut ena_stats) else {
+            panic!("ENA length mismatch should fail");
+        };
+        assert!(matches!(
+            ena_error,
+            RunError::IndeterminateInput(IndeterminateInputError::Content {
+                problem: EnaContentProblem::RecordLength { .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn mate_identifier_error_classification_respects_origin() {
+        let mut local_stats = ReadStats::default();
+        let local_provenance = RecordProvenance {
+            source: InputSource::LocalInterleavedPaired {
+                input: Path::new("reads.fastq"),
+            },
+            mate: Some(MateSide::Left),
+        };
+        let local_left = RecordView::new(b"read1/1", b"A", b"I").with_provenance(local_provenance);
+        let local_right =
+            RecordView::new(b"read2/2", b"T", b"I").with_provenance(RecordProvenance {
+                mate: Some(MateSide::Right),
+                ..local_provenance
+            });
+        let Err(local_error) =
+            local_left.validate_pair(local_right, InvalidFastqPolicy::Error, &mut local_stats)
+        else {
+            panic!("local mate mismatch should fail");
+        };
+        assert!(matches!(
+            local_error,
+            RunError::MalformedInput(error)
+                if matches!(*error, MalformedInputError::MateIdentifier { .. })
+        ));
+
+        let mut ena_stats = ReadStats::default();
+        let ena_left = RecordView::new(b"read1/1", b"A", b"I").with_provenance(RecordProvenance {
+            source: InputSource::Ena {
+                accession: "SRR35939766",
+            },
+            mate: Some(MateSide::Left),
+        });
+        let ena_right = RecordView::new(b"read2/2", b"T", b"I").with_provenance(RecordProvenance {
+            source: InputSource::Ena {
+                accession: "SRR35939766",
+            },
+            mate: Some(MateSide::Right),
+        });
+        let Err(ena_error) =
+            ena_left.validate_pair(ena_right, InvalidFastqPolicy::Error, &mut ena_stats)
+        else {
+            panic!("ENA mate mismatch should fail");
+        };
+        assert!(matches!(
+            ena_error,
+            RunError::IndeterminateInput(IndeterminateInputError::Content {
+                problem: EnaContentProblem::MateIdentifier { .. },
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -695,5 +974,105 @@ mod tests {
         assert!(report.contains("\"kind\":\"fastq_parse_error\""));
         assert!(report.contains("\"fatal\":true"));
         assert!(report.ends_with('\n'));
+    }
+
+    #[test]
+    fn invalid_fastq_report_flushes_nonfatal_events_on_finish() {
+        let temp = tempdir().expect("tempdir should be created");
+        let path = temp.path().join("invalid-fastq.jsonl");
+        let mut stats = ReadStats::default();
+        stats.set_invalid_fastq_report(
+            InvalidFastqReport::create(&path).expect("invalid FASTQ report should be created"),
+        );
+
+        let dropped = RecordView::new(b"bad", b"AAAA", b"I")
+            .validate(InvalidFastqPolicy::SilentDrop, &mut stats)
+            .expect("drop policy should retain a safe record boundary");
+        assert!(dropped.is_none());
+        stats
+            .finish_invalid_fastq_report()
+            .expect("successful run should flush its invalid FASTQ report");
+
+        let report = fs::read_to_string(path)
+            .expect("finished invalid FASTQ report should be immediately readable");
+        assert!(report.contains("\"kind\":\"sequence_quality_length_mismatch\""));
+        assert!(report.ends_with('\n'));
+    }
+
+    #[test]
+    fn invalid_fastq_report_write_failure_retains_path_and_json_source() {
+        let path = Path::new("invalid-fastq.jsonl");
+        let mut writer = FailingWriter {
+            fail_write: true,
+            fail_flush: false,
+        };
+
+        let error = write_invalid_fastq_event_to(&mut writer, path, &fatal_event())
+            .expect_err("requested report write failure should be required I/O");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::WriteReport {
+                path: observed_path,
+                source: ReportWriteError::Json(source),
+                ..
+            }) if observed_path == path && source.io_error_kind() == Some(io::ErrorKind::StorageFull)
+        ));
+    }
+
+    #[test]
+    fn invalid_fastq_report_flush_failure_is_finalization() {
+        let path = Path::new("invalid-fastq.jsonl");
+        let mut writer = FailingWriter {
+            fail_write: false,
+            fail_flush: true,
+        };
+
+        let error = finalize_invalid_fastq_report(&mut writer, path)
+            .expect_err("requested report flush failure should be required I/O");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::FinalizeReport {
+                path: observed_path,
+                source,
+                ..
+            }) if observed_path == path && source.kind() == io::ErrorKind::StorageFull
+        ));
+    }
+
+    #[test]
+    fn invalid_fastq_report_newline_failure_retains_io_source() {
+        let path = Path::new("invalid-fastq.jsonl");
+        let mut writer = NewlineFailingWriter;
+
+        let error = write_invalid_fastq_event_to(&mut writer, path, &fatal_event())
+            .expect_err("JSONL newline failure should be required I/O");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::WriteReport {
+                path: observed_path,
+                source: ReportWriteError::Bytes(source),
+                ..
+            }) if observed_path == path && source.kind() == io::ErrorKind::StorageFull
+        ));
+    }
+
+    #[test]
+    fn invalid_fastq_report_create_failure_retains_requested_path() {
+        let temp = tempdir().expect("tempdir should be created");
+        let path = temp
+            .path()
+            .join("missing-parent")
+            .join("invalid-fastq.jsonl");
+
+        let error = InvalidFastqReport::create(&path)
+            .expect_err("report under missing parent should fail to open");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::CreateReport {
+                path: observed_path,
+                source,
+                ..
+            }) if observed_path == path && source.kind() == io::ErrorKind::NotFound
+        ));
     }
 }

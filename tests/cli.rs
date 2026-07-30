@@ -458,6 +458,11 @@ fn warn_drop_invalid_fastq_policy_does_not_recover_parser_error() {
         !output.status.success(),
         "parser-level FASTQ errors should remain fatal under warn-drop"
     );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "Commit 1 should preserve generic application failure status"
+    );
     assert!(
         stderr.contains("FASTQ parser rejected malformed input"),
         "stderr did not include controlled parser diagnostic: {stderr}"
@@ -931,6 +936,11 @@ fn merge_pairs_rejects_single_end_input() {
         !output.status.success(),
         "single-end merge-pairs input should fail"
     );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "post-resolution usage remains a generic application failure in Commit 1"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("--merge-pairs requires paired-end input"),
@@ -968,10 +978,32 @@ fn merge_pairs_rejects_split_paired_output() {
         !output.status.success(),
         "split output should fail when merge-pairs is enabled"
     );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "Clap should own statically expressible output conflicts"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--merge-pairs cannot be used with split paired output"),
+        stderr.contains("--merge-pairs")
+            && stderr.contains("cannot be used with")
+            && stderr.contains("--out1")
+            && stderr.contains("--out2"),
         "stderr did not explain merge-pairs output constraint: {stderr}"
+    );
+}
+
+#[test]
+fn invalid_ena_accession_is_a_clap_value_error() {
+    let output = nuclease()
+        .args(["--ena", "PRJNA1247874"])
+        .output()
+        .expect("nuclease should run");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("use an SRR, ERR, or DRR run accession followed by digits")
     );
 }
 

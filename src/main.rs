@@ -7,6 +7,7 @@
 mod adapter;
 mod cli;
 mod ena;
+mod error;
 mod filter;
 mod output;
 mod pair_merge;
@@ -29,7 +30,5 @@ use color_eyre::eyre::Result;
 fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = cli::Cli::parse();
-    cli.init_tracing()?;
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting nuclease");
-    pipeline::run(&cli)
+    Ok(pipeline::run(&cli)?)
 }

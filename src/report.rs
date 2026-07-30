@@ -2,10 +2,12 @@
 
 use std::{fmt::Write as _, fs::File, io::BufWriter, path::Path, time::Duration};
 
-use color_eyre::eyre::Result;
 use serde::Serialize;
 
-use crate::record::{InvalidFastqEvent, ReadStats};
+use crate::{
+    error::{InternalError, IoError, ReportWriteError, Result, RunError},
+    record::{InvalidFastqEvent, ReadStats},
+};
 
 /// Lightweight run context needed to explain a preprocessing run.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -164,10 +166,49 @@ pub fn print_summary(summary: &RunSummary) {
 ///
 /// Returns an error when the file cannot be created or the JSON cannot be serialized.
 pub fn write_summary_json(path: &Path, summary: &RunSummary) -> Result<()> {
-    let file = File::create(path)?;
-    let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, summary)?;
+    let file = File::create(path).map_err(|source| IoError::CreateReport {
+        report_kind: "run summary",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut writer = BufWriter::new(file);
+    write_summary_to(&mut writer, path, summary)
+}
+
+fn write_summary_to(
+    writer: &mut impl std::io::Write,
+    path: &Path,
+    summary: &RunSummary,
+) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *writer, summary)
+        .map_err(|source| classify_json_error("run summary", path, source))?;
+    writer.flush().map_err(|source| IoError::FinalizeReport {
+        report_kind: "run summary",
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok(())
+}
+
+fn classify_json_error(
+    report_kind: &'static str,
+    path: &Path,
+    source: serde_json::Error,
+) -> RunError {
+    if source.io_error_kind().is_some() {
+        IoError::WriteReport {
+            report_kind,
+            path: path.to_path_buf(),
+            source: ReportWriteError::Json(source),
+        }
+        .into()
+    } else {
+        InternalError::SerializeReport {
+            report_kind,
+            source,
+        }
+        .into()
+    }
 }
 
 fn render_summary(summary: &RunSummary) -> String {
@@ -415,14 +456,51 @@ fn u64_to_f64(value: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, time::Duration};
+    use std::{
+        collections::BTreeMap,
+        io::{self, Write},
+        time::Duration,
+    };
 
     use tempfile::tempdir;
 
     use super::{
         IngressMode, RunContext, RunLayout, RunSummary, render_summary, write_summary_json,
+        write_summary_to,
     };
-    use crate::record::{InvalidFastqEvent, ReadStats};
+    use crate::{
+        error::{IoError, ReportWriteError, RunError},
+        record::{InvalidFastqEvent, ReadStats},
+    };
+
+    struct FailingWriter {
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "test write failure",
+                ))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "test flush failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
 
     fn sample_stats() -> ReadStats {
         let mut rejection_counts = BTreeMap::new();
@@ -524,5 +602,68 @@ mod tests {
         assert!(written.contains("\"transform_breakdown\""));
         assert!(written.contains("\"invalid_fastq_samples\""));
         assert!(written.contains("SRR35939766.42 instrument/2"));
+    }
+
+    #[test]
+    fn summary_write_failure_retains_path_and_json_io_source() {
+        let summary =
+            RunSummary::from_stats(sample_context(), &sample_stats(), Duration::from_secs(2));
+        let path = std::path::Path::new("summary.json");
+        let mut writer = FailingWriter {
+            fail_write: true,
+            fail_flush: false,
+        };
+
+        let error = write_summary_to(&mut writer, path, &summary)
+            .expect_err("summary writer failure should be required I/O");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::WriteReport {
+                path: observed_path,
+                source: ReportWriteError::Json(source),
+                ..
+            }) if observed_path == path && source.io_error_kind() == Some(io::ErrorKind::StorageFull)
+        ));
+    }
+
+    #[test]
+    fn summary_flush_failure_is_report_finalization() {
+        let summary =
+            RunSummary::from_stats(sample_context(), &sample_stats(), Duration::from_secs(2));
+        let path = std::path::Path::new("summary.json");
+        let mut writer = FailingWriter {
+            fail_write: false,
+            fail_flush: true,
+        };
+
+        let error = write_summary_to(&mut writer, path, &summary)
+            .expect_err("summary flush failure should be required I/O");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::FinalizeReport {
+                path: observed_path,
+                source,
+                ..
+            }) if observed_path == path && source.kind() == io::ErrorKind::StorageFull
+        ));
+    }
+
+    #[test]
+    fn summary_create_failure_retains_requested_path() {
+        let temp = tempdir().expect("tempdir should exist");
+        let path = temp.path().join("missing-parent").join("summary.json");
+        let summary =
+            RunSummary::from_stats(sample_context(), &sample_stats(), Duration::from_secs(2));
+
+        let error = write_summary_json(&path, &summary)
+            .expect_err("summary under missing parent should fail to open");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::CreateReport {
+                path: observed_path,
+                source,
+                ..
+            }) if observed_path == path && source.kind() == io::ErrorKind::NotFound
+        ));
     }
 }

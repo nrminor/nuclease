@@ -2,15 +2,15 @@
 
 use std::str;
 
-use color_eyre::eyre::{Result, WrapErr};
 use libpairassembly::{Assembler, CorrectionParams, OverlapParams, PairInput, SeqRecordView};
 
 use crate::{
+    error::{IndeterminateInputError, InternalError, MalformedInputError, Result, RunError},
     plan::{
         BuildPlan, IntoExecutionStep, PairTransform, PairTransformResult, PairTransformStep,
         RecordPair, TransformArena,
     },
-    record::{RecordProvenance, RecordView},
+    record::{InputSource, RecordProvenance, RecordView},
 };
 
 /// Pair-aware transform that attempts to merge paired-end reads.
@@ -56,7 +56,7 @@ impl MergePairs {
             .with_overlap_params(overlap_params)
             .with_correction_params(correction_params)
             .build()
-            .wrap_err("failed to construct libpairassembly paired-read assembler")?;
+            .map_err(|source| InternalError::PairAssembly { source })?;
         Ok(Self { assembler })
     }
 }
@@ -79,7 +79,7 @@ impl PairTransform for MergePairs {
         let Some(merged) = self
             .assembler
             .process_pair(&input)
-            .wrap_err("libpairassembly failed while processing a paired read")?
+            .map_err(|source| InternalError::PairAssembly { source })?
         else {
             return Ok(PairTransformResult::Pair {
                 pair,
@@ -127,12 +127,28 @@ impl<'a> AssemblyRecordView<'a> {
     fn try_from_record(record: RecordView<'a>) -> Result<Self> {
         Ok(Self {
             id: str::from_utf8(record.pair_key())
-                .wrap_err("read identifier must be UTF-8 for libpairassembly input")?,
+                .map_err(|source| invalid_utf8_error(record, "read identifier", source))?,
             sequence: str::from_utf8(record.sequence())
-                .wrap_err("read sequence must be UTF-8 for libpairassembly input")?,
+                .map_err(|source| invalid_utf8_error(record, "read sequence", source))?,
             quality: str::from_utf8(record.quality())
-                .wrap_err("read quality must be UTF-8 for libpairassembly input")?,
+                .map_err(|source| invalid_utf8_error(record, "read quality", source))?,
         })
+    }
+}
+
+fn invalid_utf8_error(
+    record: RecordView<'_>,
+    field: &'static str,
+    source: std::str::Utf8Error,
+) -> RunError {
+    match record.provenance().map(|provenance| provenance.source) {
+        Some(InputSource::Ena { accession }) => IndeterminateInputError::InvalidUtf8 {
+            accession: accession.to_owned(),
+            field,
+            source,
+        }
+        .into(),
+        _ => MalformedInputError::InvalidUtf8 { field, source }.into(),
     }
 }
 
@@ -187,5 +203,32 @@ mod tests {
         assert!(applied);
         assert_eq!(record.header(), b"read-1");
         assert_eq!(record.sequence().len(), record.quality().len());
+    }
+
+    #[test]
+    fn invalid_utf8_classification_respects_record_origin() {
+        let local = RecordView::new(&[0xff], b"ACGT", b"IIII");
+        let Err(local_error) = AssemblyRecordView::try_from_record(local) else {
+            panic!("invalid local identifier should fail UTF-8 conversion");
+        };
+        assert!(matches!(
+            local_error,
+            RunError::MalformedInput(error)
+                if matches!(*error, MalformedInputError::InvalidUtf8 { .. })
+        ));
+
+        let ena = RecordView::new(&[0xff], b"ACGT", b"IIII").with_provenance(RecordProvenance {
+            source: InputSource::Ena {
+                accession: "SRR35939766",
+            },
+            mate: Some(crate::record::MateSide::Left),
+        });
+        let Err(ena_error) = AssemblyRecordView::try_from_record(ena) else {
+            panic!("invalid ENA identifier should fail UTF-8 conversion");
+        };
+        assert!(matches!(
+            ena_error,
+            RunError::IndeterminateInput(IndeterminateInputError::InvalidUtf8 { .. })
+        ));
     }
 }

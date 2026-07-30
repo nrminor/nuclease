@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::eyre::{Result, WrapErr, bail, ensure, eyre};
 use md5::{Digest as _, Md5};
 use reqwest::{
     StatusCode,
@@ -19,9 +18,16 @@ use reqwest::{
         HeaderValue, RANGE,
     },
 };
+use thiserror::Error;
 use url::Url;
 
-use crate::record::MateSide;
+use crate::{
+    error::{
+        AccessionParseError, EnaAvailabilityProblem, EnaMetadataProblem, IndeterminateInputError,
+        InternalError, Result, RunError, UnavailableInputError,
+    },
+    record::MateSide,
+};
 
 /// ENA Portal API endpoint used to resolve run accessions into FASTQ metadata.
 const ENA_FILEREPORT_BASE_URL: &str = "https://www.ebi.ac.uk/ena/portal/api/filereport";
@@ -51,7 +57,7 @@ impl Accession {
     ///
     /// Returns an error when the value does not start with `SRR`, `ERR`, or `DRR` followed by
     /// digits.
-    pub fn new(value: impl Into<String>) -> Result<Self> {
+    pub fn new(value: impl Into<String>) -> std::result::Result<Self, AccessionParseError> {
         let value = value.into();
         validate_run_accession(&value)?;
         Ok(Self(value))
@@ -70,9 +76,9 @@ impl fmt::Display for Accession {
 }
 
 impl FromStr for Accession {
-    type Err = color_eyre::Report;
+    type Err = AccessionParseError;
 
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         Self::new(value)
     }
 }
@@ -87,6 +93,31 @@ pub(crate) struct EnaFastq {
     expected_md5: [u8; 16],
 }
 
+#[derive(Debug, Error)]
+#[error("{message}: HTTP status {status}")]
+struct EnaHttpStatusError {
+    status: StatusCode,
+    message: String,
+}
+
+#[derive(Debug, Error)]
+#[error(
+    "ENA stream could not resume: accession={accession} mate={mate:?} source_url={source_url} final_url={final_url} compressed_offset={compressed_offset} expected_compressed_bytes={expected_bytes} reconnects={reconnects} consecutive_failures={consecutive_failures} last_error_kind={last_error_kind:?} last_error={source}"
+)]
+struct EnaRetryExhaustedError {
+    accession: Accession,
+    mate: Option<MateSide>,
+    source_url: Url,
+    final_url: String,
+    compressed_offset: u64,
+    expected_bytes: u64,
+    reconnects: u32,
+    consecutive_failures: u32,
+    last_error_kind: io::ErrorKind,
+    #[source]
+    source: io::Error,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// A supported single- or paired-end ENA input after metadata validation.
 pub(crate) enum EnaInput {
@@ -99,135 +130,233 @@ pub(crate) enum EnaInput {
 impl EnaInput {
     fn from_filereport(accession: &Accession, body: &str) -> Result<Self> {
         let mut lines = body.lines();
-        let header = lines
-            .next()
-            .ok_or_else(|| eyre!("ENA filereport response was empty for accession {accession}"))?;
-        let row = lines.next().ok_or_else(|| {
-            eyre!("ENA filereport did not return a data row for accession {accession}")
-        })?;
-        ensure!(
-            lines.next().is_none(),
-            "ENA filereport returned more than one run row for accession {accession}"
-        );
+        let Some(header) = lines.next() else {
+            return Err(indeterminate_metadata_error(
+                accession,
+                EnaMetadataProblem::EmptyResponse,
+            ));
+        };
+        let Some(row) = lines.next() else {
+            return Err(UnavailableInputError::EnaMetadata {
+                accession: accession.clone(),
+                problem: EnaAvailabilityProblem::NoDataRow,
+            }
+            .into());
+        };
+        if lines.next().is_some() {
+            return Err(indeterminate_metadata_error(
+                accession,
+                EnaMetadataProblem::MultipleRows,
+            ));
+        }
 
         let names = header.split('\t').collect::<Vec<_>>();
         let values = row.split('\t').collect::<Vec<_>>();
-        ensure!(
-            names.len() == values.len(),
-            "ENA filereport row shape did not match its header for accession {accession}"
-        );
+        if names.len() != values.len() {
+            return Err(indeterminate_metadata_error(
+                accession,
+                EnaMetadataProblem::RowShape,
+            ));
+        }
 
-        let returned_accession = required_filereport_field(&names, &values, "run_accession")?;
-        let layout = required_filereport_field(&names, &values, "library_layout")?;
-        let urls = required_filereport_field(&names, &values, "fastq_ftp")?;
-        let byte_counts = required_filereport_field(&names, &values, "fastq_bytes")?;
-        let md5s = required_filereport_field(&names, &values, "fastq_md5")?;
+        let returned_accession =
+            required_filereport_field(accession, &names, &values, "run_accession")?;
+        let layout = required_filereport_field(accession, &names, &values, "library_layout")?;
+        let urls = required_filereport_field(accession, &names, &values, "fastq_ftp")?;
+        let byte_counts = required_filereport_field(accession, &names, &values, "fastq_bytes")?;
+        let md5s = required_filereport_field(accession, &names, &values, "fastq_md5")?;
 
-        ensure!(
-            returned_accession == accession.as_str(),
-            "ENA filereport returned accession {returned_accession} while resolving {accession}"
-        );
+        if returned_accession != accession.as_str() {
+            return Err(indeterminate_metadata_error(
+                accession,
+                EnaMetadataProblem::AccessionMismatch {
+                    returned: returned_accession.to_owned(),
+                },
+            ));
+        }
 
-        let urls = urls.split(';').collect::<Vec<_>>();
-        let byte_counts = byte_counts.split(';').collect::<Vec<_>>();
-        let md5s = md5s.split(';').collect::<Vec<_>>();
-        ensure!(
-            urls.len() == byte_counts.len() && urls.len() == md5s.len(),
-            "ENA FASTQ URL, byte-count, and MD5 cardinalities differ for accession {accession}"
-        );
-
-        let fastqs = urls
-            .into_iter()
-            .zip(byte_counts)
-            .zip(md5s)
-            .map(|((url, bytes), md5)| {
-                let expected_bytes = bytes
-                    .parse()
-                    .wrap_err_with(|| format!("ENA fastq_bytes value was not numeric: {bytes}"))?;
-                Ok(EnaFastq {
-                    accession: accession.clone(),
-                    mate: None,
-                    url: parse_ena_fastq_url(url)?,
-                    expected_bytes,
-                    expected_md5: parse_md5_bytes(md5)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let fastqs = parse_fastq_metadata(accession, urls, byte_counts, md5s)?;
 
         match layout {
             "SINGLE" => {
-                let [single]: [EnaFastq; 1] = fastqs.try_into().map_err(|files: Vec<_>| {
-                    eyre!(
-                        "ENA SINGLE layout returned {} FASTQ files for accession {accession}",
-                        files.len()
-                    )
+                let [single]: [EnaFastq; 1] = fastqs.try_into().map_err(|_files: Vec<_>| {
+                    UnavailableInputError::EnaMetadata {
+                        accession: accession.clone(),
+                        problem: EnaAvailabilityProblem::UnsupportedLayout,
+                    }
                 })?;
                 Ok(Self::Single(single))
             }
             "PAIRED" => {
                 let [mut left, mut right]: [EnaFastq; 2] =
-                    fastqs.try_into().map_err(|files: Vec<_>| {
-                        eyre!(
-                            "ENA PAIRED layout returned {} FASTQ files for accession {accession}",
-                            files.len()
-                        )
+                    fastqs.try_into().map_err(|_files: Vec<_>| {
+                        UnavailableInputError::EnaMetadata {
+                            accession: accession.clone(),
+                            problem: EnaAvailabilityProblem::UnsupportedLayout,
+                        }
                     })?;
-                ensure!(
-                    left.url != right.url,
-                    "ENA paired FASTQ URLs must be distinct for accession {accession}"
-                );
+                if left.url == right.url {
+                    return Err(indeterminate_metadata_error(
+                        accession,
+                        EnaMetadataProblem::DuplicatePairedUrls,
+                    ));
+                }
                 left.mate = Some(MateSide::Left);
                 right.mate = Some(MateSide::Right);
                 Ok(Self::Paired { left, right })
             }
-            other => bail!("ENA returned unsupported library_layout: {other}"),
+            _ => Err(UnavailableInputError::EnaMetadata {
+                accession: accession.clone(),
+                problem: EnaAvailabilityProblem::UnsupportedLayout,
+            }
+            .into()),
         }
     }
 }
 
+fn parse_fastq_metadata(
+    accession: &Accession,
+    urls: &str,
+    byte_counts: &str,
+    md5s: &str,
+) -> Result<Vec<EnaFastq>> {
+    let urls = urls.split(';').collect::<Vec<_>>();
+    let byte_counts = byte_counts.split(';').collect::<Vec<_>>();
+    let md5s = md5s.split(';').collect::<Vec<_>>();
+    if urls.len() != byte_counts.len() || urls.len() != md5s.len() {
+        return Err(indeterminate_metadata_error(
+            accession,
+            EnaMetadataProblem::CardinalityMismatch,
+        ));
+    }
+
+    urls.into_iter()
+        .zip(byte_counts)
+        .zip(md5s)
+        .map(|((url, bytes), md5)| {
+            let expected_bytes = bytes.parse().map_err(|source| {
+                indeterminate_metadata_error(
+                    accession,
+                    EnaMetadataProblem::InvalidByteCount {
+                        value: bytes.to_owned(),
+                        source,
+                    },
+                )
+            })?;
+            Ok(EnaFastq {
+                accession: accession.clone(),
+                mate: None,
+                url: parse_ena_fastq_url(accession, url)?,
+                expected_bytes,
+                expected_md5: parse_md5_bytes(accession, md5)?,
+            })
+        })
+        .collect()
+}
+
 fn required_filereport_field<'a>(
+    accession: &Accession,
     names: &[&str],
     values: &[&'a str],
-    required: &str,
+    required: &'static str,
 ) -> Result<&'a str> {
-    let value = names
+    let Some(value) = names
         .iter()
         .position(|name| *name == required)
         .and_then(|index| values.get(index))
         .copied()
-        .ok_or_else(|| eyre!("ENA filereport response did not include {required}"))?;
-    ensure!(
-        !value.is_empty(),
-        "ENA filereport field {required} was empty"
-    );
+    else {
+        return Err(indeterminate_metadata_error(
+            accession,
+            EnaMetadataProblem::MissingField { field: required },
+        ));
+    };
+    if value.is_empty() {
+        if required == "fastq_ftp" {
+            return Err(UnavailableInputError::EnaMetadata {
+                accession: accession.clone(),
+                problem: EnaAvailabilityProblem::EmptyFastqLocation,
+            }
+            .into());
+        }
+        return Err(indeterminate_metadata_error(
+            accession,
+            EnaMetadataProblem::EmptyField { field: required },
+        ));
+    }
     Ok(value)
 }
 
-fn parse_ena_fastq_url(value: &str) -> Result<Url> {
-    ensure!(!value.is_empty(), "ENA FASTQ URL must not be empty");
+fn parse_ena_fastq_url(accession: &Accession, value: &str) -> Result<Url> {
+    if value.is_empty() {
+        return Err(UnavailableInputError::EnaMetadata {
+            accession: accession.clone(),
+            problem: EnaAvailabilityProblem::EmptyFastqLocation,
+        }
+        .into());
+    }
     let url = match Url::parse(value) {
         Ok(url) => url,
-        Err(url::ParseError::RelativeUrlWithoutBase) => Url::parse(&format!("https://{value}"))?,
-        Err(error) => return Err(error.into()),
+        Err(url::ParseError::RelativeUrlWithoutBase) => Url::parse(&format!("https://{value}"))
+            .map_err(|source| {
+                indeterminate_metadata_error(
+                    accession,
+                    EnaMetadataProblem::InvalidUrl {
+                        value: value.to_owned(),
+                        source,
+                    },
+                )
+            })?,
+        Err(source) => {
+            return Err(indeterminate_metadata_error(
+                accession,
+                EnaMetadataProblem::InvalidUrl {
+                    value: value.to_owned(),
+                    source,
+                },
+            ));
+        }
     };
-    ensure!(url.scheme() == "https", "ENA FASTQ URL must use https");
-    ensure!(
-        url.path().ends_with(".fastq.gz"),
-        "ENA FASTQ URL path must end with .fastq.gz"
-    );
+    if url.scheme() != "https" {
+        return Err(indeterminate_metadata_error(
+            accession,
+            EnaMetadataProblem::NonHttpsUrl {
+                value: value.to_owned(),
+            },
+        ));
+    }
+    if !url.path().ends_with(".fastq.gz") {
+        return Err(indeterminate_metadata_error(
+            accession,
+            EnaMetadataProblem::UnexpectedUrlSuffix {
+                value: value.to_owned(),
+            },
+        ));
+    }
     Ok(url)
 }
 
-fn parse_md5_bytes(value: &str) -> Result<[u8; 16]> {
-    ensure!(
-        value.len() == 32,
-        "ENA fastq_md5 value must contain 32 hexadecimal characters"
-    );
+fn parse_md5_bytes(accession: &Accession, value: &str) -> Result<[u8; 16]> {
+    if value.len() != 32 || !value.is_ascii() {
+        return Err(indeterminate_metadata_error(
+            accession,
+            EnaMetadataProblem::InvalidMd5Shape {
+                value: value.to_owned(),
+            },
+        ));
+    }
     let mut digest = [0_u8; 16];
     for (output, pair) in digest.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
-        let pair = std::str::from_utf8(pair)?;
-        *output = u8::from_str_radix(pair, 16)
-            .wrap_err_with(|| format!("ENA fastq_md5 value was not hexadecimal: {value}"))?;
+        let pair = std::str::from_utf8(pair).expect("validated ASCII MD5 bytes must be UTF-8");
+        *output = u8::from_str_radix(pair, 16).map_err(|source| {
+            indeterminate_metadata_error(
+                accession,
+                EnaMetadataProblem::InvalidMd5 {
+                    value: value.to_owned(),
+                    source,
+                },
+            )
+        })?;
     }
     Ok(digest)
 }
@@ -243,12 +372,6 @@ pub struct EnaClient {
     max_backoff: Duration,
 }
 
-impl Default for EnaClient {
-    fn default() -> Self {
-        Self::new().expect("default ENA client configuration should be valid")
-    }
-}
-
 impl EnaClient {
     /// Construct an ENA client with a default retry budget and backoff policy.
     ///
@@ -259,7 +382,8 @@ impl EnaClient {
         let http = Client::builder()
             .connect_timeout(ENA_CONNECT_TIMEOUT)
             .timeout(ENA_OPERATION_TIMEOUT)
-            .build()?;
+            .build()
+            .map_err(|source| InternalError::HttpClientInitialization { source })?;
         Ok(Self {
             http,
             max_consecutive_failures: ENA_MAX_CONSECUTIVE_FAILURES,
@@ -289,21 +413,13 @@ impl EnaClient {
                 ),
             ])
             .send()
-            .wrap_err_with(|| {
-                format!(
-                    "ENA filereport request failed before a response was received for accession {accession}\n\
-                     url: {ENA_FILEREPORT_BASE_URL}\n\
-                     help: check network access to ebi.ac.uk from this runtime"
-                )
+            .map_err(|source| IndeterminateInputError::MetadataTransport {
+                accession: accession.clone(),
+                source,
             })?;
 
-        let body = response_text_or_error(response)?;
-        EnaInput::from_filereport(accession, &body).wrap_err_with(|| {
-            format!(
-                "ENA filereport could not be resolved for accession {accession}\n\
-                 help: nuclease requires one single-end FASTQ or two distinct paired-end FASTQs with aligned byte-count and MD5 metadata"
-            )
-        })
+        let body = response_text_or_error(accession, response)?;
+        EnaInput::from_filereport(accession, &body)
     }
 
     /// Open and preflight a resolved ENA FASTQ stream.
@@ -313,7 +429,16 @@ impl EnaClient {
     /// Returns an error when the initial response cannot be opened or does not match the
     /// catalogue metadata and gzip shape.
     pub(crate) fn stream(&self, fastq: EnaFastq) -> Result<EnaStream> {
-        Ok(EnaStream::open(self.clone(), fastq)?)
+        let accession = fastq.accession.clone();
+        let mate = fastq.mate;
+        EnaStream::open(self.clone(), fastq).map_err(|source| {
+            IndeterminateInputError::Stream {
+                accession,
+                mate,
+                source,
+            }
+            .into()
+        })
     }
 }
 
@@ -424,7 +549,7 @@ impl EnaStream {
         if self.consecutive_failures > self.client.max_consecutive_failures
             || self.reconnects >= self.client.max_reconnects
         {
-            return Err(self.retry_exhausted(&error));
+            return Err(self.retry_exhausted(error));
         }
 
         self.reconnects = self.reconnects.saturating_add(1);
@@ -479,23 +604,23 @@ impl EnaStream {
         }
     }
 
-    fn retry_exhausted(&self, cause: &io::Error) -> io::Error {
+    fn retry_exhausted(&self, cause: io::Error) -> io::Error {
         let final_url = self.final_url.as_ref().map_or("<unknown>", Url::as_str);
+        let kind = cause.kind();
         io::Error::new(
-            cause.kind(),
-            format!(
-                "ENA stream could not resume: accession={} mate={:?} source_url={} final_url={} compressed_offset={} expected_compressed_bytes={} reconnects={} consecutive_failures={} last_error_kind={:?} last_error={}",
-                self.fastq.accession,
-                self.fastq.mate,
-                self.fastq.url,
-                final_url,
-                self.compressed_offset,
-                self.fastq.expected_bytes,
-                self.reconnects,
-                self.consecutive_failures,
-                cause.kind(),
-                cause,
-            ),
+            kind,
+            EnaRetryExhaustedError {
+                accession: self.fastq.accession.clone(),
+                mate: self.fastq.mate,
+                source_url: self.fastq.url.clone(),
+                final_url: final_url.to_owned(),
+                compressed_offset: self.compressed_offset,
+                expected_bytes: self.fastq.expected_bytes,
+                reconnects: self.reconnects,
+                consecutive_failures: self.consecutive_failures,
+                last_error_kind: kind,
+                source: cause,
+            },
         )
     }
 
@@ -599,7 +724,7 @@ impl ActiveResponse {
             return if is_retryable_http_status(response.status()) {
                 Err(io::Error::other(message))
             } else {
-                Err(invalid_data(message))
+                Err(http_status_error(response.status(), message))
             };
         }
         validate_identity_content_encoding(&response)?;
@@ -653,7 +778,7 @@ impl ActiveResponse {
             return if is_retryable_http_status(response.status()) {
                 Err(io::Error::other(message))
             } else {
-                Err(invalid_data(message))
+                Err(http_status_error(response.status(), message))
             };
         }
         validate_identity_content_encoding(&response)?;
@@ -840,38 +965,59 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-fn response_text_or_error(response: Response) -> Result<String> {
-    let status = response.status();
-    ensure!(
-        status == StatusCode::OK,
-        "ENA filereport request failed with HTTP status {status}\n\
-         help: this is a metadata lookup failure before FASTQ streaming starts"
-    );
-    Ok(response.text()?)
+fn http_status_error(status: StatusCode, message: String) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        EnaHttpStatusError { status, message },
+    )
 }
 
-fn validate_run_accession(value: &str) -> Result<()> {
+fn response_text_or_error(accession: &Accession, response: Response) -> Result<String> {
+    let status = response.status();
+    if status != StatusCode::OK {
+        return Err(IndeterminateInputError::Status {
+            accession: accession.clone(),
+            status,
+        }
+        .into());
+    }
+    response
+        .text()
+        .map_err(|source| IndeterminateInputError::MetadataTransport {
+            accession: accession.clone(),
+            source,
+        })
+        .map_err(Into::into)
+}
+
+fn validate_run_accession(value: &str) -> std::result::Result<(), AccessionParseError> {
     let bytes = value.as_bytes();
 
-    ensure!(
-        bytes.len() >= 4,
-        "ENA run accession must look like SRR12345, ERR12345, or DRR12345"
-    );
-    ensure!(
-        matches!(&bytes[..3], b"SRR" | b"ERR" | b"DRR"),
-        "ENA run accession must start with SRR, ERR, or DRR"
-    );
-    ensure!(
-        bytes[3..].iter().all(u8::is_ascii_digit),
-        "ENA run accession suffix must be numeric"
-    );
+    if bytes.len() < 4 {
+        return Err(AccessionParseError::too_short(value.to_owned()));
+    }
+    if !matches!(&bytes[..3], b"SRR" | b"ERR" | b"DRR") {
+        return Err(AccessionParseError::unsupported_prefix(value.to_owned()));
+    }
+    if !bytes[3..].iter().all(u8::is_ascii_digit) {
+        return Err(AccessionParseError::non_numeric_suffix(value.to_owned()));
+    }
 
     Ok(())
+}
+
+fn indeterminate_metadata_error(accession: &Accession, problem: EnaMetadataProblem) -> RunError {
+    IndeterminateInputError::Metadata {
+        accession: accession.clone(),
+        problem,
+    }
+    .into()
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        error::Error as _,
         io::{self, Cursor, Read as _, Write as _},
         net::{SocketAddr, TcpListener, TcpStream},
         thread::{self, JoinHandle},
@@ -882,12 +1028,21 @@ mod tests {
     use flate2::{Compression, GzBuilder};
     use md5::{Digest as _, Md5};
     use needletail::parse_fastx_reader;
-    use reqwest::{StatusCode, blocking::Client};
+    use reqwest::{StatusCode, blocking::Client, header::ACCEPT_ENCODING};
     use url::Url;
 
-    use crate::record::MateSide;
+    use crate::{
+        error::{
+            EnaAvailabilityProblem, EnaMetadataProblem, IndeterminateInputError, RunError,
+            UnavailableInputError,
+        },
+        record::MateSide,
+    };
 
-    use super::{Accession, ENA_RETRY_RESET_BYTES, EnaClient, EnaFastq, EnaInput, full_jitter};
+    use super::{
+        Accession, ENA_RETRY_RESET_BYTES, EnaClient, EnaFastq, EnaInput, full_jitter,
+        response_text_or_error,
+    };
 
     const TEST_FASTQ_BYTES: &[u8] = b"\x1f\x8babcdefghijklmnopqrstuvwxyz";
     const TEST_FASTQ_MD5: [u8; 16] = [
@@ -897,6 +1052,53 @@ mod tests {
 
     type ParsedFastqRecord = (Vec<u8>, Vec<u8>, Vec<u8>);
     type ParsedFastqPair = (ParsedFastqRecord, ParsedFastqRecord);
+
+    #[derive(Clone, Copy)]
+    enum ExpectedMetadataError {
+        ByteCount,
+        Md5,
+        Metadata,
+        UnsupportedLayout,
+    }
+
+    impl ExpectedMetadataError {
+        fn assert_matches(self, error: &RunError, case: &str) {
+            if matches!(self, Self::ByteCount | Self::Md5) {
+                assert!(
+                    error.source().is_some(),
+                    "typed metadata parse failure should preserve its concrete source: {case}"
+                );
+            }
+            let matches = match self {
+                Self::ByteCount => matches!(
+                    error,
+                    RunError::IndeterminateInput(IndeterminateInputError::Metadata {
+                        problem: EnaMetadataProblem::InvalidByteCount { .. },
+                        ..
+                    })
+                ),
+                Self::Md5 => matches!(
+                    error,
+                    RunError::IndeterminateInput(IndeterminateInputError::Metadata {
+                        problem: EnaMetadataProblem::InvalidMd5 { .. },
+                        ..
+                    })
+                ),
+                Self::Metadata => matches!(
+                    error,
+                    RunError::IndeterminateInput(IndeterminateInputError::Metadata { .. })
+                ),
+                Self::UnsupportedLayout => matches!(
+                    error,
+                    RunError::UnavailableInput(UnavailableInputError::EnaMetadata {
+                        problem: EnaAvailabilityProblem::UnsupportedLayout,
+                        ..
+                    })
+                ),
+            };
+            assert!(matches, "wrong typed error for filereport case: {case}");
+        }
+    }
 
     fn test_fastq(server: &TestServer) -> Result<EnaFastq> {
         Ok(EnaFastq {
@@ -928,6 +1130,14 @@ mod tests {
         client.initial_backoff = Duration::from_millis(1);
         client.max_backoff = Duration::from_millis(2);
         Ok(client)
+    }
+
+    fn ena_stream_source(error: &RunError) -> &io::Error {
+        let RunError::IndeterminateInput(IndeterminateInputError::Stream { source, .. }) = error
+        else {
+            panic!("expected a typed ENA stream error");
+        };
+        source
     }
 
     fn stream_error_after_partial(second_exchange: Exchange) -> Result<io::Error> {
@@ -1101,6 +1311,68 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_filereport_absence_is_unavailable_input() -> Result<()> {
+        let accession = Accession::new("SRR35939766")?;
+        let header = "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n";
+        let no_row = EnaInput::from_filereport(&accession, header)
+            .expect_err("authoritative response without a row should be unavailable");
+        assert!(matches!(
+            no_row,
+            RunError::UnavailableInput(UnavailableInputError::EnaMetadata {
+                problem: EnaAvailabilityProblem::NoDataRow,
+                ..
+            })
+        ));
+
+        let empty_location = concat!(
+            "run_accession\tlibrary_layout\tfastq_ftp\tfastq_bytes\tfastq_md5\n",
+            "SRR35939766\tSINGLE\t\t12\td41d8cd98f00b204e9800998ecf8427e\n"
+        );
+        let empty_location = EnaInput::from_filereport(&accession, empty_location)
+            .expect_err("authoritative empty FASTQ location should be unavailable");
+        assert!(matches!(
+            empty_location,
+            RunError::UnavailableInput(UnavailableInputError::EnaMetadata {
+                problem: EnaAvailabilityProblem::EmptyFastqLocation,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_sampled_metadata_http_failure_is_indeterminate() -> Result<()> {
+        let accession = Accession::new("SRR35939766")?;
+        for status in [
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let server = TestServer::spawn(vec![Exchange::initial(b"error").with_status(status)])?;
+            let response = Client::builder()
+                .build()?
+                .get(server.fastq_url()?)
+                .header(ACCEPT_ENCODING, "identity")
+                .send()
+                .map_err(|error| eyre!("metadata status fixture {status} failed: {error}"))?;
+            let error = response_text_or_error(&accession, response)
+                .expect_err("non-success metadata status should be indeterminate");
+            server.finish()?;
+
+            assert!(matches!(
+                error,
+                RunError::IndeterminateInput(IndeterminateInputError::Status {
+                    status: observed,
+                    ..
+                }) if observed == status
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn ena_stream_replays_gzip_prefix_and_verifies_md5() -> Result<()> {
         let server = TestServer::spawn(vec![
             Exchange::initial(TEST_FASTQ_BYTES)
@@ -1248,6 +1520,7 @@ mod tests {
                     "d41d8cd98f00b204e9800998ecf8427e\n"
                 ),
                 "not numeric",
+                ExpectedMetadataError::ByteCount,
             ),
             (
                 concat!(
@@ -1256,6 +1529,7 @@ mod tests {
                     "d41d8cd98f00b204e9800998ecf8427e\n"
                 ),
                 "non-HTTPS URL scheme",
+                ExpectedMetadataError::Metadata,
             ),
             (
                 concat!(
@@ -1263,6 +1537,7 @@ mod tests {
                     "SRR35939766\tSINGLE\tftp.sra.ebi.ac.uk/a.fastq.gz\t12\tbad-md5\n"
                 ),
                 "32 hexadecimal",
+                ExpectedMetadataError::Metadata,
             ),
             (
                 concat!(
@@ -1271,6 +1546,7 @@ mod tests {
                     "d41d8cd98f00b204e9800998ecf8427e\n"
                 ),
                 "did not include fastq_bytes",
+                ExpectedMetadataError::Metadata,
             ),
             (
                 concat!(
@@ -1278,6 +1554,7 @@ mod tests {
                     "SRR35939766\tSINGLE\tftp.sra.ebi.ac.uk/a.fastq.gz\t12\t\n"
                 ),
                 "fastq_md5 was empty",
+                ExpectedMetadataError::Metadata,
             ),
             (
                 concat!(
@@ -1286,14 +1563,14 @@ mod tests {
                     "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n"
                 ),
                 "was not hexadecimal",
+                ExpectedMetadataError::Md5,
             ),
         ];
 
-        for (body, case) in cases {
-            assert!(
-                EnaInput::from_filereport(&accession, body).is_err(),
-                "accepted malformed filereport case: {case}"
-            );
+        for (body, case, expected) in cases {
+            let error = EnaInput::from_filereport(&accession, body)
+                .expect_err("malformed filereport case should fail");
+            expected.assert_matches(&error, case);
         }
         Ok(())
     }
@@ -1310,6 +1587,7 @@ mod tests {
                     "d41d8cd98f00b204e9800998ecf8427e;0cc175b9c0f1b6a831c399e269772661\n"
                 ),
                 "cardinalities differ",
+                ExpectedMetadataError::Metadata,
             ),
             (
                 concat!(
@@ -1319,6 +1597,7 @@ mod tests {
                     "d41d8cd98f00b204e9800998ecf8427e;0cc175b9c0f1b6a831c399e269772661\n"
                 ),
                 "SINGLE layout returned 2 FASTQ files",
+                ExpectedMetadataError::UnsupportedLayout,
             ),
             (
                 concat!(
@@ -1328,6 +1607,7 @@ mod tests {
                     "d41d8cd98f00b204e9800998ecf8427e;d41d8cd98f00b204e9800998ecf8427e\n"
                 ),
                 "must be distinct",
+                ExpectedMetadataError::Metadata,
             ),
             (
                 concat!(
@@ -1336,6 +1616,7 @@ mod tests {
                     "d41d8cd98f00b204e9800998ecf8427e\n"
                 ),
                 "while resolving SRR35939766",
+                ExpectedMetadataError::Metadata,
             ),
             (
                 concat!(
@@ -1346,14 +1627,14 @@ mod tests {
                     "0cc175b9c0f1b6a831c399e269772661\n"
                 ),
                 "more than one run row",
+                ExpectedMetadataError::Metadata,
             ),
         ];
 
-        for (body, case) in cases {
-            assert!(
-                EnaInput::from_filereport(&accession, body).is_err(),
-                "accepted malformed filereport case: {case}"
-            );
+        for (body, case, expected) in cases {
+            let error = EnaInput::from_filereport(&accession, body)
+                .expect_err("inconsistent filereport case should fail");
+            expected.assert_matches(&error, case);
         }
         Ok(())
     }
@@ -1371,11 +1652,9 @@ mod tests {
         };
         server.finish()?;
 
-        assert_eq!(
-            error.downcast_ref::<io::Error>().map(io::Error::kind),
-            Some(io::ErrorKind::InvalidData)
-        );
-        assert!(error.to_string().contains("catalogue expected"));
+        let source = ena_stream_source(&error);
+        assert_eq!(source.kind(), io::ErrorKind::InvalidData);
+        assert!(source.to_string().contains("catalogue expected"));
         Ok(())
     }
 
@@ -1391,7 +1670,11 @@ mod tests {
         };
         server.finish()?;
 
-        assert!(error.to_string().contains("Content-Length"));
+        assert!(
+            ena_stream_source(&error)
+                .to_string()
+                .contains("Content-Length")
+        );
         Ok(())
     }
 
@@ -1408,7 +1691,7 @@ mod tests {
         };
         server.finish()?;
 
-        assert!(error.to_string().contains("was HTML"));
+        assert!(ena_stream_source(&error).to_string().contains("was HTML"));
         Ok(())
     }
 
@@ -1424,7 +1707,11 @@ mod tests {
         };
         server.finish()?;
 
-        assert!(error.to_string().contains("Content-Encoding"));
+        assert!(
+            ena_stream_source(&error)
+                .to_string()
+                .contains("Content-Encoding")
+        );
         Ok(())
     }
 
@@ -1440,7 +1727,7 @@ mod tests {
         };
         server.finish()?;
 
-        assert!(error.to_string().contains("gzip magic"));
+        assert!(ena_stream_source(&error).to_string().contains("gzip magic"));
         Ok(())
     }
 
@@ -1527,6 +1814,13 @@ mod tests {
         assert!(message.contains("reconnects=2"));
         assert!(message.contains("consecutive_failures=3"));
         assert!(message.contains("503 Service Unavailable"));
+        let final_cause = error
+            .source()
+            .expect("retry exhaustion should retain its final mechanism cause");
+        assert!(
+            final_cause.to_string().contains("503 Service Unavailable"),
+            "retry exhaustion source should retain the final HTTP cause"
+        );
         Ok(())
     }
 
@@ -1678,6 +1972,25 @@ mod tests {
     }
 
     #[test]
+    fn ena_stream_classifies_initial_not_found_as_indeterminate() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::initial(TEST_FASTQ_BYTES).with_status(StatusCode::NOT_FOUND),
+        ])?;
+        let fastq = test_fastq(&server)?;
+
+        let Err(error) = test_client(1)?.stream(fastq) else {
+            bail!("initial 404 should be indeterminate input");
+        };
+        server.finish()?;
+
+        assert!(matches!(
+            error,
+            RunError::IndeterminateInput(IndeterminateInputError::Stream { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn ena_stream_rejects_invalid_ranged_responses() -> Result<()> {
         let cases = [
             (
@@ -1747,7 +2060,11 @@ mod tests {
         };
         server.finish()?;
 
-        assert!(error.to_string().contains("directory URL"));
+        assert!(
+            ena_stream_source(&error)
+                .to_string()
+                .contains("directory URL")
+        );
         Ok(())
     }
 
