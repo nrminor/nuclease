@@ -23,7 +23,22 @@ use url::Url;
 
 use crate::record::MateSide;
 
+/// ENA Portal API endpoint used to resolve run accessions into FASTQ metadata.
 const ENA_FILEREPORT_BASE_URL: &str = "https://www.ebi.ac.uk/ena/portal/api/filereport";
+/// Maximum time allowed for DNS, TCP, and TLS connection establishment.
+const ENA_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time allowed for one HTTP connect, read, or write operation.
+const ENA_OPERATION_TIMEOUT: Duration = Duration::from_mins(2);
+/// Retryable failures tolerated without a healthy interval between them.
+const ENA_MAX_CONSECUTIVE_FAILURES: u32 = 8;
+/// Replacement connection attempts allowed over one stream's lifetime.
+const ENA_MAX_RECONNECTS: u32 = 64;
+/// Compressed bytes a recovered connection must deliver before retry pressure resets.
+const ENA_RETRY_RESET_BYTES: u64 = 1024 * 1024;
+/// Initial upper bound for a full-jitter reconnect delay.
+const ENA_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+/// Maximum upper bound for a full-jitter reconnect delay.
+const ENA_MAX_BACKOFF: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 /// ENA run accession constrained to the run-level prefixes accepted by this tool.
@@ -221,7 +236,9 @@ fn parse_md5_bytes(value: &str) -> Result<[u8; 16]> {
 /// Blocking ENA client for metadata lookup and resumable HTTP stream construction.
 pub struct EnaClient {
     http: Client,
-    max_retries: u32,
+    max_consecutive_failures: u32,
+    max_reconnects: u32,
+    retry_reset_bytes: u64,
     initial_backoff: Duration,
     max_backoff: Duration,
 }
@@ -239,12 +256,17 @@ impl EnaClient {
     ///
     /// Returns an error when the underlying blocking HTTP client cannot be constructed.
     pub fn new() -> Result<Self> {
-        let http = Client::builder().build()?;
+        let http = Client::builder()
+            .connect_timeout(ENA_CONNECT_TIMEOUT)
+            .timeout(ENA_OPERATION_TIMEOUT)
+            .build()?;
         Ok(Self {
             http,
-            max_retries: 4,
-            initial_backoff: Duration::from_millis(250),
-            max_backoff: Duration::from_secs(10),
+            max_consecutive_failures: ENA_MAX_CONSECUTIVE_FAILURES,
+            max_reconnects: ENA_MAX_RECONNECTS,
+            retry_reset_bytes: ENA_RETRY_RESET_BYTES,
+            initial_backoff: ENA_INITIAL_BACKOFF,
+            max_backoff: ENA_MAX_BACKOFF,
         })
     }
 
@@ -300,11 +322,14 @@ pub(crate) struct EnaStream {
     client: EnaClient,
     fastq: EnaFastq,
     body: Option<ActiveResponse>,
+    final_url: Option<Url>,
     compressed_offset: u64,
     digest: Md5,
     prefix: [u8; 2],
     prefix_delivered: usize,
-    retries_remaining: u32,
+    consecutive_failures: u32,
+    reconnects: u32,
+    bytes_since_failure: u64,
     current_backoff: Duration,
     integrity_verified: bool,
     terminal_failure: bool,
@@ -314,16 +339,18 @@ pub(crate) struct EnaStream {
 impl EnaStream {
     fn open(client: EnaClient, fastq: EnaFastq) -> io::Result<Self> {
         let current_backoff = client.initial_backoff;
-        let retries_remaining = client.max_retries;
         let mut stream = Self {
             client,
             fastq,
             body: None,
+            final_url: None,
             compressed_offset: 0,
             digest: Md5::new(),
             prefix: [0; 2],
             prefix_delivered: 0,
-            retries_remaining,
+            consecutive_failures: 0,
+            reconnects: 0,
+            bytes_since_failure: 0,
             current_backoff,
             integrity_verified: false,
             terminal_failure: false,
@@ -368,10 +395,13 @@ impl EnaStream {
             .get(self.fastq.url.clone())
             .header(ACCEPT_ENCODING, "identity");
         if self.compressed_offset > 0 {
+            // Range offsets count compressed bytes already delivered to the consumer, not bytes
+            // merely prefetched from an HTTP response during validation.
             request = request.header(RANGE, format!("bytes={}-", self.compressed_offset));
         }
 
         let response = request.send().map_err(io::Error::other)?;
+        self.final_url = Some(response.url().clone());
         let body = if self.compressed_offset == 0 {
             ActiveResponse::initial(response, &self.fastq)?
         } else {
@@ -382,16 +412,41 @@ impl EnaStream {
     }
 
     fn retry_or_return(&mut self, error: io::Error) -> io::Result<()> {
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(());
+        }
         if !Self::should_retry_io_error(&error) {
             return Err(error);
         }
-        if self.retries_remaining == 0 {
-            return Err(io::Error::other("ENA stream retry budget exhausted"));
+
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.bytes_since_failure = 0;
+        if self.consecutive_failures > self.client.max_consecutive_failures
+            || self.reconnects >= self.client.max_reconnects
+        {
+            return Err(self.retry_exhausted(&error));
         }
 
-        self.retries_remaining -= 1;
+        self.reconnects = self.reconnects.saturating_add(1);
+        let delay = full_jitter(self.current_backoff);
+        let retry_delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(
+            accession = %self.fastq.accession,
+            mate = ?self.fastq.mate,
+            source_url = %self.fastq.url,
+            final_url = self.final_url.as_ref().map_or("<unknown>", Url::as_str),
+            compressed_offset = self.compressed_offset,
+            expected_compressed_bytes = self.fastq.expected_bytes,
+            reconnects = self.reconnects,
+            consecutive_failures = self.consecutive_failures,
+            retry_delay_ms,
+            error_kind = ?error.kind(),
+            error = %error,
+            "retrying interrupted ENA stream"
+        );
+
         self.body = None;
-        thread::sleep(self.current_backoff);
+        thread::sleep(delay);
         self.current_backoff = self
             .current_backoff
             .saturating_mul(2)
@@ -405,16 +460,43 @@ impl EnaStream {
             io::ErrorKind::BrokenPipe
                 | io::ErrorKind::ConnectionAborted
                 | io::ErrorKind::ConnectionReset
-                | io::ErrorKind::Interrupted
                 | io::ErrorKind::Other
                 | io::ErrorKind::TimedOut
                 | io::ErrorKind::UnexpectedEof
         )
     }
 
-    fn reset_backoff_after_success(&mut self) {
-        self.retries_remaining = self.client.max_retries;
-        self.current_backoff = self.client.initial_backoff;
+    fn note_progress(&mut self, bytes: u64) {
+        if self.consecutive_failures == 0 {
+            return;
+        }
+
+        self.bytes_since_failure = self.bytes_since_failure.saturating_add(bytes);
+        if self.bytes_since_failure >= self.client.retry_reset_bytes {
+            self.consecutive_failures = 0;
+            self.bytes_since_failure = 0;
+            self.current_backoff = self.client.initial_backoff;
+        }
+    }
+
+    fn retry_exhausted(&self, cause: &io::Error) -> io::Error {
+        let final_url = self.final_url.as_ref().map_or("<unknown>", Url::as_str);
+        io::Error::new(
+            cause.kind(),
+            format!(
+                "ENA stream could not resume: accession={} mate={:?} source_url={} final_url={} compressed_offset={} expected_compressed_bytes={} reconnects={} consecutive_failures={} last_error_kind={:?} last_error={}",
+                self.fastq.accession,
+                self.fastq.mate,
+                self.fastq.url,
+                final_url,
+                self.compressed_offset,
+                self.fastq.expected_bytes,
+                self.reconnects,
+                self.consecutive_failures,
+                cause.kind(),
+                cause,
+            ),
+        )
     }
 
     fn account(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -446,7 +528,7 @@ impl EnaStream {
         }
 
         self.compressed_offset = next_offset;
-        self.reset_backoff_after_success();
+        self.note_progress(byte_count);
         Ok(())
     }
 }
@@ -509,11 +591,16 @@ struct ActiveResponse {
 impl ActiveResponse {
     fn initial(response: Response, fastq: &EnaFastq) -> io::Result<Self> {
         if response.status() != StatusCode::OK {
-            return Err(io::Error::other(format!(
+            let message = format!(
                 "initial ENA stream request for {} failed with status {}",
                 fastq.accession,
                 response.status()
-            )));
+            );
+            return if is_retryable_http_status(response.status()) {
+                Err(io::Error::other(message))
+            } else {
+                Err(invalid_data(message))
+            };
         }
         validate_identity_content_encoding(&response)?;
 
@@ -561,10 +648,12 @@ impl ActiveResponse {
                 fastq.accession,
                 response.status()
             );
-            return if response.status().is_success() {
-                Err(invalid_data(message))
-            } else {
+            // A ranged 200 starts at byte zero. Appending it at a nonzero offset would duplicate
+            // compressed bytes, so reject it rather than attempting unsafe continuation.
+            return if is_retryable_http_status(response.status()) {
                 Err(io::Error::other(message))
+            } else {
+                Err(invalid_data(message))
             };
         }
         validate_identity_content_encoding(&response)?;
@@ -736,6 +825,17 @@ fn validate_identity_content_encoding(response: &Response) -> io::Result<()> {
     Ok(())
 }
 
+fn is_retryable_http_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn full_jitter(upper_bound: Duration) -> Duration {
+    let upper_nanos = u64::try_from(upper_bound.as_nanos()).unwrap_or(u64::MAX);
+    Duration::from_nanos(fastrand::u64(0..=upper_nanos))
+}
+
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -772,25 +872,31 @@ fn validate_run_accession(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{self, Read as _, Write as _},
+        io::{self, Cursor, Read as _, Write as _},
         net::{SocketAddr, TcpListener, TcpStream},
         thread::{self, JoinHandle},
         time::Duration,
     };
 
     use color_eyre::eyre::{Result, bail, ensure, eyre};
+    use flate2::{Compression, GzBuilder};
+    use md5::{Digest as _, Md5};
+    use needletail::parse_fastx_reader;
     use reqwest::{StatusCode, blocking::Client};
     use url::Url;
 
     use crate::record::MateSide;
 
-    use super::{Accession, EnaClient, EnaFastq, EnaInput};
+    use super::{Accession, ENA_RETRY_RESET_BYTES, EnaClient, EnaFastq, EnaInput, full_jitter};
 
     const TEST_FASTQ_BYTES: &[u8] = b"\x1f\x8babcdefghijklmnopqrstuvwxyz";
     const TEST_FASTQ_MD5: [u8; 16] = [
         0x45, 0x74, 0x41, 0xa3, 0x09, 0xc8, 0xfa, 0xc3, 0xf5, 0xc0, 0x59, 0xf2, 0x9b, 0x5f, 0x35,
         0x60,
     ];
+
+    type ParsedFastqRecord = (Vec<u8>, Vec<u8>, Vec<u8>);
+    type ParsedFastqPair = (ParsedFastqRecord, ParsedFastqRecord);
 
     fn test_fastq(server: &TestServer) -> Result<EnaFastq> {
         Ok(EnaFastq {
@@ -802,9 +908,23 @@ mod tests {
         })
     }
 
-    fn test_client(max_retries: u32) -> Result<EnaClient> {
+    fn test_fastq_for_payload(server: &TestServer, payload: &[u8]) -> Result<EnaFastq> {
+        let observed_md5 = Md5::digest(payload);
+        let mut expected_md5 = [0_u8; 16];
+        expected_md5.copy_from_slice(&observed_md5);
+        Ok(EnaFastq {
+            accession: Accession::new("SRR35939766")?,
+            mate: None,
+            url: Url::parse(&format!("http://{}{}", server.address, FASTQ_TARGET))?,
+            expected_bytes: payload.len() as u64,
+            expected_md5,
+        })
+    }
+
+    fn test_client(max_reconnects: u32) -> Result<EnaClient> {
         let mut client = EnaClient::new()?;
-        client.max_retries = max_retries;
+        client.max_consecutive_failures = max_reconnects;
+        client.max_reconnects = max_reconnects;
         client.initial_backoff = Duration::from_millis(1);
         client.max_backoff = Duration::from_millis(2);
         Ok(client)
@@ -823,6 +943,67 @@ mod tests {
             .expect_err("invalid ranged response should fail");
         server.finish()?;
         Ok(error)
+    }
+
+    fn gzip_fixture(fastq: &[u8]) -> Result<Vec<u8>> {
+        let mut encoder = GzBuilder::new()
+            .mtime(0)
+            .write(Vec::new(), Compression::default());
+        encoder.write_all(fastq)?;
+        Ok(encoder.finish()?)
+    }
+
+    fn parse_records(reader: impl io::Read + Send + 'static) -> Result<Vec<ParsedFastqRecord>> {
+        let mut parser = parse_fastx_reader(reader)?;
+        let mut records = Vec::new();
+        while let Some(record) = parser.next() {
+            let record = record?;
+            records.push((
+                record.id().to_vec(),
+                record.raw_seq().to_vec(),
+                record
+                    .qual()
+                    .ok_or_else(|| eyre!("FASTQ fixture record did not contain quality scores"))?
+                    .to_vec(),
+            ));
+        }
+        Ok(records)
+    }
+
+    fn parse_pairs(
+        left: impl io::Read + Send + 'static,
+        right: impl io::Read + Send + 'static,
+    ) -> Result<Vec<ParsedFastqPair>> {
+        let mut left_parser = parse_fastx_reader(left)?;
+        let mut right_parser = parse_fastx_reader(right)?;
+        let mut pairs = Vec::new();
+        loop {
+            match (left_parser.next(), right_parser.next()) {
+                (Some(left), Some(right)) => {
+                    let left = left?;
+                    let right = right?;
+                    pairs.push((
+                        (
+                            left.id().to_vec(),
+                            left.raw_seq().to_vec(),
+                            left.qual()
+                                .ok_or_else(|| eyre!("left FASTQ fixture lacked quality scores"))?
+                                .to_vec(),
+                        ),
+                        (
+                            right.id().to_vec(),
+                            right.raw_seq().to_vec(),
+                            right
+                                .qual()
+                                .ok_or_else(|| eyre!("right FASTQ fixture lacked quality scores"))?
+                                .to_vec(),
+                        ),
+                    ));
+                }
+                (None, None) => return Ok(pairs),
+                _ => bail!("paired FASTQ fixtures contained different record counts"),
+            }
+        }
     }
 
     #[test]
@@ -953,6 +1134,106 @@ mod tests {
         read_result?;
 
         assert_eq!(output, TEST_FASTQ_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_fastq_records_are_identical_across_every_compressed_cut_point() -> Result<()> {
+        let fastq = b"@read1 alpha\nACGTN\n+\nIIIII\n@read2 beta\nTGCA\n+\n!~AB\n";
+        let compressed = gzip_fixture(fastq)?;
+        let expected = vec![
+            (
+                b"read1 alpha".to_vec(),
+                b"ACGTN".to_vec(),
+                b"IIIII".to_vec(),
+            ),
+            (b"read2 beta".to_vec(), b"TGCA".to_vec(), b"!~AB".to_vec()),
+        ];
+        assert_eq!(parse_records(Cursor::new(compressed.clone()))?, expected);
+
+        for cut in 0..compressed.len() {
+            let exchanges = if cut < 2 {
+                vec![
+                    Exchange::promised_suffix(&compressed, 0, cut),
+                    Exchange::initial(&compressed),
+                ]
+            } else {
+                vec![
+                    Exchange::promised_suffix(&compressed, 0, cut),
+                    Exchange::ranged(&compressed, cut),
+                ]
+            };
+            let server = TestServer::spawn(exchanges)?;
+            let resolved = test_fastq_for_payload(&server, &compressed)?;
+            let stream = test_client(1)?.stream(resolved)?;
+
+            let observed_result = parse_records(stream);
+            server.finish()?;
+            let observed = observed_result?;
+
+            assert_eq!(observed, expected, "compressed cut point {cut}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_fastq_records_survive_multiple_disconnects() -> Result<()> {
+        let compressed =
+            gzip_fixture(b"@read1\nACGTACGT\n+\nIIIIIIII\n@read2\nTGCATGCA\n+\nJJJJJJJJ\n")?;
+        let expected = parse_records(Cursor::new(compressed.clone()))?;
+        let first_cut = compressed.len() / 3;
+        let second_cut = compressed.len() * 2 / 3;
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(&compressed, 0, 1),
+            Exchange::promised_suffix(&compressed, 0, first_cut),
+            Exchange::promised_suffix(&compressed, first_cut, second_cut),
+            Exchange::ranged(&compressed, second_cut),
+        ])?;
+        let resolved = test_fastq_for_payload(&server, &compressed)?;
+        let stream = test_client(3)?.stream(resolved)?;
+
+        let observed_result = parse_records(stream);
+        server.finish()?;
+        let observed = observed_result?;
+
+        assert_eq!(observed, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn paired_gzip_records_remain_aligned_across_independent_disconnects() -> Result<()> {
+        let left_compressed =
+            gzip_fixture(b"@read1/1\nACGTACGT\n+\nIIIIIIII\n@read2/1\nCCCCGGGG\n+\nJJJJJJJJ\n")?;
+        let right_compressed =
+            gzip_fixture(b"@read1/2\nTGCATGCA\n+\nKKKKKKKK\n@read2/2\nGGGGCCCC\n+\nLLLLLLLL\n")?;
+        let expected = parse_pairs(
+            Cursor::new(left_compressed.clone()),
+            Cursor::new(right_compressed.clone()),
+        )?;
+        let right_cut = right_compressed.len() / 2;
+        let left_server = TestServer::spawn(vec![
+            Exchange::promised_suffix(&left_compressed, 0, 1),
+            Exchange::initial(&left_compressed),
+        ])?;
+        let right_server = TestServer::spawn(vec![
+            Exchange::promised_suffix(&right_compressed, 0, right_cut),
+            Exchange::ranged(&right_compressed, right_cut),
+        ])?;
+        let mut left_fastq = test_fastq_for_payload(&left_server, &left_compressed)?;
+        left_fastq.mate = Some(MateSide::Left);
+        let mut right_fastq = test_fastq_for_payload(&right_server, &right_compressed)?;
+        right_fastq.mate = Some(MateSide::Right);
+        let left_stream = test_client(1)?.stream(left_fastq)?;
+        let right_stream = test_client(1)?.stream(right_fastq)?;
+
+        let observed_result = parse_pairs(left_stream, right_stream);
+        let left_server_result = left_server.finish();
+        let right_server_result = right_server.finish();
+        left_server_result?;
+        right_server_result?;
+        let observed = observed_result?;
+
+        assert_eq!(observed, expected);
         Ok(())
     }
 
@@ -1219,11 +1500,180 @@ mod tests {
     }
 
     #[test]
-    fn ena_stream_reports_exhausted_retry_budget() -> Result<()> {
-        let error =
-            stream_error_after_partial(Exchange::promised_suffix(TEST_FASTQ_BYTES, 10, 10))?;
+    fn ena_stream_exhaustion_preserves_last_cause_and_stream_context() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10),
+            Exchange::ranged(TEST_FASTQ_BYTES, 10).with_status(StatusCode::SERVICE_UNAVAILABLE),
+            Exchange::ranged(TEST_FASTQ_BYTES, 10).with_status(StatusCode::SERVICE_UNAVAILABLE),
+        ])?;
+        let fastq = test_fastq(&server)?;
+        let mut client = test_client(1)?;
+        client.max_consecutive_failures = 2;
+        client.max_reconnects = 10;
+        let mut stream = client.stream(fastq)?;
 
-        assert!(error.to_string().contains("retry budget exhausted"));
+        let mut output = Vec::new();
+        let error = stream
+            .read_to_end(&mut output)
+            .expect_err("third consecutive failure should exhaust a budget of two");
+        server.finish()?;
+
+        let message = error.to_string();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(message.contains("ENA stream could not resume"));
+        assert!(message.contains("accession=SRR35939766"));
+        assert!(message.contains("compressed_offset=10"));
+        assert!(message.contains("expected_compressed_bytes=28"));
+        assert!(message.contains("reconnects=2"));
+        assert!(message.contains("consecutive_failures=3"));
+        assert!(message.contains("503 Service Unavailable"));
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_resets_failure_pressure_at_the_retry_byte_threshold() -> Result<()> {
+        let reset_bytes = usize::try_from(ENA_RETRY_RESET_BYTES)?;
+        let mut payload = vec![0_u8; reset_bytes + 18];
+        payload[..2].copy_from_slice(&[0x1f, 0x8b]);
+
+        let below_server = TestServer::spawn(vec![
+            Exchange::promised_suffix(&payload, 0, 2),
+            Exchange::promised_suffix(&payload, 2, 2 + reset_bytes - 1),
+        ])?;
+        let below_fastq = test_fastq_for_payload(&below_server, &payload)?;
+        let mut below_client = test_client(1)?;
+        below_client.max_reconnects = 3;
+        let mut below_stream = below_client.stream(below_fastq)?;
+
+        let mut below_output = Vec::new();
+        let below_error = below_stream
+            .read_to_end(&mut below_output)
+            .expect_err("sub-threshold progress should retain failure pressure");
+        below_server.finish()?;
+        assert!(below_error.to_string().contains("consecutive_failures=2"));
+
+        let threshold_server = TestServer::spawn(vec![
+            Exchange::promised_suffix(&payload, 0, 2),
+            Exchange::promised_suffix(&payload, 2, 2 + reset_bytes),
+            Exchange::ranged(&payload, 2 + reset_bytes),
+        ])?;
+        let threshold_fastq = test_fastq_for_payload(&threshold_server, &payload)?;
+        let mut threshold_client = test_client(1)?;
+        threshold_client.max_reconnects = 3;
+        let mut threshold_stream = threshold_client.stream(threshold_fastq)?;
+
+        let mut threshold_output = Vec::new();
+        let threshold_result = threshold_stream.read_to_end(&mut threshold_output);
+        threshold_server.finish()?;
+        threshold_result?;
+        assert_eq!(threshold_output, payload);
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_enforces_lifetime_reconnect_limit_after_pressure_resets() -> Result<()> {
+        let mut payload = vec![0_u8; 68];
+        payload[..2].copy_from_slice(&[0x1f, 0x8b]);
+        let mut exchanges = Vec::with_capacity(65);
+        exchanges.push(Exchange::promised_suffix(&payload, 0, 3));
+        for offset in 3..67 {
+            exchanges.push(Exchange::promised_suffix(&payload, offset, offset + 1));
+        }
+        let server = TestServer::spawn(exchanges)?;
+        let fastq = test_fastq_for_payload(&server, &payload)?;
+        let mut client = test_client(64)?;
+        client.max_consecutive_failures = 1;
+        client.retry_reset_bytes = 1;
+        client.initial_backoff = Duration::ZERO;
+        client.max_backoff = Duration::ZERO;
+        let mut stream = client.stream(fastq)?;
+
+        let mut output = Vec::new();
+        let error = stream
+            .read_to_end(&mut output)
+            .expect_err("the sixty-fifth replacement connection should not be attempted");
+        server.finish()?;
+
+        let message = error.to_string();
+        assert!(message.contains("reconnects=64"));
+        assert!(message.contains("consecutive_failures=1"));
+        assert_eq!(output.len(), 67);
+        Ok(())
+    }
+
+    #[test]
+    fn full_jitter_stays_within_its_upper_bound() {
+        for upper_bound in [
+            Duration::ZERO,
+            Duration::from_millis(250),
+            Duration::from_secs(10),
+        ] {
+            for _ in 0..100 {
+                assert!(full_jitter(upper_bound) <= upper_bound);
+            }
+        }
+    }
+
+    #[test]
+    fn ena_stream_recovers_from_retryable_http_statuses() -> Result<()> {
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let server = TestServer::spawn(vec![
+                Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10),
+                Exchange::ranged(TEST_FASTQ_BYTES, 10).with_status(status),
+                Exchange::ranged(TEST_FASTQ_BYTES, 10),
+            ])?;
+            let fastq = test_fastq(&server)?;
+            let mut stream = test_client(2)?.stream(fastq)?;
+
+            let mut output = Vec::new();
+            let read_result = stream.read_to_end(&mut output);
+            server.finish()?;
+            read_result?;
+
+            assert_eq!(output, TEST_FASTQ_BYTES, "recovery after {status}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_recovers_from_initial_rate_limit_response() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::initial(TEST_FASTQ_BYTES).with_status(StatusCode::TOO_MANY_REQUESTS),
+            Exchange::initial(TEST_FASTQ_BYTES),
+        ])?;
+        let fastq = test_fastq(&server)?;
+
+        let mut stream = test_client(1)?.stream(fastq)?;
+        let mut output = Vec::new();
+        let read_result = stream.read_to_end(&mut output);
+        server.finish()?;
+        read_result?;
+
+        assert_eq!(output, TEST_FASTQ_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_does_not_retry_nonretryable_http_status() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10),
+            Exchange::ranged(TEST_FASTQ_BYTES, 10).with_status(StatusCode::NOT_FOUND),
+        ])?;
+        let fastq = test_fastq(&server)?;
+        let mut stream = test_client(2)?.stream(fastq)?;
+
+        let mut output = Vec::new();
+        let error = stream
+            .read_to_end(&mut output)
+            .expect_err("ranged 404 should fail without another request");
+        server.finish()?;
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("404 Not Found"));
         Ok(())
     }
 

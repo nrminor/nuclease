@@ -973,6 +973,7 @@ dependencies = [
  "bytecount",
  "clap",
  "color-eyre",
+ "fastrand",
  "flate2",
  "indicatif",
  "libpairassembly",
