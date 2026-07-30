@@ -120,7 +120,15 @@ impl fmt::Display for InvalidFastqPolicy {
 ))]
 pub struct Cli {
     /// ENA run accession to resolve and stream.
-    #[arg(long, help_heading = "Inputs", help = "ENA run accession to stream")]
+    #[arg(
+        long,
+        help_heading = "Inputs",
+        help = "ENA run accession to resolve and stream",
+        long_help = "\
+Stream the FASTQ files for an ENA run accession without downloading them first. \
+Nuclease validates the files against ENA's catalogue, resumes interrupted transfers when safe, \
+and verifies files that are read to completion. Use -v to show reconnects."
+    )]
     pub ena: Option<Accession>,
 
     /// Local FASTQ input. Treated as single-end unless `--paired` is also passed.

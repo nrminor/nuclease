@@ -22,7 +22,7 @@ nuclease \
 | sourmash sketch dna -p k=31 - -o sample.zip
 ```
 
-Here, `nuclease` is used to stream and preprocess reads from ENA and then pass them along into kmer sketching with Sourmash. At no point in this preprocessing will the full read dataset be materialized on disk. Instead, reads are streamed and operated on as they arrive from ENA.
+Here, `nuclease` is used to stream and preprocess reads from ENA and then pass them along into kmer sketching with Sourmash. At no point in this preprocessing will the full read dataset be materialized on disk. Instead, reads are streamed and operated on as they arrive from ENA. `nuclease` can safely resume interrupted ENA transfers and checks completed downloads against ENA's catalogue.
 
 `nuclease`'s second big feature is developer-focused: it is highly extensible. See the [Contributing to nuclease](#contributing-to-nuclease) section for more.
 
