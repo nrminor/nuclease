@@ -112,6 +112,36 @@ fn required_output_create_failure_exits_io() {
     assert!(stderr.contains("check that the parent directory exists and is writable"));
 }
 
+#[test]
+fn required_invalid_input_report_create_failure_exits_io() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    let report = temp
+        .path()
+        .join("missing-parent")
+        .join("invalid-input.jsonl");
+    fs::write(&input, b"@read1\nACGT\n+\nIIII\n").expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--passthrough",
+            "--on-invalid-input",
+            "skip",
+            "--invalid-input-report",
+            report.to_str().expect("report path should be UTF-8"),
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert_eq!(output.status.code(), Some(74));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to create requested invalid-input JSONL report"));
+    assert!(stderr.contains(report.to_str().expect("report path should be UTF-8")));
+}
+
 #[cfg(unix)]
 #[test]
 fn closed_downstream_pipe_exits_io_with_destination_context() {
@@ -627,9 +657,43 @@ fn passthrough_rejects_merge_pairs() {
 }
 
 #[test]
-fn warn_drop_invalid_fastq_policy_does_not_recover_parser_error() {
+fn skip_invalid_input_requires_a_durable_report() {
     let temp = tempdir().expect("tempdir should be created");
     let input = temp.path().join("reads.fastq");
+    fs::write(&input, b"@read1\nACGT\n+\nIIII\n").expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--on-invalid-input",
+            "skip",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        !output.status.success(),
+        "skip without a report should fail"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "Clap should own the missing required report relationship"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--invalid-input-report"),
+        "stderr did not require a durable invalid-input report: {stderr}"
+    );
+}
+
+#[test]
+fn skip_invalid_input_does_not_recover_terminal_parser_error() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    let report = temp.path().join("invalid-input.jsonl");
     fs::write(
         &input,
         b"@good1\nACGT\n+\nIIII\n@bad\nAAAA\n+\nI\n@good2\nTGCA\n+\nJJJJ\n",
@@ -646,8 +710,10 @@ fn warn_drop_invalid_fastq_policy_does_not_recover_parser_error() {
             "0",
             "--min-mean-q",
             "0",
-            "--invalid-fastq-policy",
-            "warn-drop",
+            "--on-invalid-input",
+            "skip",
+            "--invalid-input-report",
+            report.to_str().expect("report path should be UTF-8"),
             "-qqq",
         ])
         .output()
@@ -656,7 +722,7 @@ fn warn_drop_invalid_fastq_policy_does_not_recover_parser_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "parser-level FASTQ errors should remain fatal under warn-drop"
+        "terminal parser errors should remain fatal under skip"
     );
     assert_eq!(
         output.status.code(),
@@ -664,15 +730,15 @@ fn warn_drop_invalid_fastq_policy_does_not_recover_parser_error() {
         "malformed local FASTQ should use the stable data-error status"
     );
     assert!(
-        stderr.contains("FASTQ parser rejected malformed input"),
+        stderr.contains("record parser rejected malformed input"),
         "stderr did not include controlled parser diagnostic: {stderr}"
     );
     assert!(
-        stderr.contains("invalid_fastq_policy=warn_drop"),
-        "stderr did not include active invalid FASTQ policy: {stderr}"
+        stderr.contains("admission_policy=skip"),
+        "stderr did not include active admission policy: {stderr}"
     );
     assert!(
-        stderr.contains("parser_error_kind=UnequalLengths"),
+        stderr.contains("parser_error_kind=unequal_lengths"),
         "stderr did not include needletail error kind: {stderr}"
     );
     assert!(
@@ -682,10 +748,10 @@ fn warn_drop_invalid_fastq_policy_does_not_recover_parser_error() {
 }
 
 #[test]
-fn invalid_fastq_report_writes_fatal_parser_error_as_jsonl() {
+fn invalid_input_report_writes_terminal_record_parse_failure() {
     let temp = tempdir().expect("tempdir should be created");
     let input = temp.path().join("reads.fastq");
-    let report = temp.path().join("invalid-fastq.jsonl");
+    let report = temp.path().join("invalid-input.jsonl");
     fs::write(&input, b"@bad1\nAAAA\n+\nI\n@good\nTGCA\n+\nJJJJ\n")
         .expect("fixture FASTQ should be writable");
 
@@ -699,9 +765,9 @@ fn invalid_fastq_report_writes_fatal_parser_error_as_jsonl() {
             "0",
             "--min-mean-q",
             "0",
-            "--invalid-fastq-policy",
-            "silent-drop",
-            "--invalid-fastq-report",
+            "--on-invalid-input",
+            "skip",
+            "--invalid-input-report",
             report.to_str().expect("report path should be UTF-8"),
             "-qqq",
         ])
@@ -713,22 +779,21 @@ fn invalid_fastq_report_writes_fatal_parser_error_as_jsonl() {
         "parser-level FASTQ errors should be fatal: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(output.status.code(), Some(65));
 
-    let report = fs::read_to_string(report).expect("invalid FASTQ report should be readable");
+    let report = fs::read_to_string(report).expect("invalid-input report should be readable");
     let events = report
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("event should be JSON"))
         .collect::<Vec<_>>();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["kind"], "fastq_parse_error");
+    assert_eq!(events[0]["kind"], "record_parse_failure");
     assert_eq!(events[0]["mate"], "single");
-    assert_eq!(events[0]["policy"], "silent_drop");
-    assert_eq!(events[0]["recoverable"], false);
-    assert_eq!(events[0]["fatal"], true);
-    assert_eq!(events[0]["parser_error_kind"], "UnequalLengths");
-    assert_eq!(events[0]["parser_error_line"], 1);
+    assert_eq!(events[0]["continued"], false);
+    assert_eq!(events[0]["parser_kind"], "unequal_lengths");
+    assert_eq!(events[0]["line"], 1);
     assert!(
-        events[0]["parser_error_message"]
+        events[0]["message"]
             .as_str()
             .is_some_and(|message| message.contains("quality length is 1")),
         "event did not preserve parser error message: {:?}",
@@ -737,9 +802,10 @@ fn invalid_fastq_report_writes_fatal_parser_error_as_jsonl() {
 }
 
 #[test]
-fn malformed_fastq_does_not_surface_raw_parser_slice_panic() {
+fn malformed_fastq_returns_a_controlled_unequal_lengths_error() {
     let temp = tempdir().expect("tempdir should be created");
     let input = temp.path().join("malformed.fastq");
+    let report = temp.path().join("invalid-input.jsonl");
     fs::write(
         &input,
         concat!(
@@ -773,8 +839,10 @@ fn malformed_fastq_does_not_surface_raw_parser_slice_panic() {
             "0",
             "--min-mean-q",
             "0",
-            "--invalid-fastq-policy",
-            "warn-drop",
+            "--on-invalid-input",
+            "skip",
+            "--invalid-input-report",
+            report.to_str().expect("report path should be UTF-8"),
             "-qqq",
         ])
         .output()
@@ -790,8 +858,55 @@ fn malformed_fastq_does_not_surface_raw_parser_slice_panic() {
         "raw parser panic banner leaked to stderr: {stderr}"
     );
     assert!(
-        output.status.success() || stderr.contains("FASTQ parser rejected malformed input"),
-        "malformed input should either warn/drop successfully or fail with controlled parser diagnostics: {stderr}"
+        !output.status.success(),
+        "terminal parser error should fail"
+    );
+    assert_eq!(output.status.code(), Some(65));
+    assert!(
+        stderr.contains("record parser rejected malformed input"),
+        "malformed input should fail with controlled parser diagnostics: {stderr}"
+    );
+    assert!(
+        stderr.contains("parser_error_kind=unequal_lengths"),
+        "malformed input should preserve the parser error kind: {stderr}"
+    );
+}
+
+#[test]
+fn unsupported_fasta_is_not_an_admission_event() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("sequences.fasta");
+    let report = temp.path().join("invalid-input.jsonl");
+    fs::write(&input, b">sequence-1\nACGT\n").expect("FASTA fixture should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--on-invalid-input",
+            "skip",
+            "--invalid-input-report",
+            report.to_str().expect("report path should be UTF-8"),
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(!output.status.success(), "unsupported FASTA should fail");
+    assert_eq!(output.status.code(), Some(65));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported input format"),
+        "stderr did not classify the source format: {stderr}"
+    );
+    assert!(
+        !stderr.contains("did not provide quality scores"),
+        "FASTA should fail before quality extraction: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(report).expect("invalid-input report should be readable"),
+        "",
+        "source-format failures must not become admission events"
     );
 }
 
@@ -1237,6 +1352,7 @@ fn paired_fastq_count_mismatch_reports_source_and_progress() {
         .expect("nuclease should run");
 
     assert!(!output.status.success(), "mismatched inputs should fail");
+    assert_eq!(output.status.code(), Some(65));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("paired FASTQ inputs have different record counts"),
@@ -1247,9 +1363,187 @@ fn paired_fastq_count_mismatch_reports_source_and_progress() {
         "stderr did not include completed pair count: {stderr}"
     );
     assert!(
+        stderr.contains("present_mate: left") && stderr.contains("header: read2/1"),
+        "stderr did not identify the unmatched record: {stderr}"
+    );
+    assert!(
         stderr.contains("local-paired:"),
         "stderr did not include input source label: {stderr}"
     );
+}
+
+#[test]
+fn skip_drains_and_reports_every_unmatched_left_record() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input1 = temp.path().join("reads_1.fastq");
+    let input2 = temp.path().join("reads_2.fastq");
+    let report = temp.path().join("invalid-input.jsonl");
+    let summary = temp.path().join("summary.json");
+    fs::write(
+        &input1,
+        b"@read1/1\nAAAA\n+\nIIII\n@read2/1\nCCCC\n+\nJJJJ\n@read3/1\nGGGG\n+\nLLLL\n",
+    )
+    .expect("read 1 fixture should be writable");
+    fs::write(&input2, b"@read1/2\nTTTT\n+\nKKKK\n").expect("read 2 fixture should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in1",
+            input1.to_str().expect("read 1 path should be UTF-8"),
+            "--in2",
+            input2.to_str().expect("read 2 path should be UTF-8"),
+            "--min-length",
+            "4",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "--on-invalid-input",
+            "skip",
+            "--invalid-input-report",
+            report.to_str().expect("report path should be UTF-8"),
+            "--summary",
+            summary.to_str().expect("summary path should be UTF-8"),
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "skip should drain the longer input: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stderr, b"", "quiet mode should suppress warnings");
+    assert_eq!(
+        output.stdout,
+        b"@read1/1\nAAAA\n+\nIIII\n@read1/2\nTTTT\n+\nKKKK\n"
+    );
+
+    let events = fs::read_to_string(report)
+        .expect("invalid-input report should be readable")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("event should be JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["kind"], "missing_mate");
+    assert_eq!(events[0]["present_mate"], "left");
+    assert_eq!(events[0]["header"], "read2/1");
+    assert_eq!(events[1]["header"], "read3/1");
+    assert!(events.iter().all(|event| event["continued"] == true));
+
+    let summary: Value =
+        serde_json::from_str(&fs::read_to_string(summary).expect("summary should be readable"))
+            .expect("summary should be JSON");
+    assert_eq!(summary["reads_seen"], 4);
+    assert_eq!(summary["bases_seen"], 16);
+    assert_eq!(summary["pairs_seen"], 1);
+    assert_eq!(summary["invalid_pairs"], 0);
+    assert_eq!(
+        summary["admission_event_breakdown"][0]["code"],
+        "missing_mate"
+    );
+    assert_eq!(summary["admission_event_breakdown"][0]["count"], 2);
+}
+
+#[test]
+fn skip_drains_and_reports_every_unmatched_right_record() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input1 = temp.path().join("reads_1.fastq");
+    let input2 = temp.path().join("reads_2.fastq");
+    let report = temp.path().join("invalid-input.jsonl");
+    fs::write(&input1, b"@read1/1\nAAAA\n+\nIIII\n").expect("read 1 fixture should be writable");
+    fs::write(
+        &input2,
+        b"@read1/2\nTTTT\n+\nKKKK\n@read2/2\nCCCC\n+\nJJJJ\n@read3/2\nGGGG\n+\nLLLL\n",
+    )
+    .expect("read 2 fixture should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in1",
+            input1.to_str().expect("read 1 path should be UTF-8"),
+            "--in2",
+            input2.to_str().expect("read 2 path should be UTF-8"),
+            "--passthrough",
+            "--on-invalid-input",
+            "skip",
+            "--invalid-input-report",
+            report.to_str().expect("report path should be UTF-8"),
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "skip should drain the longer right input: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = fs::read_to_string(report)
+        .expect("invalid-input report should be readable")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("event should be JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|event| event["present_mate"] == "right"));
+    assert_eq!(events[0]["header"], "read2/2");
+    assert_eq!(events[1]["header"], "read3/2");
+}
+
+#[test]
+fn skip_reports_a_trailing_interleaved_record() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    let report = temp.path().join("invalid-input.jsonl");
+    let summary = temp.path().join("summary.json");
+    fs::write(&input, b"@read1/1\nAAAA\n+\nIIII\n")
+        .expect("interleaved fixture should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("input path should be UTF-8"),
+            "--paired",
+            "--passthrough",
+            "--on-invalid-input",
+            "skip",
+            "--invalid-input-report",
+            report.to_str().expect("report path should be UTF-8"),
+            "--summary",
+            summary.to_str().expect("summary path should be UTF-8"),
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "skip should accept one trailing interleaved record: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"");
+
+    let event: Value = serde_json::from_str(
+        fs::read_to_string(report)
+            .expect("invalid-input report should be readable")
+            .trim(),
+    )
+    .expect("event should be JSON");
+    assert_eq!(event["kind"], "missing_mate");
+    assert_eq!(event["present_mate"], "left");
+    assert_eq!(event["header"], "read1/1");
+    assert_eq!(event["pairs_seen"], 0);
+    assert_eq!(event["continued"], true);
+
+    let summary: Value =
+        serde_json::from_str(&fs::read_to_string(summary).expect("summary should be readable"))
+            .expect("summary should be JSON");
+    assert_eq!(summary["reads_seen"], 1);
+    assert_eq!(summary["pairs_seen"], 0);
+    assert_eq!(summary["pairs_emitted"], 0);
+    assert_eq!(summary["pairs_rejected"], 0);
+    assert_eq!(summary["invalid_pairs"], 0);
 }
 
 #[test]
@@ -1257,6 +1551,7 @@ fn paired_fastq_mate_id_mismatch_errors_by_default() {
     let temp = tempdir().expect("tempdir should be created");
     let input1 = temp.path().join("reads_1.fastq");
     let input2 = temp.path().join("reads_2.fastq");
+    let report = temp.path().join("invalid-input.jsonl");
     fs::write(&input1, b"@read1/1\nAAAA\n+\nIIII\n").expect("read 1 fixture should be writable");
     fs::write(&input2, b"@other/2\nTTTT\n+\nKKKK\n").expect("read 2 fixture should be writable");
 
@@ -1272,15 +1567,18 @@ fn paired_fastq_mate_id_mismatch_errors_by_default() {
             "0",
             "--min-mean-q",
             "0",
+            "--invalid-input-report",
+            report.to_str().expect("report path should be UTF-8"),
             "-qqq",
         ])
         .output()
         .expect("nuclease should run");
 
     assert!(!output.status.success(), "mismatched mate IDs should fail");
+    assert_eq!(output.status.code(), Some(65));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("paired FASTQ headers do not agree"),
+        stderr.contains("paired input identifiers do not agree"),
         "stderr did not explain mate mismatch: {stderr}"
     );
     assert!(
@@ -1291,14 +1589,26 @@ fn paired_fastq_mate_id_mismatch_errors_by_default() {
         stderr.contains("other/2"),
         "stderr missed right header: {stderr}"
     );
+
+    let event: Value = serde_json::from_str(
+        fs::read_to_string(report)
+            .expect("invalid-input report should be readable")
+            .trim(),
+    )
+    .expect("event should be JSON");
+    assert_eq!(event["kind"], "pair_identifier_mismatch");
+    assert_eq!(event["continued"], false);
+    assert_eq!(event["left_header"], "read1/1");
+    assert_eq!(event["right_header"], "other/2");
 }
 
 #[test]
-fn paired_fastq_mate_id_mismatch_warn_drop_continues_with_later_pairs() {
+fn paired_identifier_mismatch_skip_continues_with_later_pairs() {
     let temp = tempdir().expect("tempdir should be created");
     let input1 = temp.path().join("reads_1.fastq");
     let input2 = temp.path().join("reads_2.fastq");
     let summary = temp.path().join("summary.json");
+    let report = temp.path().join("invalid-input.jsonl");
     fs::write(&input1, b"@bad1/1\nAAAA\n+\nIIII\n@good/1\nCCCC\n+\nJJJJ\n")
         .expect("read 1 fixture should be writable");
     fs::write(&input2, b"@bad2/2\nTTTT\n+\nKKKK\n@good/2\nGGGG\n+\nLLLL\n")
@@ -1316,8 +1626,10 @@ fn paired_fastq_mate_id_mismatch_warn_drop_continues_with_later_pairs() {
             "0",
             "--min-mean-q",
             "0",
-            "--invalid-fastq-policy",
-            "warn-drop",
+            "--on-invalid-input",
+            "skip",
+            "--invalid-input-report",
+            report.to_str().expect("report path should be UTF-8"),
             "--summary",
             summary.to_str().expect("summary path should be UTF-8"),
         ])
@@ -1326,7 +1638,7 @@ fn paired_fastq_mate_id_mismatch_warn_drop_continues_with_later_pairs() {
 
     assert!(
         output.status.success(),
-        "warn-drop mate mismatch should continue: {}",
+        "skip should continue after a pair identifier mismatch: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
@@ -1336,7 +1648,7 @@ fn paired_fastq_mate_id_mismatch_warn_drop_continues_with_later_pairs() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("dropping invalid FASTQ pair"),
+        stderr.contains("skipping paired input with mismatched identifiers"),
         "stderr did not warn about invalid pair: {stderr}"
     );
 
@@ -1346,13 +1658,19 @@ fn paired_fastq_mate_id_mismatch_warn_drop_continues_with_later_pairs() {
     assert_eq!(summary["pairs_emitted"], 1);
     assert_eq!(summary["invalid_pairs"], 1);
     assert_eq!(
-        summary["invalid_fastq_samples"][0]["kind"],
-        "paired_header_mismatch"
+        summary["admission_samples"][0]["kind"],
+        "pair_identifier_mismatch"
     );
-    assert_eq!(summary["invalid_fastq_samples"][0]["left_header"], "bad1/1");
+    assert_eq!(summary["admission_samples"][0]["left_header"], "bad1/1");
+    assert_eq!(summary["admission_samples"][0]["right_header"], "bad2/2");
+    assert_eq!(summary["admission_samples"][0]["pairs_seen"], 1);
     assert_eq!(
-        summary["invalid_fastq_samples"][0]["right_header"],
-        "bad2/2"
+        summary["admission_event_breakdown"][0]["code"],
+        "pair_identifier_mismatch"
     );
-    assert_eq!(summary["invalid_fastq_samples"][0]["pairs_seen"], 1);
+
+    let report = fs::read_to_string(report).expect("invalid-input report should be readable");
+    let event: Value = serde_json::from_str(report.trim()).expect("event should be JSON");
+    assert_eq!(event["kind"], "pair_identifier_mismatch");
+    assert_eq!(event["continued"], true);
 }

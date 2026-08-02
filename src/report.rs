@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::{
     error::{InternalError, IoError, ReportWriteError, Result, RunError},
-    record::{InvalidFastqEvent, ReadStats},
+    record::{AdmissionEvent, ReadStats},
 };
 
 /// Lightweight run context needed to explain a preprocessing run.
@@ -108,10 +108,12 @@ pub struct RunSummary {
     pub pair_rejection_fraction: Option<f64>,
     /// Fraction of pairs dropped at ingress for FASTQ invalidity.
     pub invalid_pair_fraction: Option<f64>,
-    /// First invalid FASTQ events observed during this run.
-    pub invalid_fastq_samples: Vec<InvalidFastqEvent>,
-    /// Whether invalid FASTQ samples were truncated to the bounded summary limit.
-    pub invalid_fastq_samples_truncated: bool,
+    /// First record-admission failures observed during this run.
+    pub admission_samples: Vec<AdmissionEvent>,
+    /// Whether admission samples were truncated to the bounded summary limit.
+    pub admission_samples_truncated: bool,
+    /// Admission-failure breakdown sorted by descending count.
+    pub admission_event_breakdown: Vec<CountBreakdown>,
     /// Rejection breakdown sorted by descending count.
     pub rejection_breakdown: Vec<CountBreakdown>,
     /// Transform breakdown sorted by descending count.
@@ -122,6 +124,7 @@ impl RunSummary {
     /// Build an owned summary from run context, counters, and elapsed wall time.
     pub fn from_stats(context: RunContext, stats: &ReadStats, elapsed: Duration) -> Self {
         let elapsed_seconds = elapsed.as_secs_f64();
+        let paired = context.layout == RunLayout::Paired;
 
         Self {
             context,
@@ -138,15 +141,22 @@ impl RunSummary {
             bases_seen: stats.bases_seen,
             bases_emitted: stats.bases_emitted,
             base_retention_fraction: fraction(stats.bases_emitted, stats.bases_seen),
-            pairs_seen: (stats.pairs_seen > 0).then_some(stats.pairs_seen),
-            pairs_emitted: (stats.pairs_seen > 0).then_some(stats.pairs_emitted),
-            pairs_rejected: (stats.pairs_seen > 0).then_some(stats.pairs_rejected),
-            invalid_pairs: (stats.pairs_seen > 0).then_some(stats.invalid_pairs),
-            pair_retention_fraction: opt_fraction(stats.pairs_emitted, stats.pairs_seen),
-            pair_rejection_fraction: opt_fraction(stats.pairs_rejected, stats.pairs_seen),
-            invalid_pair_fraction: opt_fraction(stats.invalid_pairs, stats.pairs_seen),
-            invalid_fastq_samples: stats.invalid_fastq_samples.clone(),
-            invalid_fastq_samples_truncated: stats.invalid_fastq_samples_truncated,
+            pairs_seen: paired.then_some(stats.pairs_seen),
+            pairs_emitted: paired.then_some(stats.pairs_emitted),
+            pairs_rejected: paired.then_some(stats.pairs_rejected),
+            invalid_pairs: paired.then_some(stats.invalid_pairs),
+            pair_retention_fraction: paired
+                .then(|| fraction(stats.pairs_emitted, stats.pairs_seen)),
+            pair_rejection_fraction: paired
+                .then(|| fraction(stats.pairs_rejected, stats.pairs_seen)),
+            invalid_pair_fraction: paired.then(|| fraction(stats.invalid_pairs, stats.pairs_seen)),
+            admission_samples: stats.admission_samples.clone(),
+            admission_samples_truncated: stats.admission_samples_truncated,
+            admission_event_breakdown: breakdowns(
+                &stats.admission_event_counts,
+                stats.reads_seen,
+                stats.admission_event_counts.values().sum(),
+            ),
             rejection_breakdown: breakdowns(
                 &stats.rejection_counts,
                 stats.reads_seen,
@@ -225,7 +235,7 @@ fn render_summary(summary: &RunSummary) -> String {
     write_context(&mut output, summary);
     write_totals(&mut output, summary);
     write_pairs(&mut output, summary);
-    write_invalid_fastq_samples(&mut output, summary);
+    write_admission_samples(&mut output, summary);
     write_breakdowns(&mut output, summary);
     output
 }
@@ -328,60 +338,98 @@ fn write_pairs(output: &mut String, summary: &RunSummary) {
     }
 }
 
-fn write_invalid_fastq_samples(output: &mut String, summary: &RunSummary) {
-    if summary.invalid_fastq_samples.is_empty() {
+fn write_admission_samples(output: &mut String, summary: &RunSummary) {
+    if summary.admission_samples.is_empty() {
         return;
     }
 
-    output.push_str("\n  invalid FASTQ samples:\n");
-    for event in &summary.invalid_fastq_samples {
-        match event.kind {
-            "sequence_quality_length_mismatch" => {
+    output.push_str("\n  record-admission samples:\n");
+    for event in &summary.admission_samples {
+        match event {
+            AdmissionEvent::SequenceQualityLengthMismatch {
+                source,
+                mate,
+                header,
+                sequence_len,
+                quality_len,
+                reads_seen,
+                pairs_seen,
+                continued,
+            } => {
                 let _ = writeln!(
                     output,
-                    "    {} source={} mate={} header={} sequence_len={} quality_len={} reads_seen={} pairs_seen={}",
-                    event.kind,
-                    event.source,
-                    event.mate.unwrap_or("unknown"),
-                    event.header.as_deref().unwrap_or("<unknown>"),
-                    event.sequence_len.unwrap_or_default(),
-                    event.quality_len.unwrap_or_default(),
-                    event.reads_seen,
-                    event
-                        .pairs_seen
+                    "    sequence_quality_length_mismatch source={source} mate={mate} header={header} sequence_len={sequence_len} quality_len={quality_len} reads_seen={reads_seen} pairs_seen={} continued={continued}",
+                    pairs_seen
                         .map_or_else(|| "n/a".to_owned(), |pairs_seen| pairs_seen.to_string()),
                 );
             }
-            "paired_header_mismatch" => {
+            AdmissionEvent::PairIdentifierMismatch {
+                source,
+                left_header,
+                right_header,
+                reads_seen,
+                pairs_seen,
+                continued,
+            } => {
                 let _ = writeln!(
                     output,
-                    "    {} source={} left_header={} right_header={} reads_seen={} pairs_seen={}",
-                    event.kind,
-                    event.source,
-                    event.left_header.as_deref().unwrap_or("<unknown>"),
-                    event.right_header.as_deref().unwrap_or("<unknown>"),
-                    event.reads_seen,
-                    event
-                        .pairs_seen
-                        .map_or_else(|| "n/a".to_owned(), |pairs_seen| pairs_seen.to_string()),
+                    "    pair_identifier_mismatch source={source} left_header={left_header} right_header={right_header} reads_seen={reads_seen} pairs_seen={pairs_seen} continued={continued}",
                 );
             }
-            _ => {
+            AdmissionEvent::MissingMate {
+                source,
+                present_mate,
+                header,
+                reads_seen,
+                pairs_seen,
+                continued,
+            } => {
                 let _ = writeln!(
                     output,
-                    "    {} source={} reads_seen={}",
-                    event.kind, event.source, event.reads_seen,
+                    "    missing_mate source={source} present_mate={present_mate:?} header={header} reads_seen={reads_seen} pairs_seen={pairs_seen} continued={continued}",
+                );
+            }
+            AdmissionEvent::RecordParseFailure {
+                source,
+                mate,
+                parser_kind,
+                message,
+                line,
+                reads_seen,
+                pairs_seen,
+                continued,
+            } => {
+                let _ = writeln!(
+                    output,
+                    "    record_parse_failure source={source} mate={mate} parser_kind={parser_kind} message={message} line={} reads_seen={reads_seen} pairs_seen={} continued={continued}",
+                    line.map_or_else(|| "n/a".to_owned(), |line| line.to_string()),
+                    pairs_seen
+                        .map_or_else(|| "n/a".to_owned(), |pairs_seen| pairs_seen.to_string()),
                 );
             }
         }
     }
 
-    if summary.invalid_fastq_samples_truncated {
-        output.push_str("    ... additional invalid FASTQ events omitted from summary\n");
+    if summary.admission_samples_truncated {
+        output.push_str("    ... additional record-admission events omitted from summary\n");
     }
 }
 
 fn write_breakdowns(output: &mut String, summary: &RunSummary) {
+    if !summary.admission_event_breakdown.is_empty() {
+        output.push_str("\n  record-admission failures:\n");
+        for breakdown in &summary.admission_event_breakdown {
+            let _ = writeln!(
+                output,
+                "    {:<32} {:>10} ({:.2}% of reads, {:.2}% of admission events)",
+                breakdown.code,
+                breakdown.count,
+                breakdown.fraction_of_reads_seen * 100.0,
+                breakdown.fraction_of_category * 100.0
+            );
+        }
+    }
+
     if !summary.rejection_breakdown.is_empty() {
         output.push_str("\n  rejection reasons:\n");
         for breakdown in &summary.rejection_breakdown {
@@ -442,10 +490,6 @@ fn fraction(numerator: u64, denominator: u64) -> f64 {
     }
 }
 
-fn opt_fraction(numerator: u64, denominator: u64) -> Option<f64> {
-    (denominator > 0).then(|| fraction(numerator, denominator))
-}
-
 fn rate(total: u64, elapsed_seconds: f64) -> f64 {
     if elapsed_seconds <= f64::EPSILON {
         0.0
@@ -477,7 +521,7 @@ mod tests {
     };
     use crate::{
         error::{IoError, ReportWriteError, RunError},
-        record::{InvalidFastqEvent, ReadStats},
+        record::{AdmissionEvent, ReadStats},
     };
 
     struct FailingWriter {
@@ -517,6 +561,9 @@ mod tests {
         let mut transform_counts = BTreeMap::new();
         transform_counts.insert("trim_adapters", 4);
 
+        let mut admission_event_counts = BTreeMap::new();
+        admission_event_counts.insert("sequence_quality_length_mismatch", 1);
+
         ReadStats {
             reads_seen: 10,
             reads_emitted: 6,
@@ -530,30 +577,21 @@ mod tests {
             invalid_pairs: 1,
             rejection_counts,
             transform_counts,
-            invalid_fastq_warnings_emitted: 0,
-            invalid_fastq_warnings_suppressed: false,
-            invalid_fastq_samples: vec![InvalidFastqEvent {
-                kind: "sequence_quality_length_mismatch",
+            admission_event_counts,
+            admission_warnings_emitted: 0,
+            admission_warnings_suppressed: false,
+            admission_samples: vec![AdmissionEvent::SequenceQualityLengthMismatch {
                 source: "ena:SRR35939766".to_owned(),
-                mate: Some("right"),
-                header: Some("SRR35939766.42 instrument/2".to_owned()),
-                sequence_len: Some(267),
-                quality_len: Some(20),
-                left_mate: None,
-                right_mate: None,
-                left_header: None,
-                right_header: None,
+                mate: "right",
+                header: "SRR35939766.42 instrument/2".to_owned(),
+                sequence_len: 267,
+                quality_len: 20,
                 reads_seen: 84,
                 pairs_seen: Some(42),
-                policy: "warn_drop".to_owned(),
-                recoverable: true,
-                fatal: false,
-                parser_error_kind: None,
-                parser_error_message: None,
-                parser_error_line: None,
+                continued: true,
             }],
-            invalid_fastq_samples_truncated: false,
-            invalid_fastq_report: None,
+            admission_samples_truncated: false,
+            admission_report: None,
         }
     }
 
@@ -590,7 +628,7 @@ mod tests {
         assert!(rendered.contains("too_short"));
         assert!(rendered.contains("transforms applied:"));
         assert!(rendered.contains("trim_adapters"));
-        assert!(rendered.contains("invalid FASTQ samples:"));
+        assert!(rendered.contains("record-admission samples:"));
         assert!(rendered.contains("SRR35939766.42 instrument/2"));
     }
 
@@ -607,7 +645,7 @@ mod tests {
         assert!(written.contains("\"accession\": \"SRR35939766\""));
         assert!(written.contains("\"rejection_breakdown\""));
         assert!(written.contains("\"transform_breakdown\""));
-        assert!(written.contains("\"invalid_fastq_samples\""));
+        assert!(written.contains("\"admission_samples\""));
         assert!(written.contains("SRR35939766.42 instrument/2"));
     }
 

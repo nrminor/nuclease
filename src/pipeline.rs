@@ -1,23 +1,16 @@
 //! Top-level ingress, parsing, and output orchestration.
 
-use std::{
-    any::Any,
-    fs::File,
-    marker::PhantomData,
-    panic::{AssertUnwindSafe, catch_unwind},
-    path::PathBuf,
-    time::Instant,
-};
-
 use needletail::{
     errors::{ParseError, ParseErrorKind},
     parse_fastx_reader,
-    parser::SequenceRecord,
+    parser::{Format, SequenceRecord},
 };
+
+use std::{fs::File, marker::PhantomData, path::PathBuf, time::Instant};
 
 use crate::{
     adapter::{AdapterPreset, TrimAdaptersTransform},
-    cli::{Cli, Ingress, InvalidFastqPolicy, UiPolicy},
+    cli::{AdmissionPolicy, Cli, Ingress, UiPolicy},
     ena::{Accession, EnaClient, EnaInput},
     error::{
         EnaContentProblem, IndeterminateInputError, InternalError, IoError, MalformedInputError,
@@ -31,27 +24,32 @@ use crate::{
     },
     progress::ProgressReporter,
     quality::{QualityBinCount, QualityBinTransform, QualityTrimTransform},
-    record::{InputSource, InvalidFastqReport, MateSide, ReadStats, RecordProvenance, RecordView},
+    record::{
+        AdmissionEvent, AdmissionReport, InputSource, MateSide, ReadStats, RecordProvenance,
+        RecordView,
+    },
     report::{self, RunContext as RunSummaryContext, RunLayout},
 };
+
+const ADMISSION_WARNING_LIMIT: u64 = 5;
 
 struct SingleEnd;
 
 struct PairedEnd;
 
-trait FastqRunLayout {
+trait RecordLayout {
     type Source: RunSource;
     type Readers;
     type Output;
 }
 
-impl FastqRunLayout for SingleEnd {
+impl RecordLayout for SingleEnd {
     type Source = SingleSource;
     type Readers = Box<dyn std::io::Read + Send>;
     type Output = SingleOutputHandle;
 }
 
-impl FastqRunLayout for PairedEnd {
+impl RecordLayout for PairedEnd {
     type Source = PairedSource;
     type Readers = PairedReaders;
     type Output = PairedOutputHandle;
@@ -208,7 +206,7 @@ impl PairedSource {
     }
 }
 
-struct RunContext<L: FastqRunLayout> {
+struct RunContext<L: RecordLayout> {
     source: L::Source,
     readers: L::Readers,
     output: L::Output,
@@ -231,10 +229,10 @@ struct RunConfig {
     merge_min_overlap: usize,
     merge_max_mismatch_rate: f32,
     merge_min_correction_delta_q: u8,
-    invalid_fastq_policy: InvalidFastqPolicy,
+    admission_policy: AdmissionPolicy,
     progress_every: u64,
     summary: Option<PathBuf>,
-    invalid_fastq_report: Option<PathBuf>,
+    invalid_input_report: Option<PathBuf>,
 }
 
 impl From<&Cli> for RunConfig {
@@ -252,10 +250,10 @@ impl From<&Cli> for RunConfig {
             merge_min_overlap: cli.merge_min_overlap,
             merge_max_mismatch_rate: cli.merge_max_mismatch_rate,
             merge_min_correction_delta_q: cli.merge_min_correction_delta_q,
-            invalid_fastq_policy: cli.invalid_fastq_policy,
+            admission_policy: cli.on_invalid_input,
             progress_every: cli.progress_every,
             summary: cli.summary.clone(),
-            invalid_fastq_report: cli.invalid_fastq_report.clone(),
+            invalid_input_report: cli.invalid_input_report.clone(),
         }
     }
 }
@@ -409,18 +407,16 @@ impl RunContext<SingleEnd> {
                 source.input_origin("single"),
                 source.input_label(),
                 "single",
-                config.invalid_fastq_policy,
+                config.admission_policy,
                 &stats,
                 source_error,
             )
         })?;
         let mut progress = ProgressReporter::new(ui.progress_mode, config.progress_every);
         let started_at = Instant::now();
-        let admission = FastqAdmission::<SingleEnd>::new(&source, config.invalid_fastq_policy);
+        let admission = RecordAdmission::new(&source, config.admission_policy);
 
-        while let Some(next_record) =
-            catch_parser_panic(&source, "single", &stats, || parser.next())?
-        {
+        while let Some(next_record) = parser.next() {
             let parsed_record = admission.parse("single", &mut stats, next_record)?;
             let Some(record) = admission.single(&parsed_record, &mut stats)? else {
                 continue;
@@ -434,8 +430,10 @@ impl RunContext<SingleEnd> {
         }
 
         progress.finish();
-        stats.finish_invalid_fastq_report()?;
-        output.finish()?;
+        let output_result = output.finish();
+        let report_result = stats.finish_admission_report();
+        output_result?;
+        report_result?;
         let summary =
             report::RunSummary::from_stats(source.summary_context(), &stats, started_at.elapsed());
         if ui.show_summary {
@@ -524,7 +522,7 @@ impl RunContext<PairedEnd> {
         let mut stats = read_stats(config)?;
         let mut progress = ProgressReporter::new(ui.progress_mode, config.progress_every);
         let started_at = Instant::now();
-        let admission = FastqAdmission::<PairedEnd>::new(&source, config.invalid_fastq_policy);
+        let admission = RecordAdmission::<PairedEnd>::new(&source, config.admission_policy);
 
         match readers {
             PairedReaders::Split { left, right } => {
@@ -533,7 +531,7 @@ impl RunContext<PairedEnd> {
                         source.input_origin("left"),
                         source.input_label(),
                         "left",
-                        config.invalid_fastq_policy,
+                        config.admission_policy,
                         &stats,
                         source_error,
                     )
@@ -543,23 +541,37 @@ impl RunContext<PairedEnd> {
                         source.input_origin("right"),
                         source.input_label(),
                         "right",
-                        config.invalid_fastq_policy,
+                        config.admission_policy,
                         &stats,
                         source_error,
                     )
                 })?;
 
                 loop {
-                    let next_r1 = catch_parser_panic(&source, "left", &stats, || parser_r1.next())?;
-                    let next_r2 =
-                        catch_parser_panic(&source, "right", &stats, || parser_r2.next())?;
+                    let next_r1 = parser_r1.next();
+                    let next_r2 = parser_r2.next();
 
                     match (next_r1, next_r2) {
                         (Some(record_r1), Some(record_r2)) => {
                             let parsed_r1 = admission.parse("left", &mut stats, record_r1)?;
+                            let left = admission.paired_record(
+                                &parsed_r1,
+                                MateSide::Left,
+                                "left",
+                                &stats,
+                            )?;
+                            stats.record_seen(left.sequence().len());
+
                             let parsed_r2 = admission.parse("right", &mut stats, record_r2)?;
-                            let Some(pair) = admission.pair(&parsed_r1, &parsed_r2, &mut stats)?
-                            else {
+                            let right = admission.paired_record(
+                                &parsed_r2,
+                                MateSide::Right,
+                                "right",
+                                &stats,
+                            )?;
+                            stats.record_seen(right.sequence().len());
+
+                            let Some(pair) = admission.admit_pair(left, right, &mut stats)? else {
                                 continue;
                             };
 
@@ -569,7 +581,19 @@ impl RunContext<PairedEnd> {
                             progress.maybe_report(&stats);
                         }
                         (None, None) => break,
-                        _ => return Err(record_count_error(&source, &stats)),
+                        (Some(record_r1), None) => {
+                            let parsed = admission.parse("left", &mut stats, record_r1)?;
+                            admission.missing_mate(&parsed, MateSide::Left, "left", &mut stats)?;
+                        }
+                        (None, Some(record_r2)) => {
+                            let parsed = admission.parse("right", &mut stats, record_r2)?;
+                            admission.missing_mate(
+                                &parsed,
+                                MateSide::Right,
+                                "right",
+                                &mut stats,
+                            )?;
+                        }
                     }
                 }
             }
@@ -579,7 +603,7 @@ impl RunContext<PairedEnd> {
                         source.input_origin("left"),
                         source.input_label(),
                         "left",
-                        config.invalid_fastq_policy,
+                        config.admission_policy,
                         &stats,
                         source_error,
                     )
@@ -587,7 +611,7 @@ impl RunContext<PairedEnd> {
                 let mut left_buffer = InterleavedLeftBuffer::default();
 
                 loop {
-                    let next_left = catch_parser_panic(&source, "left", &stats, || parser.next())?;
+                    let next_left = parser.next();
                     let Some(left_record) = next_left else {
                         break;
                     };
@@ -595,15 +619,17 @@ impl RunContext<PairedEnd> {
                     let parsed_left = admission.parse("left", &mut stats, left_record)?;
                     let left =
                         admission.buffered_left_record(&parsed_left, &stats, &mut left_buffer)?;
+                    stats.record_seen(left.sequence().len());
 
-                    let next_right =
-                        catch_parser_panic(&source, "right", &stats, || parser.next())?;
+                    let next_right = parser.next();
                     let Some(right_record) = next_right else {
-                        return Err(record_count_error(&source, &stats));
+                        admission.missing_mate_record(left, &mut stats)?;
+                        break;
                     };
                     let parsed_right = admission.parse("right", &mut stats, right_record)?;
                     let right =
                         admission.paired_record(&parsed_right, MateSide::Right, "right", &stats)?;
+                    stats.record_seen(right.sequence().len());
 
                     let Some(pair) = admission.admit_pair(left, right, &mut stats)? else {
                         continue;
@@ -618,8 +644,10 @@ impl RunContext<PairedEnd> {
         }
 
         progress.finish();
-        stats.finish_invalid_fastq_report()?;
-        output.finish()?;
+        let output_result = output.finish();
+        let report_result = stats.finish_admission_report();
+        output_result?;
+        report_result?;
         let summary =
             report::RunSummary::from_stats(source.summary_context(), &stats, started_at.elapsed());
         if ui.show_summary {
@@ -658,14 +686,14 @@ impl InterleavedLeftBuffer {
     }
 }
 
-struct FastqAdmission<'source, L: FastqRunLayout> {
+struct RecordAdmission<'source, L: RecordLayout> {
     source: &'source L::Source,
-    policy: InvalidFastqPolicy,
+    policy: AdmissionPolicy,
     _layout: PhantomData<L>,
 }
 
-impl<'source, L: FastqRunLayout> FastqAdmission<'source, L> {
-    fn new(source: &'source L::Source, policy: InvalidFastqPolicy) -> Self {
+impl<'source, L: RecordLayout> RecordAdmission<'source, L> {
+    fn new(source: &'source L::Source, policy: AdmissionPolicy) -> Self {
         Self {
             source,
             policy,
@@ -680,7 +708,13 @@ impl<'source, L: FastqRunLayout> FastqAdmission<'source, L> {
         next_record: std::result::Result<SequenceRecord<'record>, ParseError>,
     ) -> Result<SequenceRecord<'record>> {
         match next_record {
-            Ok(record) => Ok(record),
+            Ok(record) if record.format() == Format::Fastq => Ok(record),
+            Ok(record) => Err(unsupported_format_error(
+                self.source.input_origin(mate),
+                self.source.input_label(),
+                mate,
+                record.format(),
+            )),
             Err(error) => self.parser_error(mate, stats, error),
         }
     }
@@ -692,27 +726,43 @@ impl<'source, L: FastqRunLayout> FastqAdmission<'source, L> {
         error: ParseError,
     ) -> Result<T> {
         let source = self.source.input_label();
-        let parser_error_kind = format!("{:?}", error.kind);
+        let parser_error_kind = parse_error_kind_name(&error.kind);
         let parser_error_message = error.to_string();
         let parser_error_line = (error.position.line > 0).then_some(error.position.line);
 
-        stats.record_invalid_parse_error(self.policy, |context| {
-            context.parse_error(
-                &source,
+        if matches!(
+            &error.kind,
+            ParseErrorKind::Io | ParseErrorKind::UnknownFormat | ParseErrorKind::EmptyFile
+        ) {
+            return Err(parser_error(
+                self.source.input_origin(mate),
+                source,
                 mate,
-                parser_error_kind.clone(),
-                parser_error_message.clone(),
-                parser_error_line,
-            )
+                self.policy,
+                stats,
+                error,
+            ));
+        }
+
+        stats.invalid_reads += 1;
+        stats.record_admission_event(AdmissionEvent::RecordParseFailure {
+            source: source.clone(),
+            mate,
+            parser_kind: parser_error_kind.to_owned(),
+            message: parser_error_message.clone(),
+            line: parser_error_line,
+            reads_seen: stats.reads_seen,
+            pairs_seen: (mate != "single").then_some(stats.pairs_seen),
+            continued: false,
         })?;
 
-        if self.policy == InvalidFastqPolicy::WarnDrop {
+        if self.policy == AdmissionPolicy::Skip {
             tracing::warn!(
                 source,
                 mate,
-                parser_error_kind,
+                parser_kind = parser_error_kind,
                 parser_error = parser_error_message,
-                "invalid FASTQ parser error is unrecoverable; stopping instead of dropping and continuing"
+                "record parser error is not recoverable; stopping instead of skipping and continuing"
             );
         }
 
@@ -725,9 +775,97 @@ impl<'source, L: FastqRunLayout> FastqAdmission<'source, L> {
             error,
         ))
     }
+
+    fn admit_record<'record>(
+        &self,
+        record: RecordView<'record>,
+        stats: &mut ReadStats,
+    ) -> Result<Option<RecordView<'record>>> {
+        if record.sequence().len() == record.quality().len() {
+            return Ok(Some(record));
+        }
+
+        self.record_length_mismatch(record, stats)?;
+
+        match self.policy {
+            AdmissionPolicy::Error => Err(Self::length_mismatch_error(record)),
+            AdmissionPolicy::Skip => {
+                Self::warn_length_mismatch(record, stats);
+                Ok(None)
+            }
+        }
+    }
+
+    fn record_length_mismatch(&self, record: RecordView<'_>, stats: &mut ReadStats) -> Result<()> {
+        stats.invalid_reads += 1;
+        stats.record_admission_event(AdmissionEvent::SequenceQualityLengthMismatch {
+            source: record.source_display(),
+            mate: record.mate_display(),
+            header: String::from_utf8_lossy(record.header()).into_owned(),
+            sequence_len: record.sequence().len(),
+            quality_len: record.quality().len(),
+            reads_seen: stats.reads_seen,
+            pairs_seen: record
+                .provenance()
+                .and_then(|provenance| provenance.mate)
+                .map(|_| stats.pairs_seen),
+            continued: self.policy == AdmissionPolicy::Skip,
+        })?;
+        Ok(())
+    }
+
+    fn length_mismatch_error(record: RecordView<'_>) -> RunError {
+        match record.provenance().map(|provenance| provenance.source) {
+            Some(InputSource::Ena { accession }) => IndeterminateInputError::Content {
+                accession: accession.to_owned(),
+                problem: EnaContentProblem::RecordLength {
+                    mate: record.mate_display(),
+                    header: String::from_utf8_lossy(record.header()).into_owned(),
+                    sequence_len: record.sequence().len(),
+                    quality_len: record.quality().len(),
+                },
+            }
+            .into(),
+            _ => MalformedInputError::RecordLength {
+                source_label: record.source_display(),
+                mate: record.mate_display(),
+                header: String::from_utf8_lossy(record.header()).into_owned(),
+                sequence_len: record.sequence().len(),
+                quality_len: record.quality().len(),
+            }
+            .into(),
+        }
+    }
+
+    fn warn_length_mismatch(record: RecordView<'_>, stats: &mut ReadStats) {
+        if stats.should_emit_admission_warning(ADMISSION_WARNING_LIMIT) {
+            tracing::warn!(
+                source = %record.source_display(),
+                mate = %record.mate_display(),
+                header = %String::from_utf8_lossy(record.header()),
+                sequence_len = record.sequence().len(),
+                quality_len = record.quality().len(),
+                "skipping input record with mismatched sequence and quality lengths"
+            );
+        } else if stats.should_emit_admission_suppressed_notice() {
+            tracing::warn!("further record-admission warnings suppressed");
+        }
+    }
 }
 
-impl FastqAdmission<'_, SingleEnd> {
+fn parse_error_kind_name(kind: &ParseErrorKind) -> &'static str {
+    match kind {
+        ParseErrorKind::Io => "io",
+        ParseErrorKind::UnknownFormat => "unknown_format",
+        ParseErrorKind::InvalidStart => "invalid_start",
+        ParseErrorKind::InvalidSeparator => "invalid_separator",
+        ParseErrorKind::UnequalLengths => "unequal_lengths",
+        ParseErrorKind::UnexpectedEnd => "unexpected_end",
+        ParseErrorKind::EmptyFile => "empty_file",
+    }
+}
+
+impl RecordAdmission<'_, SingleEnd> {
     fn single<'record>(
         &'record self,
         parsed_record: &'record SequenceRecord<'_>,
@@ -742,23 +880,11 @@ impl FastqAdmission<'_, SingleEnd> {
 
         stats.record_seen(sequence.len());
 
-        record.validate(self.policy, stats)
+        self.admit_record(record, stats)
     }
 }
 
-impl<'source> FastqAdmission<'source, PairedEnd> {
-    fn pair<'record>(
-        &'record self,
-        parsed_r1: &'record SequenceRecord<'_>,
-        parsed_r2: &'record SequenceRecord<'_>,
-        stats: &mut ReadStats,
-    ) -> Result<Option<RecordPair<'record>>> {
-        let left = self.paired_record(parsed_r1, MateSide::Left, "left", stats)?;
-        let right = self.paired_record(parsed_r2, MateSide::Right, "right", stats)?;
-
-        self.admit_pair(left, right, stats)
-    }
-
+impl<'source> RecordAdmission<'source, PairedEnd> {
     fn paired_record<'record>(
         &'record self,
         parsed_record: &'record SequenceRecord<'_>,
@@ -773,6 +899,59 @@ impl<'source> FastqAdmission<'source, PairedEnd> {
 
         Ok(RecordView::new(parsed_record.id(), sequence, quality)
             .with_provenance(self.source.provenance(mate)))
+    }
+
+    fn missing_mate(
+        &self,
+        parsed_record: &SequenceRecord<'_>,
+        present_mate: MateSide,
+        mate_label: &'static str,
+        stats: &mut ReadStats,
+    ) -> Result<()> {
+        let record = self.paired_record(parsed_record, present_mate, mate_label, stats)?;
+        stats.record_seen(record.sequence().len());
+        self.missing_mate_record(record, stats)
+    }
+
+    fn missing_mate_record(&self, record: RecordView<'_>, stats: &mut ReadStats) -> Result<()> {
+        let source = record.source_display();
+        let mate = record
+            .provenance()
+            .and_then(|provenance| provenance.mate)
+            .ok_or_else(|| InternalError::PlanInvariant {
+                detail: "paired record did not carry mate provenance".to_owned(),
+            })?;
+        let mate_label = record.mate_display();
+        let header = String::from_utf8_lossy(record.header()).into_owned();
+        let continued = self.policy == AdmissionPolicy::Skip;
+
+        stats.record_admission_event(AdmissionEvent::MissingMate {
+            source: source.clone(),
+            present_mate: mate,
+            header: header.clone(),
+            reads_seen: stats.reads_seen,
+            pairs_seen: stats.pairs_seen,
+            continued,
+        })?;
+
+        match self.policy {
+            AdmissionPolicy::Error => {
+                Err(record_count_error(self.source, mate_label, header, stats))
+            }
+            AdmissionPolicy::Skip => {
+                if stats.should_emit_admission_warning(ADMISSION_WARNING_LIMIT) {
+                    tracing::warn!(
+                        source,
+                        present_mate = mate_label,
+                        header,
+                        "skipping input record without a mate"
+                    );
+                } else if stats.should_emit_admission_suppressed_notice() {
+                    tracing::warn!("further record-admission warnings suppressed");
+                }
+                Ok(())
+            }
+        }
     }
 
     fn buffered_left_record<'record>(
@@ -800,41 +979,101 @@ impl<'source> FastqAdmission<'source, PairedEnd> {
         right: RecordView<'record>,
         stats: &mut ReadStats,
     ) -> Result<Option<RecordPair<'record>>> {
-        stats.record_seen(left.sequence().len());
-        stats.record_seen(right.sequence().len());
         stats.pairs_seen += 1;
 
-        left.validate_pair(right, self.policy, stats)
-    }
-}
+        let left_length_mismatch = left.sequence().len() != left.quality().len();
+        let right_length_mismatch = right.sequence().len() != right.quality().len();
+        if left_length_mismatch || right_length_mismatch {
+            stats.invalid_pairs += 1;
+            if left_length_mismatch {
+                self.record_length_mismatch(left, stats)?;
+            }
+            if right_length_mismatch {
+                self.record_length_mismatch(right, stats)?;
+            }
 
-fn catch_parser_panic<T, S: RunSource>(
-    source: &S,
-    mate: &'static str,
-    stats: &ReadStats,
-    operation: impl FnOnce() -> T,
-) -> Result<T> {
-    catch_unwind(AssertUnwindSafe(operation)).map_err(|panic| {
-        let panic = panic_message(&panic);
-        match source.input_origin(mate) {
-            InputOrigin::Ena(accession) => IndeterminateInputError::ParserPanic {
-                accession: accession.clone(),
-                mate,
-                reads_seen: stats.reads_seen,
-                pairs_seen: stats.pairs_seen,
-                panic,
+            return match self.policy {
+                AdmissionPolicy::Error => {
+                    Err(Self::length_mismatch_error(if left_length_mismatch {
+                        left
+                    } else {
+                        right
+                    }))
+                }
+                AdmissionPolicy::Skip => {
+                    if left_length_mismatch {
+                        Self::warn_length_mismatch(left, stats);
+                    }
+                    if right_length_mismatch {
+                        Self::warn_length_mismatch(right, stats);
+                    }
+                    Ok(None)
+                }
+            };
+        }
+
+        if left.pair_key() == right.pair_key() {
+            return Ok(Some(RecordPair { left, right }));
+        }
+
+        stats.invalid_pairs += 1;
+        stats.record_admission_event(AdmissionEvent::PairIdentifierMismatch {
+            source: left.source_display(),
+            left_header: String::from_utf8_lossy(left.header()).into_owned(),
+            right_header: String::from_utf8_lossy(right.header()).into_owned(),
+            reads_seen: stats.reads_seen,
+            pairs_seen: stats.pairs_seen,
+            continued: self.policy == AdmissionPolicy::Skip,
+        })?;
+
+        match self.policy {
+            AdmissionPolicy::Error => Err(Self::mate_identifier_error(left, right)),
+            AdmissionPolicy::Skip => {
+                Self::warn_identifier_mismatch(left, right, stats);
+                Ok(None)
+            }
+        }
+    }
+
+    fn mate_identifier_error(left: RecordView<'_>, right: RecordView<'_>) -> RunError {
+        match left.provenance().map(|provenance| provenance.source) {
+            Some(InputSource::Ena { accession }) => IndeterminateInputError::Content {
+                accession: accession.to_owned(),
+                problem: EnaContentProblem::MateIdentifier {
+                    left_header: String::from_utf8_lossy(left.header()).into_owned(),
+                    right_header: String::from_utf8_lossy(right.header()).into_owned(),
+                },
             }
             .into(),
-            InputOrigin::Local(_) => InternalError::LocalParserPanic {
-                source_label: source.input_label(),
-                mate,
-                reads_seen: stats.reads_seen,
-                pairs_seen: stats.pairs_seen,
-                panic,
+            _ => MalformedInputError::MateIdentifier {
+                source_label: left.source_display(),
+                left_mate: left.mate_display(),
+                right_mate: right.mate_display(),
+                left_header: String::from_utf8_lossy(left.header()).into_owned(),
+                right_header: String::from_utf8_lossy(right.header()).into_owned(),
             }
             .into(),
         }
-    })
+    }
+
+    fn warn_identifier_mismatch(
+        left: RecordView<'_>,
+        right: RecordView<'_>,
+        stats: &mut ReadStats,
+    ) {
+        if stats.should_emit_admission_warning(ADMISSION_WARNING_LIMIT) {
+            tracing::warn!(
+                source = %left.source_display(),
+                left_mate = %left.mate_display(),
+                right_mate = %right.mate_display(),
+                left_header = %String::from_utf8_lossy(left.header()),
+                right_header = %String::from_utf8_lossy(right.header()),
+                "skipping paired input with mismatched identifiers"
+            );
+        } else if stats.should_emit_admission_suppressed_notice() {
+            tracing::warn!("further record-admission warnings suppressed");
+        }
+    }
 }
 
 fn missing_quality_error<S: RunSource>(
@@ -845,7 +1084,13 @@ fn missing_quality_error<S: RunSource>(
     match source.input_origin(mate) {
         InputOrigin::Ena(accession) => IndeterminateInputError::Content {
             accession: accession.to_string(),
-            problem: EnaContentProblem::MissingQuality { mate },
+            problem: EnaContentProblem::MissingQuality {
+                mate,
+                reads_seen: stats.reads_seen,
+                pairs_seen: stats.pairs_seen,
+                invalid_reads: stats.invalid_reads,
+                invalid_pairs: stats.invalid_pairs,
+            },
         }
         .into(),
         InputOrigin::Local(_) => MalformedInputError::MissingQuality {
@@ -853,25 +1098,17 @@ fn missing_quality_error<S: RunSource>(
             mate,
             reads_seen: stats.reads_seen,
             pairs_seen: stats.pairs_seen,
+            invalid_reads: stats.invalid_reads,
+            invalid_pairs: stats.invalid_pairs,
         }
         .into(),
     }
 }
 
-fn panic_message(panic: &Box<dyn Any + Send>) -> String {
-    if let Some(message) = panic.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else if let Some(message) = panic.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "<non-string panic>".to_owned()
-    }
-}
-
 fn read_stats(config: &RunConfig) -> Result<ReadStats> {
     let mut stats = ReadStats::default();
-    if let Some(path) = &config.invalid_fastq_report {
-        stats.set_invalid_fastq_report(InvalidFastqReport::create(path)?);
+    if let Some(path) = &config.invalid_input_report {
+        stats.set_admission_report(AdmissionReport::create(path)?);
     }
     Ok(stats)
 }
@@ -880,7 +1117,7 @@ fn parser_error(
     origin: InputOrigin<'_>,
     source_label: String,
     mate: &'static str,
-    policy: InvalidFastqPolicy,
+    policy: AdmissionPolicy,
     stats: &ReadStats,
     source: ParseError,
 ) -> RunError {
@@ -902,6 +1139,22 @@ fn parser_error(
             source,
         }
         .into(),
+        InputOrigin::Local(_)
+            if matches!(
+                &source.kind,
+                ParseErrorKind::UnknownFormat | ParseErrorKind::EmptyFile
+            ) =>
+        {
+            MalformedInputError::UnreadableFastq {
+                source_label,
+                mate,
+                reads_seen: stats.reads_seen,
+                pairs_seen: stats.pairs_seen,
+                parser_error_kind: parse_error_kind_name(&source.kind),
+                source,
+            }
+            .into()
+        }
         InputOrigin::Local(_) => MalformedInputError::LocalParser {
             source_label,
             mate,
@@ -910,30 +1163,62 @@ fn parser_error(
             pairs_seen: stats.pairs_seen,
             invalid_reads: stats.invalid_reads,
             invalid_pairs: stats.invalid_pairs,
-            parser_error_kind: format!("{:?}", source.kind),
+            parser_error_kind: parse_error_kind_name(&source.kind).to_owned(),
             source,
         }
         .into(),
     }
 }
 
-fn record_count_error(source: &PairedSource, stats: &ReadStats) -> RunError {
+fn unsupported_format_error(
+    origin: InputOrigin<'_>,
+    source_label: String,
+    mate: &'static str,
+    format: Format,
+) -> RunError {
+    match origin {
+        InputOrigin::Ena(accession) => IndeterminateInputError::Content {
+            accession: accession.to_string(),
+            problem: EnaContentProblem::UnsupportedFormat { mate, format },
+        }
+        .into(),
+        InputOrigin::Local(_) => MalformedInputError::UnsupportedFormat {
+            source_label,
+            mate,
+            format,
+        }
+        .into(),
+    }
+}
+
+fn record_count_error(
+    source: &PairedSource,
+    present_mate: &'static str,
+    header: String,
+    stats: &ReadStats,
+) -> RunError {
     match source {
         PairedSource::Ena { accession } => IndeterminateInputError::Content {
             accession: accession.to_string(),
             problem: EnaContentProblem::RecordCount {
                 complete_pairs_seen: stats.pairs_seen,
+                present_mate,
+                header,
             },
         }
         .into(),
         PairedSource::LocalInterleaved { .. } => MalformedInputError::InterleavedRecordCount {
             source_label: source.input_label(),
+            present_mate,
+            header,
             complete_pairs_seen: stats.pairs_seen,
             reads_seen: stats.reads_seen,
         }
         .into(),
         PairedSource::LocalSplit { .. } => MalformedInputError::PairedRecordCount {
             source_label: source.input_label(),
+            present_mate,
+            header,
             complete_pairs_seen: stats.pairs_seen,
             reads_seen: stats.reads_seen,
         }
@@ -948,7 +1233,7 @@ mod tests {
         fs::File,
         io::{self, Cursor, Write as _},
         marker::PhantomData,
-        path::Path,
+        path::{Path, PathBuf},
     };
 
     use color_eyre::{Result, eyre::bail};
@@ -961,7 +1246,7 @@ mod tests {
 
     use crate::{
         adapter::AdapterPreset,
-        cli::{Cli, InvalidFastqPolicy},
+        cli::{AdmissionPolicy, Cli},
         ena::Accession,
         error::{
             EnaContentProblem, IndeterminateInputError, IoError, MalformedInputError, RunError,
@@ -970,12 +1255,12 @@ mod tests {
             InterleavedOutput, OutputArgs, OutputEncoding, OutputFormat, PairedRecordOutput,
             SingleOutput, SingleRecordOutput, StreamSink,
         },
-        record::{ReadStats, RecordView},
+        record::{AdmissionEvent, AdmissionReport, MateSide, ReadStats, RecordView},
     };
 
     use super::{
-        InputOrigin, PairedEndContext, PairedSource, RunConfig, SingleSource,
-        missing_quality_error, parser_error, record_count_error,
+        InputOrigin, PairedEnd, PairedEndContext, PairedSource, RecordAdmission, RunConfig,
+        SingleEnd, SingleSource, missing_quality_error, parser_error, record_count_error,
     };
 
     fn single_output_for_vec(format: OutputFormat) -> SingleOutput<StreamSink<Vec<u8>>> {
@@ -1007,13 +1292,13 @@ mod tests {
             min_entropy: 0.0,
             output_format: OutputFormat::Fastq,
             output_encoding: None,
-            invalid_fastq_policy: InvalidFastqPolicy::Error,
+            on_invalid_input: AdmissionPolicy::Error,
             out: None,
             out1: None,
             out2: None,
             progress_every: 100_000,
             summary: None,
-            invalid_fastq_report: None,
+            invalid_input_report: None,
             verbose: 0,
             quiet: 0,
         }
@@ -1197,7 +1482,7 @@ mod tests {
             *error,
             MalformedInputError::PairedRecordCount {
                 complete_pairs_seen: 1,
-                reads_seen: 2,
+                reads_seen: 3,
                 ..
             }
         ));
@@ -1259,7 +1544,7 @@ mod tests {
                 InputOrigin::Ena(&accession),
                 format!("ena:{accession}"),
                 "single",
-                InvalidFastqPolicy::Error,
+                AdmissionPolicy::Error,
                 &stats,
                 source,
             );
@@ -1285,7 +1570,7 @@ mod tests {
             InputOrigin::Local(local_path),
             "local:reads.fastq".to_owned(),
             "single",
-            InvalidFastqPolicy::Error,
+            AdmissionPolicy::Error,
             &stats,
             ParseError::from(io::Error::other("local read failed")),
         );
@@ -1294,16 +1579,18 @@ mod tests {
         };
         assert_eq!(source.kind, ParseErrorKind::Io);
 
-        for source in parser_errors
-            .into_iter()
-            .filter(|source| source.kind != ParseErrorKind::Io)
-        {
+        for source in parser_errors.into_iter().filter(|source| {
+            !matches!(
+                &source.kind,
+                ParseErrorKind::Io | ParseErrorKind::UnknownFormat | ParseErrorKind::EmptyFile
+            )
+        }) {
             let expected_kind = source.kind.clone();
             let error = parser_error(
                 InputOrigin::Local(local_path),
                 "local:reads.fastq".to_owned(),
                 "single",
-                InvalidFastqPolicy::Error,
+                AdmissionPolicy::Error,
                 &stats,
                 source,
             );
@@ -1320,7 +1607,46 @@ mod tests {
                     if source.kind == expected_kind
             ));
         }
+
         Ok(())
+    }
+
+    #[test]
+    fn local_parser_source_classification_preserves_typed_source() {
+        let stats = ReadStats {
+            reads_seen: 7,
+            pairs_seen: 3,
+            ..ReadStats::default()
+        };
+        let local_path = Path::new("reads.fastq");
+
+        for source in [
+            ParseError::new_unknown_format(b'!'),
+            ParseError::new_empty_file(),
+        ] {
+            let expected_kind = source.kind.clone();
+            let error = parser_error(
+                InputOrigin::Local(local_path),
+                "local:reads.fastq".to_owned(),
+                "single",
+                AdmissionPolicy::Error,
+                &stats,
+                source,
+            );
+            assert!(
+                error.source().is_some(),
+                "source-classification failures should retain the parser source"
+            );
+            assert!(matches!(
+                error,
+                RunError::MalformedInput(error)
+                    if matches!(
+                        &*error,
+                        MalformedInputError::UnreadableFastq { source, .. }
+                            if source.kind == expected_kind
+                    )
+            ));
+        }
     }
 
     #[test]
@@ -1333,19 +1659,28 @@ mod tests {
         let accession = Accession::new("SRR35939766")?;
 
         assert!(matches!(
-            record_count_error(&PairedSource::Ena { accession }, &stats),
+            record_count_error(
+                &PairedSource::Ena { accession },
+                "left",
+                "read2/1".to_owned(),
+                &stats,
+            ),
             RunError::IndeterminateInput(IndeterminateInputError::Content {
                 problem: EnaContentProblem::RecordCount {
-                    complete_pairs_seen: 1
+                    complete_pairs_seen: 1,
+                    present_mate: "left",
+                    ref header,
                 },
                 ..
-            })
+            }) if header == "read2/1"
         ));
         assert!(matches!(
             record_count_error(
                 &PairedSource::LocalInterleaved {
                     input: "reads.fastq".into(),
                 },
+                "left",
+                "read2/1".to_owned(),
                 &stats,
             ),
             RunError::MalformedInput(error)
@@ -1357,6 +1692,8 @@ mod tests {
                     input1: "reads_1.fastq".into(),
                     input2: "reads_2.fastq".into(),
                 },
+                "right",
+                "read2/2".to_owned(),
                 &stats,
             ),
             RunError::MalformedInput(error)
@@ -1377,7 +1714,7 @@ mod tests {
         assert!(matches!(
             missing_quality_error(&SingleSource::Ena { accession }, "single", &stats),
             RunError::IndeterminateInput(IndeterminateInputError::Content {
-                problem: EnaContentProblem::MissingQuality { mate: "single" },
+                problem: EnaContentProblem::MissingQuality { mate: "single", .. },
                 ..
             })
         ));
@@ -1392,6 +1729,272 @@ mod tests {
             RunError::MalformedInput(error)
                 if matches!(*error, MalformedInputError::MissingQuality { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn record_length_errors_preserve_input_origin_at_admission() -> Result<()> {
+        let local_source = SingleSource::Local {
+            input: PathBuf::from("reads.fastq"),
+        };
+        let local_admission =
+            RecordAdmission::<SingleEnd>::new(&local_source, AdmissionPolicy::Error);
+        let local_record =
+            RecordView::new(b"read1", b"ACGT", b"I").with_provenance(local_source.provenance());
+        let mut local_stats = ReadStats::default();
+        local_stats.record_seen(local_record.sequence().len());
+
+        let Err(local_error) = local_admission.admit_record(local_record, &mut local_stats) else {
+            panic!("local length mismatch should fail admission");
+        };
+        assert!(matches!(
+            local_error,
+            RunError::MalformedInput(error)
+                if matches!(*error, MalformedInputError::RecordLength { .. })
+        ));
+        assert_eq!(local_stats.invalid_reads, 1);
+        assert_eq!(
+            local_stats
+                .admission_event_counts
+                .get("sequence_quality_length_mismatch"),
+            Some(&1)
+        );
+
+        let ena_source = SingleSource::Ena {
+            accession: Accession::new("SRR35939766")?,
+        };
+        let ena_admission = RecordAdmission::<SingleEnd>::new(&ena_source, AdmissionPolicy::Error);
+        let ena_record =
+            RecordView::new(b"read1", b"ACGT", b"I").with_provenance(ena_source.provenance());
+        let mut ena_stats = ReadStats::default();
+        ena_stats.record_seen(ena_record.sequence().len());
+
+        let Err(ena_error) = ena_admission.admit_record(ena_record, &mut ena_stats) else {
+            panic!("ENA length mismatch should fail admission");
+        };
+        assert!(matches!(
+            ena_error,
+            RunError::IndeterminateInput(IndeterminateInputError::Content {
+                problem: EnaContentProblem::RecordLength { .. },
+                ..
+            })
+        ));
+        assert_eq!(ena_stats.invalid_reads, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn mate_identifier_errors_preserve_input_origin_at_admission() -> Result<()> {
+        let local_source = PairedSource::LocalInterleaved {
+            input: PathBuf::from("reads.fastq"),
+        };
+        let local_admission =
+            RecordAdmission::<PairedEnd>::new(&local_source, AdmissionPolicy::Error);
+        let local_left = RecordView::new(b"read1/1", b"A", b"I")
+            .with_provenance(local_source.provenance(MateSide::Left));
+        let local_right = RecordView::new(b"read2/2", b"T", b"I")
+            .with_provenance(local_source.provenance(MateSide::Right));
+        let mut local_stats = ReadStats::default();
+        local_stats.record_seen(1);
+        local_stats.record_seen(1);
+
+        let Err(local_error) =
+            local_admission.admit_pair(local_left, local_right, &mut local_stats)
+        else {
+            panic!("local mate mismatch should fail admission");
+        };
+        assert!(matches!(
+            local_error,
+            RunError::MalformedInput(error)
+                if matches!(*error, MalformedInputError::MateIdentifier { .. })
+        ));
+        assert_eq!(local_stats.invalid_pairs, 1);
+
+        let ena_source = PairedSource::Ena {
+            accession: Accession::new("SRR35939766")?,
+        };
+        let ena_admission = RecordAdmission::<PairedEnd>::new(&ena_source, AdmissionPolicy::Error);
+        let ena_left = RecordView::new(b"read1/1", b"A", b"I")
+            .with_provenance(ena_source.provenance(MateSide::Left));
+        let ena_right = RecordView::new(b"read2/2", b"T", b"I")
+            .with_provenance(ena_source.provenance(MateSide::Right));
+        let mut ena_stats = ReadStats::default();
+        ena_stats.record_seen(1);
+        ena_stats.record_seen(1);
+
+        let Err(ena_error) = ena_admission.admit_pair(ena_left, ena_right, &mut ena_stats) else {
+            panic!("ENA mate mismatch should fail admission");
+        };
+        assert!(matches!(
+            ena_error,
+            RunError::IndeterminateInput(IndeterminateInputError::Content {
+                problem: EnaContentProblem::MateIdentifier { .. },
+                ..
+            })
+        ));
+        assert_eq!(ena_stats.invalid_pairs, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn parser_io_failure_is_not_an_admission_event() -> Result<()> {
+        let temp = tempdir()?;
+        let report_path = temp.path().join("invalid-input.jsonl");
+        let source = SingleSource::Local {
+            input: PathBuf::from("reads.fastq"),
+        };
+        let admission = RecordAdmission::<SingleEnd>::new(&source, AdmissionPolicy::Skip);
+        let mut stats = ReadStats::default();
+        stats.set_admission_report(AdmissionReport::create(&report_path)?);
+
+        let error = admission
+            .parse(
+                "single",
+                &mut stats,
+                Err(ParseError::from(io::Error::other("synthetic read failure"))),
+            )
+            .expect_err("I/O failure should remain fatal");
+
+        assert!(
+            matches!(error, RunError::Io(IoError::LocalFastqRead { .. })),
+            "I/O parser failure should be classified as local read I/O"
+        );
+        assert_eq!(stats.invalid_reads, 0);
+        assert!(stats.admission_event_counts.is_empty());
+        assert_eq!(std::fs::read_to_string(report_path)?, "");
+        Ok(())
+    }
+
+    #[test]
+    fn parser_source_classification_failures_are_not_admission_events() -> Result<()> {
+        let temp = tempdir()?;
+        let report_path = temp.path().join("invalid-input.jsonl");
+        let source = SingleSource::Local {
+            input: PathBuf::from("reads.fastq"),
+        };
+        let admission = RecordAdmission::<SingleEnd>::new(&source, AdmissionPolicy::Skip);
+        let mut stats = ReadStats::default();
+        stats.set_admission_report(AdmissionReport::create(&report_path)?);
+
+        for parse_error in [
+            ParseError::new_unknown_format(b'!'),
+            ParseError::new_empty_file(),
+        ] {
+            let error = admission
+                .parse("single", &mut stats, Err(parse_error))
+                .expect_err("source classification failure should remain fatal");
+            assert!(
+                error
+                    .to_string()
+                    .contains("input source did not provide a readable FASTQ stream")
+            );
+        }
+
+        assert_eq!(stats.invalid_reads, 0);
+        assert!(stats.admission_event_counts.is_empty());
+        assert_eq!(std::fs::read_to_string(report_path)?, "");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_pair_admission_is_atomic_for_each_invalid_mate() -> Result<()> {
+        for (invalid_mate, left_quality, right_quality) in [
+            ("left", b"I".as_slice(), b"KKKK".as_slice()),
+            ("right", b"IIII".as_slice(), b"K".as_slice()),
+        ] {
+            for policy in [AdmissionPolicy::Error, AdmissionPolicy::Skip] {
+                let source = PairedSource::LocalSplit {
+                    input1: PathBuf::from("reads_1.fastq"),
+                    input2: PathBuf::from("reads_2.fastq"),
+                };
+                let admission = RecordAdmission::<PairedEnd>::new(&source, policy);
+                let left = RecordView::new(b"read1/1", b"AAAA", left_quality)
+                    .with_provenance(source.provenance(MateSide::Left));
+                let right = RecordView::new(b"read1/2", b"TTTT", right_quality)
+                    .with_provenance(source.provenance(MateSide::Right));
+                let mut stats = ReadStats::default();
+                stats.record_seen(left.sequence().len());
+                stats.record_seen(right.sequence().len());
+
+                let result = admission.admit_pair(left, right, &mut stats);
+                match policy {
+                    AdmissionPolicy::Error => {
+                        assert!(
+                            result.is_err(),
+                            "Error should halt on an invalid {invalid_mate} mate"
+                        );
+                    }
+                    AdmissionPolicy::Skip => {
+                        assert!(
+                            result?.is_none(),
+                            "Skip should discard the pair when its {invalid_mate} mate is invalid"
+                        );
+                    }
+                }
+
+                assert_eq!(stats.pairs_seen, 1);
+                assert_eq!(stats.invalid_pairs, 1);
+                assert_eq!(stats.invalid_reads, 1);
+                assert_eq!(
+                    stats
+                        .admission_event_counts
+                        .get("sequence_quality_length_mismatch"),
+                    Some(&1)
+                );
+                let [
+                    AdmissionEvent::SequenceQualityLengthMismatch {
+                        mate, continued, ..
+                    },
+                ] = stats.admission_samples.as_slice()
+                else {
+                    panic!("exactly one length-mismatch event should identify the invalid mate");
+                };
+                assert_eq!(*mate, invalid_mate);
+                assert_eq!(*continued, policy == AdmissionPolicy::Skip);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_pair_classification_does_not_depend_on_policy() -> Result<()> {
+        for policy in [AdmissionPolicy::Error, AdmissionPolicy::Skip] {
+            let source = PairedSource::LocalSplit {
+                input1: PathBuf::from("reads_1.fastq"),
+                input2: PathBuf::from("reads_2.fastq"),
+            };
+            let admission = RecordAdmission::<PairedEnd>::new(&source, policy);
+            let left = RecordView::new(b"read1/1", b"AAAA", b"I")
+                .with_provenance(source.provenance(MateSide::Left));
+            let right = RecordView::new(b"read1/2", b"TTTT", b"K")
+                .with_provenance(source.provenance(MateSide::Right));
+            let mut stats = ReadStats::default();
+            stats.record_seen(left.sequence().len());
+            stats.record_seen(right.sequence().len());
+
+            let result = admission.admit_pair(left, right, &mut stats);
+            match policy {
+                AdmissionPolicy::Error => {
+                    assert!(
+                        result.is_err(),
+                        "Error policy should halt on the malformed pair"
+                    );
+                }
+                AdmissionPolicy::Skip => {
+                    assert!(result?.is_none(), "Skip should discard the malformed pair");
+                }
+            }
+
+            assert_eq!(stats.pairs_seen, 1);
+            assert_eq!(stats.invalid_pairs, 1);
+            assert_eq!(stats.invalid_reads, 2);
+            assert_eq!(
+                stats
+                    .admission_event_counts
+                    .get("sequence_quality_length_mismatch"),
+                Some(&2)
+            );
+        }
         Ok(())
     }
 

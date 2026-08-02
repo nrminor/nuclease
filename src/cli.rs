@@ -76,28 +76,21 @@ pub(crate) struct UiPolicy {
     pub progress_mode: ProgressMode,
 }
 
-/// Policy for handling invalid FASTQ input.
-///
-/// Some invalid FASTQ events are recoverable because `nuclease` still has a safe record or pair
-/// boundary. Parser-level or stream-level corruption is still managed by this policy for reporting
-/// and diagnostics, but remains fatal when the stream cannot be safely resynchronized.
+/// Policy for handling record-admission failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum InvalidFastqPolicy {
-    /// Fail immediately when invalid FASTQ input is observed.
+pub enum AdmissionPolicy {
+    /// Fail immediately when a record fails admission checks.
     Error,
-    /// Warn and drop invalid FASTQ records or pairs when recovery is safe.
-    WarnDrop,
-    /// Drop invalid FASTQ records or pairs without warning when recovery is safe.
-    SilentDrop,
+    /// Report and skip the current record when recovery is safe.
+    Skip,
 }
 
-impl fmt::Display for InvalidFastqPolicy {
+impl fmt::Display for AdmissionPolicy {
     /// Format the policy as its stable machine-readable token.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Error => "error",
-            Self::WarnDrop => "warn_drop",
-            Self::SilentDrop => "silent_drop",
+            Self::Skip => "skip",
         })
     }
 }
@@ -283,15 +276,16 @@ and verifies files that are read to completion. Use -v to show reconnects."
     )]
     pub merge_min_correction_delta_q: u8,
 
-    /// How to handle invalid FASTQ input.
+    /// How to handle records that fail admission checks, e.g., that sequence length and quality
+    /// length match.
     #[arg(
-        long,
+        long = "on-invalid-input",
         value_enum,
-        default_value_t = InvalidFastqPolicy::Error,
+        default_value_t = AdmissionPolicy::Error,
         help_heading = "Preprocessing",
-        help = "How to handle invalid FASTQ input; unrecoverable parser or stream errors are reported and remain fatal"
+        help = "Error or skip when a single read or a pair fails input validation"
     )]
-    pub invalid_fastq_policy: InvalidFastqPolicy,
+    pub on_invalid_input: AdmissionPolicy,
 
     /// Output record format.
     #[arg(
@@ -358,13 +352,14 @@ and verifies files that are read to completion. Use -v to show reconnects."
     )]
     pub summary: Option<PathBuf>,
 
-    /// Write every invalid FASTQ event as newline-delimited JSON to this path.
+    /// Write every record-admission failure as newline-delimited JSON to this path.
     #[arg(
-        long,
+        long = "invalid-input-report",
+        required_if_eq("on_invalid_input", "skip"),
         help_heading = "Reporting",
-        help = "Write all invalid FASTQ events to this JSONL path"
+        help = "Write all record-admission failures to this JSONL path; required when --on-invalid-input=skip"
     )]
-    pub invalid_fastq_report: Option<PathBuf>,
+    pub invalid_input_report: Option<PathBuf>,
 
     /// Increase tracing verbosity (`-v` = INFO, `-vv` = DEBUG, `-vvv` = TRACE).
     #[arg(short = 'v', long = "verbose", action = ArgAction::Count, help_heading = "Execution")]
@@ -490,7 +485,7 @@ mod tests {
     use color_eyre::Result;
     use tracing::level_filters::LevelFilter;
 
-    use super::{Cli, Ingress, InvalidFastqPolicy, UiPolicy};
+    use super::{AdmissionPolicy, Cli, Ingress, UiPolicy};
     use crate::{
         adapter::AdapterPreset,
         ena::Accession,
@@ -517,7 +512,7 @@ mod tests {
             merge_min_overlap: 10,
             merge_max_mismatch_rate: 0.2,
             merge_min_correction_delta_q: 0,
-            invalid_fastq_policy: InvalidFastqPolicy::Error,
+            on_invalid_input: AdmissionPolicy::Error,
             output_format: OutputFormat::Fastq,
             output_encoding: None,
             out: None,
@@ -525,7 +520,7 @@ mod tests {
             out2: None,
             progress_every: 100_000,
             summary: None,
-            invalid_fastq_report: None,
+            invalid_input_report: None,
             verbose: 0,
             quiet: 0,
         }
@@ -557,7 +552,7 @@ mod tests {
             merge_min_overlap: 10,
             merge_max_mismatch_rate: 0.2,
             merge_min_correction_delta_q: 0,
-            invalid_fastq_policy: InvalidFastqPolicy::Error,
+            on_invalid_input: AdmissionPolicy::Error,
             output_format: OutputFormat::Fastq,
             output_encoding: Some(OutputEncoding::Plain),
             out: None,
@@ -565,7 +560,7 @@ mod tests {
             out2: None,
             progress_every: 100_000,
             summary: None,
-            invalid_fastq_report: None,
+            invalid_input_report: None,
             verbose: 0,
             quiet: 0,
         };
@@ -595,7 +590,7 @@ mod tests {
             merge_min_overlap: 10,
             merge_max_mismatch_rate: 0.2,
             merge_min_correction_delta_q: 0,
-            invalid_fastq_policy: InvalidFastqPolicy::Error,
+            on_invalid_input: AdmissionPolicy::Error,
             output_format: OutputFormat::Fastq,
             output_encoding: Some(OutputEncoding::Plain),
             out: None,
@@ -603,7 +598,7 @@ mod tests {
             out2: None,
             progress_every: 100_000,
             summary: None,
-            invalid_fastq_report: None,
+            invalid_input_report: None,
             verbose: 0,
             quiet: 0,
         };

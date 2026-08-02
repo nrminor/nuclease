@@ -2,7 +2,7 @@
 
 use std::{fmt, io, num::ParseIntError, path::PathBuf, process::ExitCode, str::Utf8Error};
 
-use needletail::errors::ParseError;
+use needletail::{errors::ParseError, parser::Format};
 use reqwest::StatusCode;
 use thiserror::Error;
 
@@ -125,8 +125,8 @@ pub(crate) enum UsageError {
 #[derive(Debug, Error)]
 pub(crate) enum MalformedInputError {
     #[error(
-        "FASTQ parser rejected malformed input while reading source={source_label} mate={mate}\n\
-         invalid_fastq_policy={policy}\n\
+        "record parser rejected malformed input while reading source={source_label} mate={mate}\n\
+         admission_policy={policy}\n\
          reads_seen={reads_seen} pairs_seen={pairs_seen} invalid_reads={invalid_reads} invalid_pairs={invalid_pairs}\n\
          parser_error_kind={parser_error_kind}\n\
          help: inspect the local FASTQ structure and compression before retrying"
@@ -145,7 +145,33 @@ pub(crate) enum MalformedInputError {
     },
 
     #[error(
-        "invalid FASTQ record source={source_label} mate={mate} header={header} sequence_len={sequence_len} quality_len={quality_len}"
+        "input source did not provide a readable FASTQ stream source={source_label} mate={mate}\n\
+         reads_seen={reads_seen} pairs_seen={pairs_seen}\n\
+         parser_error_kind={parser_error_kind}\n\
+         help: confirm the local input is a non-empty FASTQ stream and that compression was detected correctly"
+    )]
+    UnreadableFastq {
+        source_label: String,
+        mate: &'static str,
+        reads_seen: u64,
+        pairs_seen: u64,
+        parser_error_kind: &'static str,
+        #[source]
+        source: ParseError,
+    },
+
+    #[error(
+        "unsupported input format source={source_label} mate={mate} format={format:?}\n\
+         help: this release accepts FASTQ input; use --output-format fasta only to convert admitted FASTQ records"
+    )]
+    UnsupportedFormat {
+        source_label: String,
+        mate: &'static str,
+        format: Format,
+    },
+
+    #[error(
+        "record failed admission source={source_label} mate={mate} header={header} sequence_len={sequence_len} quality_len={quality_len}"
     )]
     RecordLength {
         source_label: String,
@@ -156,7 +182,7 @@ pub(crate) enum MalformedInputError {
     },
 
     #[error(
-        "paired FASTQ headers do not agree source={source_label} left_mate={left_mate} right_mate={right_mate} left_header={left_header} right_header={right_header}\n\
+        "paired input identifiers do not agree source={source_label} left_mate={left_mate} right_mate={right_mate} left_header={left_header} right_header={right_header}\n\
          help: confirm both files contain aligned mates in the same order"
     )]
     MateIdentifier {
@@ -170,12 +196,16 @@ pub(crate) enum MalformedInputError {
     #[error(
         "paired FASTQ inputs have different record counts\n\
          source: {source_label}\n\
+         present_mate: {present_mate}\n\
+         header: {header}\n\
          complete_pairs_seen: {complete_pairs_seen}\n\
          reads_seen_before_failure: {reads_seen}\n\
          help: confirm both inputs are complete mates from the same run"
     )]
     PairedRecordCount {
         source_label: String,
+        present_mate: &'static str,
+        header: String,
         complete_pairs_seen: u64,
         reads_seen: u64,
     },
@@ -183,12 +213,16 @@ pub(crate) enum MalformedInputError {
     #[error(
         "interleaved paired FASTQ ended with an unpaired read\n\
          source: {source_label}\n\
+         present_mate: {present_mate}\n\
+         header: {header}\n\
          complete_pairs_seen: {complete_pairs_seen}\n\
          reads_seen_before_failure: {reads_seen}\n\
          help: confirm the interleaved input contains adjacent read pairs and was not truncated"
     )]
     InterleavedRecordCount {
         source_label: String,
+        present_mate: &'static str,
+        header: String,
         complete_pairs_seen: u64,
         reads_seen: u64,
     },
@@ -205,7 +239,7 @@ pub(crate) enum MalformedInputError {
 
     #[error(
         "FASTQ parser did not provide quality scores while reading source={source_label} mate={mate}\n\
-         reads_seen={reads_seen} pairs_seen={pairs_seen}\n\
+         reads_seen={reads_seen} pairs_seen={pairs_seen} invalid_reads={invalid_reads} invalid_pairs={invalid_pairs}\n\
          help: confirm the input is FASTQ rather than FASTA and that parser quality computation is enabled"
     )]
     MissingQuality {
@@ -213,6 +247,8 @@ pub(crate) enum MalformedInputError {
         mate: &'static str,
         reads_seen: u64,
         pairs_seen: u64,
+        invalid_reads: u64,
+        invalid_pairs: u64,
     },
 }
 
@@ -461,22 +497,6 @@ pub(crate) enum IndeterminateInputError {
         #[source]
         source: Utf8Error,
     },
-
-    #[error(
-        "Needletail panicked while parsing unverified ENA input {accession}\n\
-         mate: {mate}\n\
-         reads_seen: {reads_seen}\n\
-         pairs_seen: {pairs_seen}\n\
-         panic: {panic}\n\
-         help: retry the complete run and report this diagnostic if it is reproducible"
-    )]
-    ParserPanic {
-        accession: Accession,
-        mate: &'static str,
-        reads_seen: u64,
-        pairs_seen: u64,
-        panic: String,
-    },
 }
 
 /// Closed set of malformed or contradictory ENA file-report states.
@@ -541,10 +561,26 @@ pub(crate) enum EnaContentProblem {
         left_header: String,
         right_header: String,
     },
-    #[error("FASTQ record for mate={mate} did not include quality scores")]
-    MissingQuality { mate: &'static str },
-    #[error("paired FASTQ inputs ended after {complete_pairs_seen} complete pairs")]
-    RecordCount { complete_pairs_seen: u64 },
+    #[error(
+        "FASTQ record for mate={mate} did not include quality scores after reads_seen={reads_seen} pairs_seen={pairs_seen} invalid_reads={invalid_reads} invalid_pairs={invalid_pairs}"
+    )]
+    MissingQuality {
+        mate: &'static str,
+        reads_seen: u64,
+        pairs_seen: u64,
+        invalid_reads: u64,
+        invalid_pairs: u64,
+    },
+    #[error("input provided unsupported format {format:?} for mate={mate}")]
+    UnsupportedFormat { mate: &'static str, format: Format },
+    #[error(
+        "paired FASTQ inputs ended after {complete_pairs_seen} complete pairs with unmatched {present_mate} record {header}"
+    )]
+    RecordCount {
+        complete_pairs_seen: u64,
+        present_mate: &'static str,
+        header: String,
+    },
 }
 
 /// Software defects, initialization failures, and violated internal expectations.
@@ -614,22 +650,6 @@ pub(crate) enum InternalError {
         #[source]
         source: serde_json::Error,
     },
-
-    #[error(
-        "Needletail panicked while parsing local input {source_label}\n\
-         mate: {mate}\n\
-         reads_seen: {reads_seen}\n\
-         pairs_seen: {pairs_seen}\n\
-         panic: {panic}\n\
-         help: report this diagnostic with the triggering input if possible"
-    )]
-    LocalParserPanic {
-        source_label: String,
-        mate: &'static str,
-        reads_seen: u64,
-        pairs_seen: u64,
-        panic: String,
-    },
 }
 
 #[cfg(test)]
@@ -653,6 +673,8 @@ mod tests {
                     mate: "single",
                     reads_seen: 0,
                     pairs_seen: 0,
+                    invalid_reads: 0,
+                    invalid_pairs: 0,
                 }),
                 65,
             ),
