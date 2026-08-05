@@ -402,6 +402,7 @@ impl Cli {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_writer(io::stderr)
+            .log_internal_errors(false)
             .try_init()
             .map_err(|source| InternalError::Tracing { source }.into())
     }

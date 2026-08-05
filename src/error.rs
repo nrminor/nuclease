@@ -1,6 +1,6 @@
 //! Typed application errors that determine Nuclease's terminal behavior.
 
-use std::{fmt, io, num::ParseIntError, path::PathBuf, str::Utf8Error};
+use std::{fmt, io, num::ParseIntError, path::PathBuf, process::ExitCode, str::Utf8Error};
 
 use needletail::errors::ParseError;
 use reqwest::StatusCode;
@@ -26,6 +26,20 @@ pub(crate) enum RunError {
     IndeterminateInput(#[from] IndeterminateInputError),
     #[error(transparent)]
     Internal(#[from] InternalError),
+}
+
+impl RunError {
+    /// Return the stable process status for this terminal failure category.
+    pub(crate) fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Usage(_) => ExitCode::from(2),
+            Self::MalformedInput(_) => ExitCode::from(65),
+            Self::UnavailableInput(_) => ExitCode::from(66),
+            Self::Io(_) => ExitCode::from(74),
+            Self::IndeterminateInput(_) => ExitCode::from(75),
+            Self::Internal(_) => ExitCode::FAILURE,
+        }
+    }
 }
 
 impl From<MalformedInputError> for RunError {
@@ -289,6 +303,16 @@ pub(crate) enum IoError {
     CreateOutput {
         destination: OutputDestination,
         encoding: &'static str,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error(
+        "required output {destination} was closed before nuclease finished writing\n\
+         help: ensure the downstream process consumes the complete output"
+    )]
+    BrokenPipe {
+        destination: OutputDestination,
         #[source]
         source: io::Error,
     },
@@ -606,4 +630,63 @@ pub(crate) enum InternalError {
         pairs_seen: u64,
         panic: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io, path::PathBuf, process::ExitCode};
+
+    use super::{
+        EnaAvailabilityProblem, IndeterminateInputError, InternalError, IoError,
+        MalformedInputError, OutputDestination, RunError, UnavailableInputError, UsageError,
+    };
+    use crate::ena::Accession;
+
+    #[test]
+    fn run_error_categories_map_to_stable_exit_codes() {
+        let accession = Accession::new("SRR35939766").expect("test accession should be valid");
+        let cases = [
+            (RunError::from(UsageError::MergeRequiresPairedInput), 2),
+            (
+                RunError::from(MalformedInputError::MissingQuality {
+                    source_label: "local:reads.fastq".to_owned(),
+                    mate: "single",
+                    reads_seen: 0,
+                    pairs_seen: 0,
+                }),
+                65,
+            ),
+            (
+                RunError::from(UnavailableInputError::EnaMetadata {
+                    accession: accession.clone(),
+                    problem: EnaAvailabilityProblem::NoDataRow,
+                }),
+                66,
+            ),
+            (
+                RunError::from(IoError::WriteOutput {
+                    destination: OutputDestination::File(PathBuf::from("results.fastq")),
+                    source: io::Error::other("test output failure"),
+                }),
+                74,
+            ),
+            (
+                RunError::from(IndeterminateInputError::Status {
+                    accession,
+                    status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                }),
+                75,
+            ),
+            (
+                RunError::from(InternalError::CliInvariant {
+                    detail: "test invariant".to_owned(),
+                }),
+                1,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.exit_code(), ExitCode::from(expected));
+        }
+    }
 }

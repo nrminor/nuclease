@@ -1,6 +1,12 @@
 //! Human-readable run summaries written after a streaming job completes.
 
-use std::{fmt::Write as _, fs::File, io::BufWriter, path::Path, time::Duration};
+use std::{
+    fmt::Write as _,
+    fs::File,
+    io::{self, BufWriter, Write as _},
+    path::Path,
+    time::Duration,
+};
 
 use serde::Serialize;
 
@@ -157,7 +163,8 @@ impl RunSummary {
 
 /// Print a human-readable run summary to stderr.
 pub fn print_summary(summary: &RunSummary) {
-    eprint!("{}", render_summary(summary));
+    let rendered = render_summary(summary);
+    let _ = io::stderr().write_all(rendered.as_bytes());
 }
 
 /// Write a JSON summary to disk.

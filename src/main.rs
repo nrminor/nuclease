@@ -4,6 +4,12 @@
 //! layout/format/encoding, and is intended to compose directly with downstream tools such as
 //! `sourmash scripts singlesketch`.
 
+use std::{
+    fmt,
+    io::{self, Write as _},
+    process::ExitCode,
+};
+
 mod adapter;
 mod cli;
 mod ena;
@@ -19,16 +25,26 @@ mod record;
 mod report;
 
 use clap::Parser;
-use color_eyre::eyre::Result;
 
 /// Parse CLI arguments, initialize tracing, and execute the selected pipeline.
-///
-/// # Errors
-///
-/// Returns an error when ingress selection, reader construction, parsing, transport, or output
-/// finalization fails.
-fn main() -> Result<()> {
-    color_eyre::install()?;
+fn main() -> ExitCode {
+    if let Err(error) = color_eyre::install() {
+        stderr_best_effort(format_args!("failed to install error reporting: {error}"));
+        return ExitCode::FAILURE;
+    }
+
     let cli = cli::Cli::parse();
-    Ok(pipeline::run(&cli)?)
+    match pipeline::run(&cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            let report = color_eyre::Report::new(error);
+            stderr_best_effort(format_args!("{report:?}"));
+            exit_code
+        }
+    }
+}
+
+fn stderr_best_effort(arguments: fmt::Arguments<'_>) {
+    let _ = writeln!(io::stderr(), "{arguments}");
 }

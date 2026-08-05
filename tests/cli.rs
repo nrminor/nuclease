@@ -1,12 +1,24 @@
 //! CLI contract tests for `nuclease`.
 
-use std::{fs, process::Command};
+use std::{
+    fs,
+    process::{Command, Stdio},
+};
 
 use serde_json::Value;
 use tempfile::tempdir;
 
 fn nuclease() -> Command {
     Command::new(env!("CARGO_BIN_EXE_nuclease"))
+}
+
+#[cfg(unix)]
+fn nuclease_with_closed_stderr() -> Command {
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "exec 2>&-; exec \"$@\"", "nuclease-shell"])
+        .arg(env!("CARGO_BIN_EXE_nuclease"));
+    command
 }
 
 #[test]
@@ -50,6 +62,194 @@ fn local_single_fastq_streams_cleaned_reads_and_writes_summary() {
     assert_eq!(summary["reads_emitted"], 2);
     assert_eq!(summary["reads_rejected"], 0);
     assert_eq!(summary["invalid_reads"], 0);
+}
+
+#[test]
+fn missing_local_input_exits_unavailable() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("missing.fastq");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--passthrough",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert_eq!(output.status.code(), Some(66));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to open local FASTQ input"));
+    assert!(stderr.contains(input.to_str().expect("fixture path should be UTF-8")));
+    assert!(stderr.contains("check that the path exists and is readable"));
+}
+
+#[test]
+fn required_output_create_failure_exits_io() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    let output_path = temp.path().join("missing-parent").join("clean.fastq");
+    fs::write(&input, b"@read1\nACGT\n+\nIIII\n").expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--passthrough",
+            "--out",
+            output_path.to_str().expect("output path should be UTF-8"),
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert_eq!(output.status.code(), Some(74));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to create required output"));
+    assert!(stderr.contains(output_path.to_str().expect("output path should be UTF-8")));
+    assert!(stderr.contains("check that the parent directory exists and is writable"));
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_downstream_pipe_exits_io_with_destination_context() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    let reads = b"@read1\nACGT\n+\nIIII\n".repeat(100_000);
+    fs::write(&input, reads).expect("fixture FASTQ should be writable");
+
+    let mut child = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--passthrough",
+            "-qqq",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("nuclease should start");
+    drop(
+        child
+            .stdout
+            .take()
+            .expect("nuclease stdout should be piped"),
+    );
+
+    let output = child
+        .wait_with_output()
+        .expect("nuclease should report its process status");
+
+    assert_eq!(output.status.code(), Some(74));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("required output stdout was closed before nuclease finished writing"));
+    assert!(stderr.contains("ensure the downstream process consumes the complete output"));
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stderr_does_not_change_selected_error_status() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("malformed.fastq");
+    fs::write(&input, b"@bad\nACGT\n+\nI\n").expect("fixture FASTQ should be writable");
+
+    let status = nuclease_with_closed_stderr()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--passthrough",
+            "-qqq",
+        ])
+        .stdout(Stdio::null())
+        .status()
+        .expect("nuclease should run with closed stderr");
+
+    assert_eq!(status.code(), Some(65));
+}
+
+#[cfg(unix)]
+#[test]
+fn plain_progress_is_best_effort_when_stderr_is_closed() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    let output = temp.path().join("clean.fastq");
+    fs::write(&input, b"@read1\nACGT\n+\nIIII\n").expect("fixture FASTQ should be writable");
+
+    let status = nuclease_with_closed_stderr()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--passthrough",
+            "--out",
+            output.to_str().expect("output path should be UTF-8"),
+            "--progress-every",
+            "1",
+            "-qq",
+        ])
+        .stdout(Stdio::null())
+        .status()
+        .expect("nuclease should run with closed stderr");
+
+    assert!(status.success());
+    assert_eq!(
+        fs::read(output).expect("output should be readable"),
+        fs::read(input).expect("input should be readable")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn human_summary_is_best_effort_when_stderr_is_closed() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    let output = temp.path().join("clean.fastq");
+    fs::write(&input, b"@read1\nACGT\n+\nIIII\n").expect("fixture FASTQ should be writable");
+
+    let status = nuclease_with_closed_stderr()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--passthrough",
+            "--out",
+            output.to_str().expect("output path should be UTF-8"),
+            "--progress-every",
+            "0",
+        ])
+        .stdout(Stdio::null())
+        .status()
+        .expect("nuclease should run with closed stderr");
+
+    assert!(status.success());
+    assert!(output.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn tracing_is_best_effort_when_stderr_is_closed() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    let output = temp.path().join("clean.fastq");
+    fs::write(&input, b"@read1\nACGT\n+\nIIII\n").expect("fixture FASTQ should be writable");
+
+    let status = nuclease_with_closed_stderr()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--passthrough",
+            "--out",
+            output.to_str().expect("output path should be UTF-8"),
+            "--progress-every",
+            "0",
+            "-v",
+        ])
+        .stdout(Stdio::null())
+        .status()
+        .expect("nuclease should run with closed stderr");
+
+    assert!(status.success());
+    assert!(output.exists());
 }
 
 #[test]
@@ -460,8 +660,8 @@ fn warn_drop_invalid_fastq_policy_does_not_recover_parser_error() {
     );
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "Commit 1 should preserve generic application failure status"
+        Some(65),
+        "malformed local FASTQ should use the stable data-error status"
     );
     assert!(
         stderr.contains("FASTQ parser rejected malformed input"),
@@ -938,8 +1138,8 @@ fn merge_pairs_rejects_single_end_input() {
     );
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "post-resolution usage remains a generic application failure in Commit 1"
+        Some(2),
+        "post-resolution semantic usage should match Clap usage status"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

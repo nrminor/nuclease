@@ -1,6 +1,9 @@
 //! Progress rendering for long-running streaming jobs.
 
-use std::time::Instant;
+use std::{
+    io::{self, Write as _},
+    time::Instant,
+};
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
@@ -67,7 +70,9 @@ impl ProgressReporter {
                     bar.tick();
                 }
             }
-            ProgressMode::Plain => eprintln!("{message}"),
+            ProgressMode::Plain => {
+                let _ = writeln!(io::stderr(), "{message}");
+            }
             ProgressMode::Off => {}
         }
 

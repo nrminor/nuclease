@@ -1184,6 +1184,13 @@ fn finalizable_file_writer(
 fn output_write_error(destination: &OutputDestination, error: SinkError) -> RunError {
     match error {
         SinkError::MissingQuality => InternalError::MissingOutputQuality.into(),
+        SinkError::Io(source) if source.kind() == io::ErrorKind::BrokenPipe => {
+            IoError::BrokenPipe {
+                destination: destination.clone(),
+                source,
+            }
+            .into()
+        }
         SinkError::Io(source) => IoError::WriteOutput {
             destination: destination.clone(),
             source,
@@ -1193,11 +1200,19 @@ fn output_write_error(destination: &OutputDestination, error: SinkError) -> RunE
 }
 
 fn output_finish_error(destination: OutputDestination, source: io::Error) -> RunError {
-    IoError::FinalizeOutput {
-        destination,
-        source,
+    if source.kind() == io::ErrorKind::BrokenPipe {
+        IoError::BrokenPipe {
+            destination,
+            source,
+        }
+        .into()
+    } else {
+        IoError::FinalizeOutput {
+            destination,
+            source,
+        }
+        .into()
     }
-    .into()
 }
 
 #[cfg(test)]
@@ -1366,7 +1381,7 @@ mod tests {
             .write_record(RecordView::new(b"read1", b"ACGT", b"IIII"))
             .expect_err("closed output should fail at the destination-aware handle");
 
-        let RunError::Io(IoError::WriteOutput {
+        let RunError::Io(IoError::BrokenPipe {
             destination: observed,
             source,
         }) = error
@@ -1427,7 +1442,7 @@ mod tests {
             .expect_err("right mate output should fail");
         assert!(matches!(
             error,
-            RunError::Io(IoError::WriteOutput {
+            RunError::Io(IoError::BrokenPipe {
                 destination: observed,
                 source,
             }) if observed == right_destination && source.kind() == io::ErrorKind::BrokenPipe
