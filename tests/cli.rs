@@ -1181,6 +1181,55 @@ fn paired_fastq_merge_pairs_keeps_unmerged_pair() {
 }
 
 #[test]
+fn paired_fastq_merge_pairs_keeps_validation_rejected_pair() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input1 = temp.path().join("reads_1.fastq");
+    let input2 = temp.path().join("reads_2.fastq");
+    fs::write(
+        &input1,
+        b"@read1/1\nACGTTGCAGATCTGACCTGAATCGTACGAGTCTAGCGTAT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )
+    .expect("read 1 fixture should be writable");
+    fs::write(
+        &input2,
+        b"@read1/2\nGTACGCTAGACTCGTACGATTCAGGTCAGATCTGCAATGA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+    )
+    .expect("read 2 fixture should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in1",
+            input1.to_str().expect("read 1 path should be UTF-8"),
+            "--in2",
+            input2.to_str().expect("read 2 path should be UTF-8"),
+            "--merge-pairs",
+            "--bin-qualities",
+            "--adapter-preset",
+            "none",
+            "--min-length",
+            "1",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "validation-rejected overlap should remain an ordinary pair: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        b"@read1/1\nACGTTGCAGATCTGACCTGAATCGTACGAGTCTAGCGTAT\n+\nEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE\n@read1/2\nGTACGCTAGACTCGTACGATTCAGGTCAGATCTGCAATGA\n+\nEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE\n",
+        "both mates should continue through quality binning"
+    );
+}
+
+#[test]
 fn paired_fastq_merge_min_overlap_can_reject_shorter_overlap() {
     let temp = tempdir().expect("tempdir should be created");
     let input1 = temp.path().join("reads_1.fastq");

@@ -859,9 +859,9 @@ dependencies = [
 
 [[package]]
 name = "libpairassembly"
-version = "0.1.2"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d400eb861cf82194bc9836ec91a69396e19d6f486564b1968764a6fa93bc4917"
+checksum = "03e7d9cb37de6b4d39dc474ade501cc9b6452df22839245f39b1581efd707412"
 dependencies = [
  "itertools",
  "rustc-hash",
