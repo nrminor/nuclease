@@ -196,7 +196,8 @@ and verifies files that are read to completion. Use -v to show reconnects."
         long,
         default_value_t = 0.0,
         help_heading = "Preprocessing",
-        help = "Minimum Shannon entropy after trimming"
+        help = "Minimum Shannon entropy of A/C/G/T composition; 0 disables",
+        long_help = "Reject reads below the minimum Shannon entropy of their A/C/G/T frequencies. Scores are 0 for a homopolymer, 1 for the diversity of two equally frequent bases, and 2 for balanced A/C/G/T. Values around 0.7-1.0 target strongly composition-biased reads. Base order and non-ACGT symbols are ignored."
     )]
     pub min_entropy: f64,
 

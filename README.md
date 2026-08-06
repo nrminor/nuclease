@@ -45,7 +45,7 @@ Supported filters are:
 - Maximum ambiguous bases (`--max-ns`): rejects reads with more than the configured number of `N` bases.
 - Minimum read length (`--min-length`): rejects post-transform reads shorter than the configured length.
 - Minimum mean Phred quality (`--min-mean-q`): rejects post-transform reads whose mean quality is below the configured threshold.
-- Minimum Shannon entropy (`--min-entropy`): rejects post-transform reads whose `A`/`C`/`G`/`T` composition is below the configured entropy threshold.
+- Minimum Shannon entropy (`--min-entropy`): rejects post-transform reads below the configured entropy of their `A`/`C`/`G`/`T` frequencies. Scores are 0 for a homopolymer, 1 for the diversity of two equally frequent bases, and 2 for balanced `A`/`C`/`G`/`T`; values around 0.7–1.0 target strongly composition-biased reads. Base order and non-`A`/`C`/`G`/`T` symbols are ignored.
 
 Supported transforms are:
 
