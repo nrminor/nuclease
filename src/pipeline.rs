@@ -1296,7 +1296,7 @@ mod tests {
             out: None,
             out1: None,
             out2: None,
-            progress_every: 100_000,
+            progress_every: 1_234,
             summary: None,
             invalid_input_report: None,
             verbose: 0,

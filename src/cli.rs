@@ -339,7 +339,7 @@ and verifies files that are read to completion. Use -v to show reconnects."
     /// Number of records between progress log updates.
     #[arg(
         long,
-        default_value_t = 100_000,
+        default_value_t = 1_234,
         help_heading = "Reporting",
         help = "Reads between progress log updates"
     )]
@@ -519,7 +519,7 @@ mod tests {
             out: None,
             out1: None,
             out2: None,
-            progress_every: 100_000,
+            progress_every: 1_234,
             summary: None,
             invalid_input_report: None,
             verbose: 0,
@@ -531,6 +531,14 @@ mod tests {
         let mut policy = cli.ui_policy();
         policy.progress_mode = ProgressMode::Live;
         policy
+    }
+
+    #[test]
+    fn progress_interval_defaults_to_rapid_feedback() {
+        let cli = Cli::try_parse_from(["nuclease", "--in", "reads.fastq.gz"])
+            .expect("minimal local input should parse");
+
+        assert_eq!(cli.progress_every, 1_234);
     }
 
     #[test]
@@ -559,7 +567,7 @@ mod tests {
             out: None,
             out1: None,
             out2: None,
-            progress_every: 100_000,
+            progress_every: 1_234,
             summary: None,
             invalid_input_report: None,
             verbose: 0,
@@ -597,7 +605,7 @@ mod tests {
             out: None,
             out1: None,
             out2: None,
-            progress_every: 100_000,
+            progress_every: 1_234,
             summary: None,
             invalid_input_report: None,
             verbose: 0,
