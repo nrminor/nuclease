@@ -145,7 +145,7 @@ impl QualityTrim {
             running_sum += score;
 
             if running_sum < 0 {
-                running_sum = 0;
+                break;
             } else if running_sum > best_sum {
                 best_sum = running_sum;
                 trim_end = idx;
@@ -250,14 +250,14 @@ mod tests {
     }
 
     #[test]
-    fn quality_trim_cuts_at_low_quality_tail_start_even_if_tail_recovers() {
+    fn quality_trim_preserves_recovered_high_quality_tail() {
         let trimmer = QualityTrim::new(20);
         let arena = TransformArena::new();
         let result = trimmer.apply(record(b"ACGT", b"I!II"), &arena);
 
-        assert!(result.applied);
-        assert_eq!(result.record.sequence(), b"A");
-        assert_eq!(result.record.quality(), b"I");
+        assert!(!result.applied);
+        assert_eq!(result.record.sequence(), b"ACGT");
+        assert_eq!(result.record.quality(), b"I!II");
     }
 
     #[test]

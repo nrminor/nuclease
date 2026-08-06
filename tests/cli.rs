@@ -65,6 +65,45 @@ fn local_single_fastq_streams_cleaned_reads_and_writes_summary() {
 }
 
 #[test]
+fn recovered_quality_tail_avoids_default_minimum_length_rejection() {
+    let temp = tempdir().expect("tempdir should be created");
+    let input = temp.path().join("reads.fastq");
+    let summary = temp.path().join("summary.json");
+    let sequence = "ACGT".repeat(15);
+    let mut quality = vec![b'I'; sequence.len()];
+    quality[10] = b'!';
+    let fastq = format!(
+        "@recovered-tail\n{sequence}\n+\n{}\n",
+        String::from_utf8(quality).expect("quality fixture should be UTF-8")
+    );
+    fs::write(&input, &fastq).expect("fixture FASTQ should be writable");
+
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("fixture path should be UTF-8"),
+            "--summary",
+            summary.to_str().expect("summary path should be UTF-8"),
+            "-qqq",
+        ])
+        .output()
+        .expect("nuclease should run");
+
+    assert!(
+        output.status.success(),
+        "nuclease failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, fastq.as_bytes());
+
+    let summary_json = fs::read_to_string(summary).expect("summary should be readable");
+    let summary: Value = serde_json::from_str(&summary_json).expect("summary should be JSON");
+    assert_eq!(summary["reads_seen"], 1);
+    assert_eq!(summary["reads_emitted"], 1);
+    assert_eq!(summary["reads_rejected"], 0);
+}
+
+#[test]
 fn missing_local_input_exits_unavailable() {
     let temp = tempdir().expect("tempdir should be created");
     let input = temp.path().join("missing.fastq");
