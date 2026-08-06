@@ -90,17 +90,23 @@ impl ProgressReporter {
 fn render_message(stats: &ReadStats, elapsed_seconds: f64) -> String {
     let reads_per_second = rate(stats.reads_seen, elapsed_seconds);
     let bases_per_second = rate(stats.bases_seen, elapsed_seconds);
+    let (retained_fraction, retained_unit) = if stats.pairs_seen > 0 {
+        (fraction(stats.pairs_emitted, stats.pairs_seen), "pairs")
+    } else {
+        (fraction(stats.reads_emitted, stats.reads_seen), "reads")
+    };
     let top_rejection = top_rejection_reason(stats).map_or_else(
         || "none".to_owned(),
         |(code, count)| format!("{code}:{count}"),
     );
 
     format!(
-        "reads={} emitted={} rejected={} ({:.1}% kept) bases={} emitted_bases={} {:.0} reads/s {:.1} bases/s top_reject={}",
+        "reads={} emitted={} rejected={} ({:.1}% {} retained) bases={} emitted_bases={} {:.0} reads/s {:.1} bases/s top_reject={}",
         stats.reads_seen,
         stats.reads_emitted,
         stats.reads_rejected,
-        fraction(stats.reads_emitted, stats.reads_seen) * 100.0,
+        retained_fraction * 100.0,
+        retained_unit,
         stats.bases_seen,
         stats.bases_emitted,
         reads_per_second,
@@ -137,16 +143,19 @@ fn rate(total: u64, elapsed_seconds: f64) -> f64 {
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "progress rates and fractions do not require integer-exact floating-point values"
+)]
 fn u64_to_f64(value: u64) -> f64 {
-    value
-        .to_string()
-        .parse::<f64>()
-        .expect("u64 should always parse into f64")
+    value as f64
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ProgressMode, ProgressReporter, rate};
+    use crate::record::ReadStats;
+
+    use super::{ProgressMode, ProgressReporter, rate, render_message};
 
     #[test]
     fn rate_is_zero_when_elapsed_is_zero() {
@@ -156,6 +165,40 @@ mod tests {
     #[test]
     fn rate_divides_total_by_elapsed() {
         assert!((rate(100, 4.0) - 25.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn merged_pair_progress_reports_pair_retention() {
+        let stats = ReadStats {
+            reads_seen: 2,
+            reads_emitted: 1,
+            pairs_seen: 1,
+            pairs_emitted: 1,
+            ..ReadStats::default()
+        };
+
+        let message = render_message(&stats, 1.0);
+
+        assert!(
+            message.contains("(100.0% pairs retained)"),
+            "unexpected progress message: {message}"
+        );
+    }
+
+    #[test]
+    fn single_end_progress_reports_read_retention() {
+        let stats = ReadStats {
+            reads_seen: 4,
+            reads_emitted: 3,
+            ..ReadStats::default()
+        };
+
+        let message = render_message(&stats, 1.0);
+
+        assert!(
+            message.contains("(75.0% reads retained)"),
+            "unexpected progress message: {message}"
+        );
     }
 
     #[test]
