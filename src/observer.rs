@@ -17,6 +17,7 @@ use crate::{
 };
 
 const INVALID_INPUT_SAMPLE_LIMIT: usize = 20;
+const INVALID_INPUT_WARNING_LIMIT: u64 = 5;
 const INVALID_INPUT_REPORT_KIND: &str = "invalid-input JSONL";
 
 /// Parser-owned evidence captured from one failed physical FASTQ slot.
@@ -259,14 +260,14 @@ impl InvalidInputReport<BufWriter<File>> {
 
 impl<W: Write> InvalidInputReport<W> {
     #[cfg(test)]
-    pub(crate) fn from_writer(path: impl Into<PathBuf>, writer: W) -> Self {
+    fn from_writer(path: impl Into<PathBuf>, writer: W) -> Self {
         Self {
             path: path.into(),
             writer,
         }
     }
 
-    pub(crate) fn write_event(&mut self, event: &InvalidInputEvent) -> Result<()> {
+    fn write_event(&mut self, event: &InvalidInputEvent) -> Result<()> {
         write_invalid_input_event_to(&mut self.writer, &self.path, event)
     }
 
@@ -275,7 +276,7 @@ impl<W: Write> InvalidInputReport<W> {
     }
 }
 
-pub(crate) fn write_invalid_input_event_to(
+fn write_invalid_input_event_to(
     writer: &mut impl Write,
     path: &Path,
     event: &InvalidInputEvent,
@@ -298,7 +299,7 @@ pub(crate) fn write_invalid_input_event_to(
     Ok(())
 }
 
-pub(crate) fn finalize_invalid_input_report(writer: &mut impl Write, path: &Path) -> Result<()> {
+fn finalize_invalid_input_report(writer: &mut impl Write, path: &Path) -> Result<()> {
     writer.flush().map_err(|source| {
         IoError::FinalizeReport {
             report_kind: INVALID_INPUT_REPORT_KIND,
@@ -307,6 +308,75 @@ pub(crate) fn finalize_invalid_input_report(writer: &mut impl Write, path: &Path
         }
         .into()
     })
+}
+
+#[derive(Debug, Default)]
+struct InvalidInputLog {
+    event_counts: BTreeMap<&'static str, u64>,
+    warnings_emitted: u64,
+    warnings_suppressed: bool,
+    samples: Vec<InvalidInputEvent>,
+    samples_truncated: bool,
+    report: Option<InvalidInputReport>,
+}
+
+impl InvalidInputLog {
+    fn install_report(&mut self, report: InvalidInputReport) {
+        self.report = Some(report);
+    }
+
+    fn record(&mut self, event: InvalidInputEvent) -> Result<()> {
+        *self.event_counts.entry(event.kind()).or_default() += 1;
+
+        if let Some(report) = &mut self.report {
+            report.write_event(&event)?;
+        }
+
+        if self.samples.len() < INVALID_INPUT_SAMPLE_LIMIT {
+            self.samples.push(event);
+        } else {
+            self.samples_truncated = true;
+        }
+
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(report) = &mut self.report {
+            report.finish()?;
+        }
+        Ok(())
+    }
+
+    fn should_emit_warning(&mut self) -> bool {
+        if self.warnings_emitted < INVALID_INPUT_WARNING_LIMIT {
+            self.warnings_emitted += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn should_emit_suppressed_notice(&mut self) -> bool {
+        if self.warnings_suppressed {
+            false
+        } else {
+            self.warnings_suppressed = true;
+            true
+        }
+    }
+
+    fn samples(&self) -> &[InvalidInputEvent] {
+        &self.samples
+    }
+
+    fn samples_truncated(&self) -> bool {
+        self.samples_truncated
+    }
+
+    fn event_counts(&self) -> &BTreeMap<&'static str, u64> {
+        &self.event_counts
+    }
 }
 
 /// Mutable observation state for one preprocessing run.
@@ -337,12 +407,7 @@ pub struct RunObserver {
     pub rejection_counts: BTreeMap<&'static str, u64>,
     /// Per-transform counts keyed by stable transform code.
     pub transform_counts: BTreeMap<&'static str, u64>,
-    invalid_input_event_counts: BTreeMap<&'static str, u64>,
-    invalid_input_warnings_emitted: u64,
-    invalid_input_warnings_suppressed: bool,
-    invalid_input_samples: Vec<InvalidInputEvent>,
-    invalid_input_samples_truncated: bool,
-    invalid_input_report: Option<InvalidInputReport>,
+    invalid_input: InvalidInputLog,
 }
 
 impl RunObserver {
@@ -362,18 +427,13 @@ impl RunObserver {
             invalid_pairs: 0,
             rejection_counts: BTreeMap::new(),
             transform_counts: BTreeMap::new(),
-            invalid_input_event_counts: BTreeMap::new(),
-            invalid_input_warnings_emitted: 0,
-            invalid_input_warnings_suppressed: false,
-            invalid_input_samples: Vec::new(),
-            invalid_input_samples_truncated: false,
-            invalid_input_report: None,
+            invalid_input: InvalidInputLog::default(),
         }
     }
 
     /// Install a JSONL report writer for invalid-input events.
     pub fn set_invalid_input_report(&mut self, report: InvalidInputReport) {
-        self.invalid_input_report = Some(report);
+        self.invalid_input.install_report(report);
     }
 
     /// Increment counters for one observed record of `bases` length.
@@ -417,22 +477,7 @@ impl RunObserver {
 
     /// Record one invalid-input event in counters, the detailed report, and bounded samples.
     pub fn record_invalid_input(&mut self, event: InvalidInputEvent) -> Result<()> {
-        *self
-            .invalid_input_event_counts
-            .entry(event.kind())
-            .or_default() += 1;
-
-        if let Some(report) = &mut self.invalid_input_report {
-            report.write_event(&event)?;
-        }
-
-        if self.invalid_input_samples.len() < INVALID_INPUT_SAMPLE_LIMIT {
-            self.invalid_input_samples.push(event);
-        } else {
-            self.invalid_input_samples_truncated = true;
-        }
-
-        Ok(())
+        self.invalid_input.record(event)
     }
 
     /// Record and present a recoverable single-end parser failure.
@@ -554,45 +599,335 @@ impl RunObserver {
 
     /// Return `true` when another invalid-input warning may be emitted.
     pub fn should_emit_invalid_input_warning(&mut self) -> bool {
-        const WARNING_LIMIT: u64 = 5;
-        if self.invalid_input_warnings_emitted < WARNING_LIMIT {
-            self.invalid_input_warnings_emitted += 1;
-            true
-        } else {
-            false
-        }
+        self.invalid_input.should_emit_warning()
     }
 
     /// Return `true` once when invalid-input warning suppression should be announced.
     pub fn should_emit_invalid_input_suppressed_notice(&mut self) -> bool {
-        if self.invalid_input_warnings_suppressed {
-            false
-        } else {
-            self.invalid_input_warnings_suppressed = true;
-            true
-        }
+        self.invalid_input.should_emit_suppressed_notice()
     }
 
     /// Flush the invalid-input report on successful completion.
     pub fn finish_invalid_input_report(&mut self) -> Result<()> {
-        if let Some(report) = &mut self.invalid_input_report {
-            report.finish()?;
-        }
-        Ok(())
+        self.invalid_input.finish()
     }
 
     /// Return the bounded invalid-input samples captured for the run summary.
     pub fn invalid_input_samples(&self) -> &[InvalidInputEvent] {
-        &self.invalid_input_samples
+        self.invalid_input.samples()
     }
 
     /// Return whether invalid-input samples exceeded their in-memory bound.
     pub fn invalid_input_samples_truncated(&self) -> bool {
-        self.invalid_input_samples_truncated
+        self.invalid_input.samples_truncated()
     }
 
     /// Return invalid-input event counts keyed by stable event code.
     pub fn invalid_input_event_counts(&self) -> &BTreeMap<&'static str, u64> {
-        &self.invalid_input_event_counts
+        self.invalid_input.event_counts()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs, io,
+        io::Write,
+        path::{Path, PathBuf},
+    };
+
+    use tempfile::tempdir;
+
+    use super::{
+        InvalidInputEvent, InvalidInputLog, InvalidInputReport, MateSide, RecordParseFailure,
+        RunObserver, finalize_invalid_input_report, write_invalid_input_event_to,
+    };
+    use crate::error::{self, IoError, ReportWriteError, RunError};
+
+    #[derive(Debug)]
+    struct FailingWriter {
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    #[derive(Debug)]
+    struct NewlineFailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "test write failure",
+                ))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "test flush failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Write for NewlineFailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes == b"\n" {
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "test newline failure",
+                ))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn terminal_event() -> InvalidInputEvent {
+        InvalidInputEvent::SingleRecordParseFailure {
+            source: "local:reads.fastq".to_owned(),
+            failure: RecordParseFailure {
+                parser_kind: "unequal_lengths".to_owned(),
+                message: "sequence and quality lengths differ".to_owned(),
+                line: Some(1),
+            },
+            reads_seen: 1,
+            continued: false,
+        }
+    }
+
+    #[test]
+    fn invalid_input_report_flushes_terminal_events_before_drop() {
+        let temp = tempdir().expect("tempdir should be created");
+        let path = temp.path().join("invalid-input.jsonl");
+        let mut observer = RunObserver::new("ena:SRR000001".to_owned());
+        observer.set_invalid_input_report(
+            InvalidInputReport::create(&path).expect("invalid-input report should be created"),
+        );
+
+        observer
+            .record_invalid_input(InvalidInputEvent::SingleRecordParseFailure {
+                source: "ena:SRR000001".to_owned(),
+                failure: RecordParseFailure {
+                    parser_kind: "unequal_lengths".to_owned(),
+                    message: "Sequence length is 4 but quality length is 1".to_owned(),
+                    line: Some(1),
+                },
+                reads_seen: 0,
+                continued: false,
+            })
+            .expect("terminal invalid-input event should be reported");
+
+        let report = fs::read_to_string(path)
+            .expect("terminal invalid-input report should be readable before observer is dropped");
+        assert!(report.contains("\"kind\":\"record_parse_failure\""));
+        assert!(report.contains("\"continued\":false"));
+        assert!(report.ends_with('\n'));
+    }
+
+    #[test]
+    fn invalid_input_report_flushes_nonterminal_events_immediately() {
+        let temp = tempdir().expect("tempdir should be created");
+        let path = temp.path().join("invalid-input.jsonl");
+        let mut observer = RunObserver::new("local:reads.fastq".to_owned());
+        observer.set_invalid_input_report(
+            InvalidInputReport::create(&path).expect("invalid-input report should be created"),
+        );
+
+        observer
+            .record_invalid_input(InvalidInputEvent::SequenceQualityLengthMismatch {
+                source: "local:reads.fastq".to_owned(),
+                mate: None,
+                header: "bad".to_owned(),
+                sequence_len: 4,
+                quality_len: 1,
+                reads_seen: 1,
+                pairs_seen: None,
+                continued: true,
+            })
+            .expect("nonterminal invalid-input event should be reported");
+
+        let report = fs::read_to_string(path)
+            .expect("nonterminal invalid-input report should be readable before finish");
+        assert!(report.contains("\"kind\":\"sequence_quality_length_mismatch\""));
+        assert!(report.ends_with('\n'));
+    }
+
+    #[test]
+    fn invalid_input_report_write_failure_retains_path_and_json_source() {
+        let path = Path::new("invalid-input.jsonl");
+        let mut writer = FailingWriter {
+            fail_write: true,
+            fail_flush: false,
+        };
+
+        let error = write_invalid_input_event_to(&mut writer, path, &terminal_event())
+            .expect_err("requested report write failure should be required I/O");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::WriteReport {
+                report_kind: "invalid-input JSONL",
+                path: observed_path,
+                source: ReportWriteError::Json(source),
+            }) if observed_path == path && source.io_error_kind() == Some(io::ErrorKind::StorageFull)
+        ));
+    }
+
+    #[test]
+    fn invalid_input_report_newline_failure_retains_io_source() {
+        let path = Path::new("invalid-input.jsonl");
+        let mut writer = NewlineFailingWriter;
+
+        let error = write_invalid_input_event_to(&mut writer, path, &terminal_event())
+            .expect_err("JSONL newline failure should be required I/O");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::WriteReport {
+                report_kind: "invalid-input JSONL",
+                path: observed_path,
+                source: ReportWriteError::Bytes(source),
+            }) if observed_path == path && source.kind() == io::ErrorKind::StorageFull
+        ));
+    }
+
+    #[test]
+    fn invalid_input_report_event_flush_failure_is_finalization() {
+        let path = Path::new("invalid-input.jsonl");
+        let mut writer = FailingWriter {
+            fail_write: false,
+            fail_flush: true,
+        };
+
+        let error = write_invalid_input_event_to(&mut writer, path, &terminal_event())
+            .expect_err("event flush failure should be required I/O");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::FinalizeReport {
+                report_kind: "invalid-input JSONL",
+                path: observed_path,
+                source,
+            }) if observed_path == path && source.kind() == io::ErrorKind::StorageFull
+        ));
+    }
+
+    #[test]
+    fn invalid_input_report_final_flush_failure_is_finalization() {
+        let path = Path::new("invalid-input.jsonl");
+        let mut writer = FailingWriter {
+            fail_write: false,
+            fail_flush: true,
+        };
+
+        let error = finalize_invalid_input_report(&mut writer, path)
+            .expect_err("requested report flush failure should be required I/O");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::FinalizeReport {
+                report_kind: "invalid-input JSONL",
+                path: observed_path,
+                source,
+            }) if observed_path == path && source.kind() == io::ErrorKind::StorageFull
+        ));
+    }
+
+    #[test]
+    fn invalid_input_report_create_failure_retains_requested_path() {
+        let temp = tempdir().expect("tempdir should be created");
+        let path = temp
+            .path()
+            .join("missing-parent")
+            .join("invalid-input.jsonl");
+
+        let error = InvalidInputReport::create(&path)
+            .expect_err("report under missing parent should fail to open");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::CreateReport {
+                report_kind: "invalid-input JSONL",
+                path: observed_path,
+                source,
+            }) if observed_path == path && source.kind() == io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn invalid_input_report_from_writer_uses_fixture_path_for_typed_errors() {
+        let path = PathBuf::from("fixture-invalid-input.jsonl");
+        let mut report = InvalidInputReport::from_writer(
+            path.clone(),
+            FailingWriter {
+                fail_write: false,
+                fail_flush: true,
+            },
+        );
+
+        let error = report
+            .write_event(&terminal_event())
+            .expect_err("fixture writer flush failure should retain fixture path");
+        assert!(matches!(
+            error,
+            RunError::Io(IoError::FinalizeReport {
+                report_kind: "invalid-input JSONL",
+                path: observed_path,
+                source,
+            }) if observed_path == path && source.kind() == io::ErrorKind::StorageFull
+        ));
+    }
+
+    #[test]
+    fn non_io_serialization_defect_is_internal() {
+        let source = serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("truncated JSON should produce a non-I/O serde_json error");
+        let error = error::constructors::json_report_error(
+            "invalid-input JSONL",
+            Path::new("invalid-input.jsonl"),
+            source,
+        );
+
+        assert!(matches!(error, RunError::Internal(_)));
+    }
+
+    #[test]
+    fn invalid_input_log_bounds_samples_and_counts_all_events() {
+        let mut log = InvalidInputLog::default();
+
+        for index in 0..25 {
+            log.record(InvalidInputEvent::MissingMate {
+                source: "local-paired:left.fastq|right.fastq".to_owned(),
+                present_mate: MateSide::Left,
+                header: format!("read{index}"),
+                reads_seen: index + 1,
+                pairs_seen: index,
+                continued: true,
+            })
+            .expect("invalid-input event should be recorded");
+        }
+
+        assert_eq!(log.samples().len(), 20);
+        assert!(log.samples_truncated());
+        assert_eq!(log.event_counts()["missing_mate"], 25);
+    }
+
+    #[test]
+    fn invalid_input_log_limits_warnings_and_emits_one_suppression_notice() {
+        let mut log = InvalidInputLog::default();
+
+        for _ in 0..5 {
+            assert!(log.should_emit_warning());
+        }
+        assert!(!log.should_emit_warning());
+        assert!(log.should_emit_suppressed_notice());
+        assert!(!log.should_emit_suppressed_notice());
     }
 }
