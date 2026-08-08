@@ -5,12 +5,12 @@ use std::str;
 use libpairassembly::{Assembler, CorrectionParams, OverlapParams, PairInput, SeqRecordView};
 
 use crate::{
-    error::{IndeterminateInputError, InternalError, MalformedInputError, Result, RunError},
+    error::{self, InternalError, Result},
     plan::{
         BuildPlan, IntoExecutionStep, PairTransform, PairTransformResult, PairTransformStep,
-        RecordPair, TransformArena,
+        TransformArena,
     },
-    record::{InputSource, RecordProvenance, RecordView},
+    record::{RecordPair, RecordView},
 };
 
 /// Pair-aware transform that attempts to merge paired-end reads.
@@ -72,8 +72,8 @@ impl PairTransform for MergePairs {
         arena: &'a TransformArena,
     ) -> Result<PairTransformResult<'a>> {
         let input = PairInput::new(
-            AssemblyRecordView::try_from_record(pair.left)?,
-            AssemblyRecordView::try_from_record(pair.right)?,
+            AssemblyRecordView::try_from_record(pair.left())?,
+            AssemblyRecordView::try_from_record(pair.right())?,
         );
 
         let Some(merged) = self
@@ -87,18 +87,12 @@ impl PairTransform for MergePairs {
             });
         };
 
-        let provenance = pair.left.provenance().map(|provenance| RecordProvenance {
-            source: provenance.source,
-            mate: None,
-        });
-        let mut record = RecordView::new(
+        let record = RecordView::new(
             arena.alloc_slice_copy(merged.id().as_bytes()),
             arena.alloc_slice_copy(merged.sequence_bytes()),
             arena.alloc_slice_copy(merged.quality_bytes()),
-        );
-        if let Some(provenance) = provenance {
-            record = record.with_provenance(provenance);
-        }
+        )
+        .inherit_source(pair.left());
 
         Ok(PairTransformResult::Single {
             record,
@@ -126,29 +120,16 @@ impl<T> MergePairsTransform for T where T: BuildPlan {}
 impl<'a> AssemblyRecordView<'a> {
     fn try_from_record(record: RecordView<'a>) -> Result<Self> {
         Ok(Self {
-            id: str::from_utf8(record.pair_key())
-                .map_err(|source| invalid_utf8_error(record, "read identifier", source))?,
-            sequence: str::from_utf8(record.sequence())
-                .map_err(|source| invalid_utf8_error(record, "read sequence", source))?,
-            quality: str::from_utf8(record.quality())
-                .map_err(|source| invalid_utf8_error(record, "read quality", source))?,
+            id: str::from_utf8(record.pair_key()).map_err(|source| {
+                error::constructors::invalid_utf8_error(record, "read identifier", source)
+            })?,
+            sequence: str::from_utf8(record.sequence()).map_err(|source| {
+                error::constructors::invalid_utf8_error(record, "read sequence", source)
+            })?,
+            quality: str::from_utf8(record.quality()).map_err(|source| {
+                error::constructors::invalid_utf8_error(record, "read quality", source)
+            })?,
         })
-    }
-}
-
-fn invalid_utf8_error(
-    record: RecordView<'_>,
-    field: &'static str,
-    source: std::str::Utf8Error,
-) -> RunError {
-    match record.provenance().map(|provenance| provenance.source) {
-        Some(InputSource::Ena { accession }) => IndeterminateInputError::InvalidUtf8 {
-            accession: accession.to_owned(),
-            field,
-            source,
-        }
-        .into(),
-        _ => MalformedInputError::InvalidUtf8 { field, source }.into(),
     }
 }
 
@@ -168,23 +149,26 @@ impl SeqRecordView for AssemblyRecordView<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::plan::{PairTransform, TransformArena};
+    use crate::{
+        error::{IndeterminateInputError, MalformedInputError, RunError},
+        plan::{PairTransform, TransformArena},
+        record::InputSource,
+    };
 
     use super::*;
 
     fn pair() -> RecordPair<'static> {
-        RecordPair {
-            left: RecordView::new(
-                b"read-1/1",
-                b"ACGTTGCAGTACGATCGTACGGAATTCGCCGATGACTGACCTAGGTCAGTACGATC",
-                b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII",
-            ),
-            right: RecordView::new(
-                b"read-1/2",
-                b"GATCGTACTGACCTAGGTCAGTCATCGGCGAATTCCGTACGATCGTACTGCAACGT",
-                b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII",
-            ),
-        }
+        let left = RecordView::new(
+            b"read-1/1",
+            b"ACGTTGCAGTACGATCGTACGGAATTCGCCGATGACTGACCTAGGTCAGTACGATC",
+            b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII",
+        );
+        let right = RecordView::new(
+            b"read-1/2",
+            b"GATCGTACTGACCTAGGTCAGTCATCGGCGAATTCCGTACGATCGTACTGCAACGT",
+            b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII",
+        );
+        RecordPair::try_new(left.into(), right.into()).expect("fixture pair should be valid")
     }
 
     #[test]
@@ -217,11 +201,8 @@ mod tests {
                 if matches!(*error, MalformedInputError::InvalidUtf8 { .. })
         ));
 
-        let ena = RecordView::new(&[0xff], b"ACGT", b"IIII").with_provenance(RecordProvenance {
-            source: InputSource::Ena {
-                accession: "SRR35939766",
-            },
-            mate: Some(crate::record::MateSide::Left),
+        let ena = RecordView::new(&[0xff], b"ACGT", b"IIII").with_source(InputSource::Ena {
+            accession: "SRR35939766",
         });
         let Err(ena_error) = AssemblyRecordView::try_from_record(ena) else {
             panic!("invalid ENA identifier should fail UTF-8 conversion");

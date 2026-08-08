@@ -13,32 +13,26 @@ use crate::{
     cli::{AdmissionPolicy, Cli, Ingress, UiPolicy},
     ena::{Accession, EnaClient, EnaInput},
     error::{
-        EnaContentProblem, IndeterminateInputError, InternalError, IoError, MalformedInputError,
-        Result, RunError, UnavailableInputError, UsageError,
+        self, InputOrigin, PairConstructionError, PairedInputLayout, Result, UnavailableInputError,
+        UsageError,
     },
     filter::{MaxNsFilter, MinEntropyFilter, MinLengthFilter, MinMeanQualityFilter},
+    observer::{InvalidInputEvent, InvalidInputReport, RunObserver},
     output::{OutputArgs, PairedOutputHandle, SingleOutputHandle, UnitOutput},
     pair_merge::MergePairsTransform,
-    plan::{
-        BuildPlan, Execute, Execution, Logical, OrphanPolicy, Plan, RecordPair, TransformArena,
-    },
+    plan::{BuildPlan, Execute, Execution, Logical, OrphanPolicy, Plan, TransformArena},
     progress::ProgressReporter,
     quality::{QualityBinCount, QualityBinTransform, QualityTrimTransform},
-    record::{
-        AdmissionEvent, AdmissionReport, InputSource, MateSide, ReadStats, RecordProvenance,
-        RecordView,
-    },
+    record::{InputSource, LeftMate, MateRecord, MateSide, RecordPair, RecordView, RightMate},
     report::{self, RunContext as RunSummaryContext, RunLayout},
 };
-
-const ADMISSION_WARNING_LIMIT: u64 = 5;
 
 struct SingleEnd;
 
 struct PairedEnd;
 
 trait RecordLayout {
-    type Source: RunSource;
+    type Source;
     type Readers;
     type Output;
 }
@@ -53,18 +47,6 @@ impl RecordLayout for PairedEnd {
     type Source = PairedSource;
     type Readers = PairedReaders;
     type Output = PairedOutputHandle;
-}
-
-trait RunSource {
-    fn input_label(&self) -> String;
-    fn input_origin(&self, mate: &'static str) -> InputOrigin<'_>;
-    fn summary_context(&self) -> RunSummaryContext;
-}
-
-#[derive(Clone, Copy)]
-enum InputOrigin<'source> {
-    Ena(&'source Accession),
-    Local(&'source std::path::Path),
 }
 
 enum SingleSource {
@@ -86,18 +68,11 @@ enum PairedReaders {
     },
 }
 
-impl RunSource for SingleSource {
+impl SingleSource {
     fn input_label(&self) -> String {
         match self {
             Self::Ena { accession } => format!("ena:{accession}"),
             Self::Local { input } => format!("local:{}", input.display()),
-        }
-    }
-
-    fn input_origin(&self, _mate: &'static str) -> InputOrigin<'_> {
-        match self {
-            Self::Ena { accession } => InputOrigin::Ena(accession),
-            Self::Local { input } => InputOrigin::Local(input),
         }
     }
 
@@ -119,26 +94,25 @@ impl RunSource for SingleSource {
             },
         }
     }
-}
 
-impl SingleSource {
-    fn provenance(&self) -> RecordProvenance<'_> {
+    fn input_origin(&self) -> InputOrigin<'_> {
         match self {
-            Self::Ena { accession } => RecordProvenance {
-                source: InputSource::Ena {
-                    accession: accession.as_str(),
-                },
-                mate: None,
+            Self::Ena { accession } => InputOrigin::Ena(accession),
+            Self::Local { input } => InputOrigin::Local(input),
+        }
+    }
+
+    fn input_source(&self) -> InputSource<'_> {
+        match self {
+            Self::Ena { accession } => InputSource::Ena {
+                accession: accession.as_str(),
             },
-            Self::Local { input } => RecordProvenance {
-                source: InputSource::LocalSingle { input },
-                mate: None,
-            },
+            Self::Local { input } => InputSource::LocalSingle { input },
         }
     }
 }
 
-impl RunSource for PairedSource {
+impl PairedSource {
     fn input_label(&self) -> String {
         match self {
             Self::Ena { accession } => format!("ena:{accession}"),
@@ -146,15 +120,6 @@ impl RunSource for PairedSource {
             Self::LocalSplit { input1, input2 } => {
                 format!("local-paired:{}|{}", input1.display(), input2.display())
             }
-        }
-    }
-
-    fn input_origin(&self, mate: &'static str) -> InputOrigin<'_> {
-        match self {
-            Self::Ena { accession } => InputOrigin::Ena(accession),
-            Self::LocalInterleaved { input } => InputOrigin::Local(input),
-            Self::LocalSplit { input2, .. } if mate == "right" => InputOrigin::Local(input2),
-            Self::LocalSplit { input1, .. } => InputOrigin::Local(input1),
         }
     }
 
@@ -183,25 +148,37 @@ impl RunSource for PairedSource {
             },
         }
     }
-}
 
-impl PairedSource {
-    fn provenance(&self, mate: MateSide) -> RecordProvenance<'_> {
+    fn left_input_origin(&self) -> InputOrigin<'_> {
         match self {
-            Self::Ena { accession } => RecordProvenance {
-                source: InputSource::Ena {
-                    accession: accession.as_str(),
-                },
-                mate: Some(mate),
+            Self::Ena { accession } => InputOrigin::Ena(accession),
+            Self::LocalInterleaved { input } => InputOrigin::Local(input),
+            Self::LocalSplit { input1, .. } => InputOrigin::Local(input1),
+        }
+    }
+
+    fn right_input_origin(&self) -> InputOrigin<'_> {
+        match self {
+            Self::Ena { accession } => InputOrigin::Ena(accession),
+            Self::LocalInterleaved { input } => InputOrigin::Local(input),
+            Self::LocalSplit { input2, .. } => InputOrigin::Local(input2),
+        }
+    }
+
+    const fn input_layout(&self) -> PairedInputLayout {
+        match self {
+            Self::LocalInterleaved { .. } => PairedInputLayout::Interleaved,
+            Self::Ena { .. } | Self::LocalSplit { .. } => PairedInputLayout::Split,
+        }
+    }
+
+    fn input_source(&self) -> InputSource<'_> {
+        match self {
+            Self::Ena { accession } => InputSource::Ena {
+                accession: accession.as_str(),
             },
-            Self::LocalInterleaved { input } => RecordProvenance {
-                source: InputSource::LocalInterleavedPaired { input },
-                mate: Some(mate),
-            },
-            Self::LocalSplit { input1, input2 } => RecordProvenance {
-                source: InputSource::LocalPaired { input1, input2 },
-                mate: Some(mate),
-            },
+            Self::LocalInterleaved { input } => InputSource::LocalInterleavedPaired { input },
+            Self::LocalSplit { input1, input2 } => InputSource::LocalPaired { input1, input2 },
         }
     }
 }
@@ -400,15 +377,14 @@ impl RunContext<SingleEnd> {
         let mut plan = config.build_plan(RunLayout::Single)?;
 
         let mut arena = TransformArena::new();
-        let mut stats = read_stats(config)?;
+        let mut observer = run_observer(config, source.input_label())?;
         // build out the mutable state needed to run the application loop
         let mut parser = parse_fastx_reader(reader).map_err(|source_error| {
-            parser_error(
-                source.input_origin("single"),
+            error::constructors::single_parser_error(
+                source.input_origin(),
                 source.input_label(),
-                "single",
-                config.admission_policy,
-                &stats,
+                &config.admission_policy,
+                &observer,
                 source_error,
             )
         })?;
@@ -417,25 +393,55 @@ impl RunContext<SingleEnd> {
         let admission = RecordAdmission::new(&source, config.admission_policy);
 
         while let Some(next_record) = parser.next() {
-            let parsed_record = admission.parse("single", &mut stats, next_record)?;
-            let Some(record) = admission.single(&parsed_record, &mut stats)? else {
+            let Some(parsed_record) = (match next_record {
+                Ok(record) if record.format() == Format::Fastq => Some(record),
+                Ok(record) => {
+                    return Err(error::constructors::single_unsupported_format_error(
+                        source.input_origin(),
+                        source.input_label(),
+                        record.format(),
+                    ));
+                }
+                Err(error)
+                    if config.admission_policy == AdmissionPolicy::Skip
+                        && error.kind == ParseErrorKind::UnequalLengths =>
+                {
+                    observer.record_unparsed_seen();
+                    observer.recoverable_single_parser_failure(&error)?;
+                    None
+                }
+                Err(error) => {
+                    return single_parser_failure(
+                        &source,
+                        config.admission_policy,
+                        &mut observer,
+                        error,
+                    );
+                }
+            }) else {
+                continue;
+            };
+            let Some(record) = admission.single(&parsed_record, &mut observer)? else {
                 continue;
             };
             arena.reset();
 
-            let outcome = plan.execute(record, &mut arena, &mut stats)?;
-            output.write_outcome(&outcome, &mut stats)?;
+            let outcome = plan.execute(record, &mut arena, &mut observer)?;
+            output.write_outcome(&outcome, &mut observer)?;
 
-            progress.maybe_report(&stats);
+            progress.maybe_report(&observer);
         }
 
         progress.finish();
         let output_result = output.finish();
-        let report_result = stats.finish_admission_report();
+        let report_result = observer.finish_invalid_input_report();
         output_result?;
         report_result?;
-        let summary =
-            report::RunSummary::from_stats(source.summary_context(), &stats, started_at.elapsed());
+        let summary = report::RunSummary::from_observer(
+            source.summary_context(),
+            &observer,
+            started_at.elapsed(),
+        );
         if ui.show_summary {
             report::print_summary(&summary);
         }
@@ -519,7 +525,7 @@ impl RunContext<PairedEnd> {
         } = self;
         let mut plan = config.build_plan(RunLayout::Paired)?;
         let mut arena = TransformArena::new();
-        let mut stats = read_stats(config)?;
+        let mut observer = run_observer(config, source.input_label())?;
         let mut progress = ProgressReporter::new(ui.progress_mode, config.progress_every);
         let started_at = Instant::now();
         let admission = RecordAdmission::<PairedEnd>::new(&source, config.admission_policy);
@@ -527,22 +533,20 @@ impl RunContext<PairedEnd> {
         match readers {
             PairedReaders::Split { left, right } => {
                 let mut parser_r1 = parse_fastx_reader(left).map_err(|source_error| {
-                    parser_error(
-                        source.input_origin("left"),
+                    error::constructors::left_parser_error(
+                        source.left_input_origin(),
                         source.input_label(),
-                        "left",
-                        config.admission_policy,
-                        &stats,
+                        &config.admission_policy,
+                        &observer,
                         source_error,
                     )
                 })?;
                 let mut parser_r2 = parse_fastx_reader(right).map_err(|source_error| {
-                    parser_error(
-                        source.input_origin("right"),
+                    error::constructors::right_parser_error(
+                        source.right_input_origin(),
                         source.input_label(),
-                        "right",
-                        config.admission_policy,
-                        &stats,
+                        &config.admission_policy,
+                        &observer,
                         source_error,
                     )
                 })?;
@@ -553,58 +557,213 @@ impl RunContext<PairedEnd> {
 
                     match (next_r1, next_r2) {
                         (Some(record_r1), Some(record_r2)) => {
-                            let parsed_r1 = admission.parse("left", &mut stats, record_r1)?;
-                            let left = admission.paired_record(
-                                &parsed_r1,
-                                MateSide::Left,
-                                "left",
-                                &stats,
-                            )?;
-                            stats.record_seen(left.sequence().len());
+                            observer.pairs_seen += 1;
+                            let (parsed_r1, left_failure) = match record_r1 {
+                                Ok(record) if record.format() == Format::Fastq => {
+                                    observer.record_seen(record.raw_seq().len());
+                                    (Some(record), None)
+                                }
+                                Ok(record) => {
+                                    return Err(
+                                        error::constructors::left_unsupported_format_error(
+                                            source.left_input_origin(),
+                                            source.input_label(),
+                                            record.format(),
+                                        ),
+                                    );
+                                }
+                                Err(error)
+                                    if config.admission_policy == AdmissionPolicy::Skip
+                                        && error.kind == ParseErrorKind::UnequalLengths =>
+                                {
+                                    observer.record_unparsed_seen();
+                                    (None, Some(error))
+                                }
+                                Err(error) => {
+                                    return left_parser_failure(
+                                        &source,
+                                        config.admission_policy,
+                                        &mut observer,
+                                        error,
+                                    );
+                                }
+                            };
+                            let (parsed_r2, right_failure) = match record_r2 {
+                                Ok(record) if record.format() == Format::Fastq => {
+                                    observer.record_seen(record.raw_seq().len());
+                                    (Some(record), None)
+                                }
+                                Ok(record) => {
+                                    return Err(
+                                        error::constructors::right_unsupported_format_error(
+                                            source.right_input_origin(),
+                                            source.input_label(),
+                                            record.format(),
+                                        ),
+                                    );
+                                }
+                                Err(error)
+                                    if config.admission_policy == AdmissionPolicy::Skip
+                                        && error.kind == ParseErrorKind::UnequalLengths =>
+                                {
+                                    observer.record_unparsed_seen();
+                                    (None, Some(error))
+                                }
+                                Err(error) => {
+                                    let right_has_record_slot =
+                                        parser_failure_has_record_slot(&error);
+                                    if left_failure.is_some() || right_has_record_slot {
+                                        observer.invalid_pairs += 1;
+                                    }
+                                    if right_has_record_slot {
+                                        observer.record_unparsed_seen();
+                                    }
+                                    if let Some(left_failure) = &left_failure {
+                                        observer.recoverable_paired_parser_failure(
+                                            MateSide::Left,
+                                            left_failure,
+                                            false,
+                                        )?;
+                                    }
+                                    return finish_right_parser_failure(
+                                        &source,
+                                        config.admission_policy,
+                                        &mut observer,
+                                        error,
+                                    );
+                                }
+                            };
 
-                            let parsed_r2 = admission.parse("right", &mut stats, record_r2)?;
-                            let right = admission.paired_record(
-                                &parsed_r2,
-                                MateSide::Right,
-                                "right",
-                                &stats,
-                            )?;
-                            stats.record_seen(right.sequence().len());
+                            if let Some(left_failure) = &left_failure {
+                                observer.recoverable_paired_parser_failure(
+                                    MateSide::Left,
+                                    left_failure,
+                                    true,
+                                )?;
+                            }
+                            if let Some(right_failure) = &right_failure {
+                                observer.recoverable_paired_parser_failure(
+                                    MateSide::Right,
+                                    right_failure,
+                                    true,
+                                )?;
+                            }
 
-                            let Some(pair) = admission.admit_pair(left, right, &mut stats)? else {
+                            let left = match parsed_r1.as_ref() {
+                                Some(parsed) => {
+                                    let record = admission.left_record(parsed, &observer)?;
+                                    Some(record)
+                                }
+                                None => None,
+                            };
+                            let right = match parsed_r2.as_ref() {
+                                Some(parsed) => {
+                                    let record = admission.right_record(parsed, &observer)?;
+                                    Some(record)
+                                }
+                                None => None,
+                            };
+
+                            let (Some(left), Some(right)) = (left, right) else {
+                                observer.invalid_pairs += 1;
+                                continue;
+                            };
+
+                            let Some(pair) = admission.admit_pair(left, right, &mut observer)?
+                            else {
                                 continue;
                             };
 
                             arena.reset();
-                            let outcome = plan.execute(pair, &mut arena, &mut stats)?;
-                            output.write_outcome(&outcome, &mut stats)?;
-                            progress.maybe_report(&stats);
+                            let outcome = plan.execute(pair, &mut arena, &mut observer)?;
+                            output.write_outcome(&outcome, &mut observer)?;
+                            progress.maybe_report(&observer);
                         }
                         (None, None) => break,
                         (Some(record_r1), None) => {
-                            let parsed = admission.parse("left", &mut stats, record_r1)?;
-                            admission.missing_mate(&parsed, MateSide::Left, "left", &mut stats)?;
+                            let parsed = match record_r1 {
+                                Ok(record) if record.format() == Format::Fastq => Some(record),
+                                Ok(record) => {
+                                    return Err(
+                                        error::constructors::left_unsupported_format_error(
+                                            source.left_input_origin(),
+                                            source.input_label(),
+                                            record.format(),
+                                        ),
+                                    );
+                                }
+                                Err(error)
+                                    if config.admission_policy == AdmissionPolicy::Skip
+                                        && error.kind == ParseErrorKind::UnequalLengths =>
+                                {
+                                    observer.record_unparsed_seen();
+                                    observer.recoverable_paired_parser_failure(
+                                        MateSide::Left,
+                                        &error,
+                                        true,
+                                    )?;
+                                    None
+                                }
+                                Err(error) => {
+                                    return left_parser_failure(
+                                        &source,
+                                        config.admission_policy,
+                                        &mut observer,
+                                        error,
+                                    );
+                                }
+                            };
+                            if let Some(parsed) = parsed.as_ref() {
+                                admission.missing_right(parsed, &mut observer)?;
+                            }
                         }
                         (None, Some(record_r2)) => {
-                            let parsed = admission.parse("right", &mut stats, record_r2)?;
-                            admission.missing_mate(
-                                &parsed,
-                                MateSide::Right,
-                                "right",
-                                &mut stats,
-                            )?;
+                            let parsed = match record_r2 {
+                                Ok(record) if record.format() == Format::Fastq => Some(record),
+                                Ok(record) => {
+                                    return Err(
+                                        error::constructors::right_unsupported_format_error(
+                                            source.right_input_origin(),
+                                            source.input_label(),
+                                            record.format(),
+                                        ),
+                                    );
+                                }
+                                Err(error)
+                                    if config.admission_policy == AdmissionPolicy::Skip
+                                        && error.kind == ParseErrorKind::UnequalLengths =>
+                                {
+                                    observer.record_unparsed_seen();
+                                    observer.recoverable_paired_parser_failure(
+                                        MateSide::Right,
+                                        &error,
+                                        true,
+                                    )?;
+                                    None
+                                }
+                                Err(error) => {
+                                    return right_parser_failure(
+                                        &source,
+                                        config.admission_policy,
+                                        &mut observer,
+                                        error,
+                                    );
+                                }
+                            };
+                            if let Some(parsed) = parsed.as_ref() {
+                                admission.missing_left(parsed, &mut observer)?;
+                            }
                         }
                     }
                 }
             }
             PairedReaders::Interleaved(reader) => {
                 let mut parser = parse_fastx_reader(reader).map_err(|source_error| {
-                    parser_error(
-                        source.input_origin("left"),
+                    error::constructors::left_parser_error(
+                        source.left_input_origin(),
                         source.input_label(),
-                        "left",
-                        config.admission_policy,
-                        &stats,
+                        &config.admission_policy,
+                        &observer,
                         source_error,
                     )
                 })?;
@@ -616,40 +775,150 @@ impl RunContext<PairedEnd> {
                         break;
                     };
 
-                    let parsed_left = admission.parse("left", &mut stats, left_record)?;
-                    let left =
-                        admission.buffered_left_record(&parsed_left, &stats, &mut left_buffer)?;
-                    stats.record_seen(left.sequence().len());
+                    let (parsed_left, left_failure) = match left_record {
+                        Ok(record) if record.format() == Format::Fastq => (Some(record), None),
+                        Ok(record) => {
+                            return Err(error::constructors::left_unsupported_format_error(
+                                source.left_input_origin(),
+                                source.input_label(),
+                                record.format(),
+                            ));
+                        }
+                        Err(error)
+                            if config.admission_policy == AdmissionPolicy::Skip
+                                && error.kind == ParseErrorKind::UnequalLengths =>
+                        {
+                            observer.record_unparsed_seen();
+                            (None, Some(error))
+                        }
+                        Err(error) => {
+                            return left_parser_failure(
+                                &source,
+                                config.admission_policy,
+                                &mut observer,
+                                error,
+                            );
+                        }
+                    };
+                    let left = match parsed_left {
+                        Some(parsed) => {
+                            let record = admission.buffered_left_record(
+                                &parsed,
+                                &observer,
+                                &mut left_buffer,
+                            )?;
+                            observer.record_seen(record.into_record().sequence().len());
+                            Some(record)
+                        }
+                        None => None,
+                    };
 
                     let next_right = parser.next();
                     let Some(right_record) = next_right else {
-                        admission.missing_mate_record(left, &mut stats)?;
+                        if let Some(left_failure) = &left_failure {
+                            observer.recoverable_paired_parser_failure(
+                                MateSide::Left,
+                                left_failure,
+                                true,
+                            )?;
+                        }
+                        if let Some(left) = left {
+                            admission.missing_right_record(left, &mut observer)?;
+                        }
                         break;
                     };
-                    let parsed_right = admission.parse("right", &mut stats, right_record)?;
-                    let right =
-                        admission.paired_record(&parsed_right, MateSide::Right, "right", &stats)?;
-                    stats.record_seen(right.sequence().len());
+                    observer.pairs_seen += 1;
+                    let (parsed_right, right_failure) = match right_record {
+                        Ok(record) if record.format() == Format::Fastq => {
+                            observer.record_seen(record.raw_seq().len());
+                            (Some(record), None)
+                        }
+                        Ok(record) => {
+                            return Err(error::constructors::right_unsupported_format_error(
+                                source.right_input_origin(),
+                                source.input_label(),
+                                record.format(),
+                            ));
+                        }
+                        Err(error)
+                            if config.admission_policy == AdmissionPolicy::Skip
+                                && error.kind == ParseErrorKind::UnequalLengths =>
+                        {
+                            observer.record_unparsed_seen();
+                            (None, Some(error))
+                        }
+                        Err(error) => {
+                            let right_has_record_slot = parser_failure_has_record_slot(&error);
+                            if left_failure.is_some() || right_has_record_slot {
+                                observer.invalid_pairs += 1;
+                            }
+                            if right_has_record_slot {
+                                observer.record_unparsed_seen();
+                            }
+                            if let Some(left_failure) = &left_failure {
+                                observer.recoverable_paired_parser_failure(
+                                    MateSide::Left,
+                                    left_failure,
+                                    false,
+                                )?;
+                            }
+                            return finish_right_parser_failure(
+                                &source,
+                                config.admission_policy,
+                                &mut observer,
+                                error,
+                            );
+                        }
+                    };
+                    if let Some(left_failure) = &left_failure {
+                        observer.recoverable_paired_parser_failure(
+                            MateSide::Left,
+                            left_failure,
+                            true,
+                        )?;
+                    }
+                    if let Some(right_failure) = &right_failure {
+                        observer.recoverable_paired_parser_failure(
+                            MateSide::Right,
+                            right_failure,
+                            true,
+                        )?;
+                    }
+                    let right = match parsed_right.as_ref() {
+                        Some(parsed) => {
+                            let record = admission.right_record(parsed, &observer)?;
+                            Some(record)
+                        }
+                        None => None,
+                    };
 
-                    let Some(pair) = admission.admit_pair(left, right, &mut stats)? else {
+                    let (Some(left), Some(right)) = (left, right) else {
+                        observer.invalid_pairs += 1;
+                        continue;
+                    };
+
+                    let Some(pair) = admission.admit_pair(left, right, &mut observer)? else {
                         continue;
                     };
 
                     arena.reset();
-                    let outcome = plan.execute(pair, &mut arena, &mut stats)?;
-                    output.write_outcome(&outcome, &mut stats)?;
-                    progress.maybe_report(&stats);
+                    let outcome = plan.execute(pair, &mut arena, &mut observer)?;
+                    output.write_outcome(&outcome, &mut observer)?;
+                    progress.maybe_report(&observer);
                 }
             }
         }
 
         progress.finish();
         let output_result = output.finish();
-        let report_result = stats.finish_admission_report();
+        let report_result = observer.finish_invalid_input_report();
         output_result?;
         report_result?;
-        let summary =
-            report::RunSummary::from_stats(source.summary_context(), &stats, started_at.elapsed());
+        let summary = report::RunSummary::from_observer(
+            source.summary_context(),
+            &observer,
+            started_at.elapsed(),
+        );
         if ui.show_summary {
             report::print_summary(&summary);
         }
@@ -686,6 +955,114 @@ impl InterleavedLeftBuffer {
     }
 }
 
+fn single_parser_failure<T>(
+    source: &SingleSource,
+    policy: AdmissionPolicy,
+    observer: &mut RunObserver,
+    error: ParseError,
+) -> Result<T> {
+    let source_label = source.input_label();
+    if matches!(
+        &error.kind,
+        ParseErrorKind::Io | ParseErrorKind::UnknownFormat | ParseErrorKind::EmptyFile
+    ) {
+        return Err(error::constructors::single_parser_error(
+            source.input_origin(),
+            source_label,
+            &policy,
+            observer,
+            error,
+        ));
+    }
+    observer.record_unparsed_seen();
+    observer.terminal_single_parser_failure(&error, policy)?;
+    Err(error::constructors::single_parser_error(
+        source.input_origin(),
+        source_label,
+        &policy,
+        observer,
+        error,
+    ))
+}
+
+fn left_parser_failure<T>(
+    source: &PairedSource,
+    policy: AdmissionPolicy,
+    observer: &mut RunObserver,
+    error: ParseError,
+) -> Result<T> {
+    let source_label = source.input_label();
+    if matches!(
+        &error.kind,
+        ParseErrorKind::Io | ParseErrorKind::UnknownFormat | ParseErrorKind::EmptyFile
+    ) {
+        return Err(error::constructors::left_parser_error(
+            source.left_input_origin(),
+            source_label,
+            &policy,
+            observer,
+            error,
+        ));
+    }
+    observer.record_unparsed_seen();
+    observer.terminal_paired_parser_failure(MateSide::Left, &error, policy)?;
+    Err(error::constructors::left_parser_error(
+        source.left_input_origin(),
+        source_label,
+        &policy,
+        observer,
+        error,
+    ))
+}
+
+fn right_parser_failure<T>(
+    source: &PairedSource,
+    policy: AdmissionPolicy,
+    observer: &mut RunObserver,
+    error: ParseError,
+) -> Result<T> {
+    if parser_failure_has_record_slot(&error) {
+        observer.record_unparsed_seen();
+    }
+    finish_right_parser_failure(source, policy, observer, error)
+}
+
+fn finish_right_parser_failure<T>(
+    source: &PairedSource,
+    policy: AdmissionPolicy,
+    observer: &mut RunObserver,
+    error: ParseError,
+) -> Result<T> {
+    let source_label = source.input_label();
+    if matches!(
+        &error.kind,
+        ParseErrorKind::Io | ParseErrorKind::UnknownFormat | ParseErrorKind::EmptyFile
+    ) {
+        return Err(error::constructors::right_parser_error(
+            source.right_input_origin(),
+            source_label,
+            &policy,
+            observer,
+            error,
+        ));
+    }
+    observer.terminal_paired_parser_failure(MateSide::Right, &error, policy)?;
+    Err(error::constructors::right_parser_error(
+        source.right_input_origin(),
+        source_label,
+        &policy,
+        observer,
+        error,
+    ))
+}
+
+fn parser_failure_has_record_slot(error: &ParseError) -> bool {
+    !matches!(
+        &error.kind,
+        ParseErrorKind::Io | ParseErrorKind::UnknownFormat | ParseErrorKind::EmptyFile
+    )
+}
+
 struct RecordAdmission<'source, L: RecordLayout> {
     source: &'source L::Source,
     policy: AdmissionPolicy,
@@ -701,167 +1078,71 @@ impl<'source, L: RecordLayout> RecordAdmission<'source, L> {
         }
     }
 
-    fn parse<'record>(
-        &self,
-        mate: &'static str,
-        stats: &mut ReadStats,
-        next_record: std::result::Result<SequenceRecord<'record>, ParseError>,
-    ) -> Result<SequenceRecord<'record>> {
-        match next_record {
-            Ok(record) if record.format() == Format::Fastq => Ok(record),
-            Ok(record) => Err(unsupported_format_error(
-                self.source.input_origin(mate),
-                self.source.input_label(),
-                mate,
-                record.format(),
-            )),
-            Err(error) => self.parser_error(mate, stats, error),
-        }
-    }
-
-    fn parser_error<T>(
-        &self,
-        mate: &'static str,
-        stats: &mut ReadStats,
-        error: ParseError,
-    ) -> Result<T> {
-        let source = self.source.input_label();
-        let parser_error_kind = parse_error_kind_name(&error.kind);
-        let parser_error_message = error.to_string();
-        let parser_error_line = (error.position.line > 0).then_some(error.position.line);
-
-        if matches!(
-            &error.kind,
-            ParseErrorKind::Io | ParseErrorKind::UnknownFormat | ParseErrorKind::EmptyFile
-        ) {
-            return Err(parser_error(
-                self.source.input_origin(mate),
-                source,
-                mate,
-                self.policy,
-                stats,
-                error,
-            ));
-        }
-
-        stats.invalid_reads += 1;
-        stats.record_admission_event(AdmissionEvent::RecordParseFailure {
-            source: source.clone(),
-            mate,
-            parser_kind: parser_error_kind.to_owned(),
-            message: parser_error_message.clone(),
-            line: parser_error_line,
-            reads_seen: stats.reads_seen,
-            pairs_seen: (mate != "single").then_some(stats.pairs_seen),
-            continued: false,
-        })?;
-
-        if self.policy == AdmissionPolicy::Skip {
-            tracing::warn!(
-                source,
-                mate,
-                parser_kind = parser_error_kind,
-                parser_error = parser_error_message,
-                "record parser error is not recoverable; stopping instead of skipping and continuing"
-            );
-        }
-
-        Err(parser_error(
-            self.source.input_origin(mate),
-            source,
-            mate,
-            self.policy,
-            stats,
-            error,
-        ))
-    }
-
     fn admit_record<'record>(
         &self,
         record: RecordView<'record>,
-        stats: &mut ReadStats,
+        mate: Option<MateSide>,
+        pairs_seen: Option<u64>,
+        observer: &mut RunObserver,
     ) -> Result<Option<RecordView<'record>>> {
         if record.sequence().len() == record.quality().len() {
             return Ok(Some(record));
         }
 
-        self.record_length_mismatch(record, stats)?;
+        self.record_length_mismatch(record, mate, pairs_seen, observer)?;
 
         match self.policy {
-            AdmissionPolicy::Error => Err(Self::length_mismatch_error(record)),
+            AdmissionPolicy::Error => Err(error::constructors::record_length_error(record, mate)),
             AdmissionPolicy::Skip => {
-                Self::warn_length_mismatch(record, stats);
+                Self::warn_length_mismatch(record, mate, observer);
                 Ok(None)
             }
         }
     }
 
-    fn record_length_mismatch(&self, record: RecordView<'_>, stats: &mut ReadStats) -> Result<()> {
-        stats.invalid_reads += 1;
-        stats.record_admission_event(AdmissionEvent::SequenceQualityLengthMismatch {
+    fn record_length_mismatch(
+        &self,
+        record: RecordView<'_>,
+        mate: Option<MateSide>,
+        pairs_seen: Option<u64>,
+        observer: &mut RunObserver,
+    ) -> Result<()> {
+        observer.invalid_reads += 1;
+        observer.record_invalid_input(InvalidInputEvent::SequenceQualityLengthMismatch {
             source: record.source_display(),
-            mate: record.mate_display(),
+            mate,
             header: String::from_utf8_lossy(record.header()).into_owned(),
             sequence_len: record.sequence().len(),
             quality_len: record.quality().len(),
-            reads_seen: stats.reads_seen,
-            pairs_seen: record
-                .provenance()
-                .and_then(|provenance| provenance.mate)
-                .map(|_| stats.pairs_seen),
+            reads_seen: observer.reads_seen,
+            pairs_seen,
             continued: self.policy == AdmissionPolicy::Skip,
         })?;
         Ok(())
     }
 
-    fn length_mismatch_error(record: RecordView<'_>) -> RunError {
-        match record.provenance().map(|provenance| provenance.source) {
-            Some(InputSource::Ena { accession }) => IndeterminateInputError::Content {
-                accession: accession.to_owned(),
-                problem: EnaContentProblem::RecordLength {
-                    mate: record.mate_display(),
-                    header: String::from_utf8_lossy(record.header()).into_owned(),
-                    sequence_len: record.sequence().len(),
-                    quality_len: record.quality().len(),
-                },
-            }
-            .into(),
-            _ => MalformedInputError::RecordLength {
-                source_label: record.source_display(),
-                mate: record.mate_display(),
-                header: String::from_utf8_lossy(record.header()).into_owned(),
-                sequence_len: record.sequence().len(),
-                quality_len: record.quality().len(),
-            }
-            .into(),
-        }
-    }
-
-    fn warn_length_mismatch(record: RecordView<'_>, stats: &mut ReadStats) {
-        if stats.should_emit_admission_warning(ADMISSION_WARNING_LIMIT) {
+    fn warn_length_mismatch(
+        record: RecordView<'_>,
+        mate: Option<MateSide>,
+        observer: &mut RunObserver,
+    ) {
+        let mate = match mate {
+            Some(MateSide::Left) => "left",
+            Some(MateSide::Right) => "right",
+            None => "single",
+        };
+        if observer.should_emit_invalid_input_warning() {
             tracing::warn!(
                 source = %record.source_display(),
-                mate = %record.mate_display(),
+                mate,
                 header = %String::from_utf8_lossy(record.header()),
                 sequence_len = record.sequence().len(),
                 quality_len = record.quality().len(),
                 "skipping input record with mismatched sequence and quality lengths"
             );
-        } else if stats.should_emit_admission_suppressed_notice() {
-            tracing::warn!("further record-admission warnings suppressed");
+        } else if observer.should_emit_invalid_input_suppressed_notice() {
+            tracing::warn!("further invalid-input warnings suppressed");
         }
-    }
-}
-
-fn parse_error_kind_name(kind: &ParseErrorKind) -> &'static str {
-    match kind {
-        ParseErrorKind::Io => "io",
-        ParseErrorKind::UnknownFormat => "unknown_format",
-        ParseErrorKind::InvalidStart => "invalid_start",
-        ParseErrorKind::InvalidSeparator => "invalid_separator",
-        ParseErrorKind::UnequalLengths => "unequal_lengths",
-        ParseErrorKind::UnexpectedEnd => "unexpected_end",
-        ParseErrorKind::EmptyFile => "empty_file",
     }
 }
 
@@ -869,85 +1150,149 @@ impl RecordAdmission<'_, SingleEnd> {
     fn single<'record>(
         &'record self,
         parsed_record: &'record SequenceRecord<'_>,
-        stats: &mut ReadStats,
+        observer: &mut RunObserver,
     ) -> Result<Option<RecordView<'record>>> {
         let sequence = parsed_record.raw_seq();
-        let quality = parsed_record
-            .qual()
-            .ok_or_else(|| missing_quality_error(self.source, "single", stats))?;
+        let quality = parsed_record.qual().ok_or_else(|| {
+            error::constructors::missing_single_quality_error(
+                self.source.input_origin(),
+                self.source.input_label(),
+                observer,
+            )
+        })?;
         let record = RecordView::new(parsed_record.id(), sequence, quality)
-            .with_provenance(self.source.provenance());
+            .with_source(self.source.input_source());
 
-        stats.record_seen(sequence.len());
+        observer.record_seen(sequence.len());
 
-        self.admit_record(record, stats)
+        self.admit_record(record, None, None, observer)
     }
 }
 
 impl<'source> RecordAdmission<'source, PairedEnd> {
-    fn paired_record<'record>(
+    fn left_record<'record>(
         &'record self,
         parsed_record: &'record SequenceRecord<'_>,
-        mate: MateSide,
-        mate_label: &'static str,
-        stats: &ReadStats,
-    ) -> Result<RecordView<'record>> {
+        observer: &RunObserver,
+    ) -> Result<MateRecord<'record, LeftMate>> {
         let sequence = parsed_record.raw_seq();
-        let quality = parsed_record
-            .qual()
-            .ok_or_else(|| missing_quality_error(self.source, mate_label, stats))?;
-
+        let quality = parsed_record.qual().ok_or_else(|| {
+            error::constructors::missing_left_quality_error(
+                self.source.left_input_origin(),
+                self.source.input_label(),
+                observer,
+            )
+        })?;
         Ok(RecordView::new(parsed_record.id(), sequence, quality)
-            .with_provenance(self.source.provenance(mate)))
+            .with_source(self.source.input_source())
+            .into())
     }
 
-    fn missing_mate(
+    fn right_record<'record>(
+        &'record self,
+        parsed_record: &'record SequenceRecord<'_>,
+        observer: &RunObserver,
+    ) -> Result<MateRecord<'record, RightMate>> {
+        let sequence = parsed_record.raw_seq();
+        let quality = parsed_record.qual().ok_or_else(|| {
+            error::constructors::missing_right_quality_error(
+                self.source.right_input_origin(),
+                self.source.input_label(),
+                observer,
+            )
+        })?;
+        Ok(RecordView::new(parsed_record.id(), sequence, quality)
+            .with_source(self.source.input_source())
+            .into())
+    }
+
+    fn missing_right(
         &self,
         parsed_record: &SequenceRecord<'_>,
-        present_mate: MateSide,
-        mate_label: &'static str,
-        stats: &mut ReadStats,
+        observer: &mut RunObserver,
     ) -> Result<()> {
-        let record = self.paired_record(parsed_record, present_mate, mate_label, stats)?;
-        stats.record_seen(record.sequence().len());
-        self.missing_mate_record(record, stats)
+        let record = self.left_record(parsed_record, observer)?;
+        observer.record_seen(record.into_record().sequence().len());
+        self.missing_right_record(record, observer)
     }
 
-    fn missing_mate_record(&self, record: RecordView<'_>, stats: &mut ReadStats) -> Result<()> {
+    fn missing_left(
+        &self,
+        parsed_record: &SequenceRecord<'_>,
+        observer: &mut RunObserver,
+    ) -> Result<()> {
+        let record = self.right_record(parsed_record, observer)?;
+        observer.record_seen(record.into_record().sequence().len());
+        self.missing_left_record(record, observer)
+    }
+
+    fn missing_right_record(
+        &self,
+        left: MateRecord<'_, LeftMate>,
+        observer: &mut RunObserver,
+    ) -> Result<()> {
+        let record = left.into_record();
         let source = record.source_display();
-        let mate = record
-            .provenance()
-            .and_then(|provenance| provenance.mate)
-            .ok_or_else(|| InternalError::PlanInvariant {
-                detail: "paired record did not carry mate provenance".to_owned(),
-            })?;
-        let mate_label = record.mate_display();
         let header = String::from_utf8_lossy(record.header()).into_owned();
         let continued = self.policy == AdmissionPolicy::Skip;
-
-        stats.record_admission_event(AdmissionEvent::MissingMate {
+        observer.record_invalid_input(InvalidInputEvent::MissingMate {
             source: source.clone(),
-            present_mate: mate,
+            present_mate: MateSide::Left,
             header: header.clone(),
-            reads_seen: stats.reads_seen,
-            pairs_seen: stats.pairs_seen,
+            reads_seen: observer.reads_seen,
+            pairs_seen: observer.pairs_seen,
+            continued,
+        })?;
+        match self.policy {
+            AdmissionPolicy::Error => Err(error::constructors::left_record_count_error(
+                self.source.left_input_origin(),
+                self.source.input_layout(),
+                source,
+                header,
+                observer,
+            )),
+            AdmissionPolicy::Skip => {
+                if observer.should_emit_invalid_input_warning() {
+                    tracing::warn!(source, header, "skipping left record without a right mate");
+                } else if observer.should_emit_invalid_input_suppressed_notice() {
+                    tracing::warn!("further invalid-input warnings suppressed");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn missing_left_record(
+        &self,
+        right: MateRecord<'_, RightMate>,
+        observer: &mut RunObserver,
+    ) -> Result<()> {
+        let record = right.into_record();
+        let source = record.source_display();
+        let header = String::from_utf8_lossy(record.header()).into_owned();
+        let continued = self.policy == AdmissionPolicy::Skip;
+        observer.record_invalid_input(InvalidInputEvent::MissingMate {
+            source: source.clone(),
+            present_mate: MateSide::Right,
+            header: header.clone(),
+            reads_seen: observer.reads_seen,
+            pairs_seen: observer.pairs_seen,
             continued,
         })?;
 
         match self.policy {
-            AdmissionPolicy::Error => {
-                Err(record_count_error(self.source, mate_label, header, stats))
-            }
+            AdmissionPolicy::Error => Err(error::constructors::right_record_count_error(
+                self.source.right_input_origin(),
+                self.source.input_layout(),
+                source,
+                header,
+                observer,
+            )),
             AdmissionPolicy::Skip => {
-                if stats.should_emit_admission_warning(ADMISSION_WARNING_LIMIT) {
-                    tracing::warn!(
-                        source,
-                        present_mate = mate_label,
-                        header,
-                        "skipping input record without a mate"
-                    );
-                } else if stats.should_emit_admission_suppressed_notice() {
-                    tracing::warn!("further record-admission warnings suppressed");
+                if observer.should_emit_invalid_input_warning() {
+                    tracing::warn!(source, header, "skipping right record without a left mate");
+                } else if observer.should_emit_invalid_input_suppressed_notice() {
+                    tracing::warn!("further invalid-input warnings suppressed");
                 }
                 Ok(())
             }
@@ -957,273 +1302,88 @@ impl<'source> RecordAdmission<'source, PairedEnd> {
     fn buffered_left_record<'record>(
         &'record self,
         parsed_record: &SequenceRecord<'_>,
-        stats: &ReadStats,
+        observer: &RunObserver,
         buffer: &'record mut InterleavedLeftBuffer,
-    ) -> Result<RecordView<'record>>
+    ) -> Result<MateRecord<'record, LeftMate>>
     where
         'source: 'record,
     {
         let sequence = parsed_record.raw_seq();
-        let quality = parsed_record
-            .qual()
-            .ok_or_else(|| missing_quality_error(self.source, "left", stats))?;
+        let quality = parsed_record.qual().ok_or_else(|| {
+            error::constructors::missing_left_quality_error(
+                self.source.left_input_origin(),
+                self.source.input_label(),
+                observer,
+            )
+        })?;
 
         Ok(buffer
             .copy_from(parsed_record.id(), sequence, quality)
-            .with_provenance(self.source.provenance(MateSide::Left)))
+            .with_source(self.source.input_source())
+            .into())
     }
 
     fn admit_pair<'record>(
         &self,
-        left: RecordView<'record>,
-        right: RecordView<'record>,
-        stats: &mut ReadStats,
+        left: impl Into<MateRecord<'record, LeftMate>>,
+        right: impl Into<MateRecord<'record, RightMate>>,
+        observer: &mut RunObserver,
     ) -> Result<Option<RecordPair<'record>>> {
-        stats.pairs_seen += 1;
+        let error = match RecordPair::try_new(left.into(), right.into()) {
+            Ok(pair) => return Ok(Some(pair)),
+            Err(error) => error,
+        };
 
-        let left_length_mismatch = left.sequence().len() != left.quality().len();
-        let right_length_mismatch = right.sequence().len() != right.quality().len();
-        if left_length_mismatch || right_length_mismatch {
-            stats.invalid_pairs += 1;
-            if left_length_mismatch {
-                self.record_length_mismatch(left, stats)?;
-            }
-            if right_length_mismatch {
-                self.record_length_mismatch(right, stats)?;
-            }
+        observer.invalid_pairs += 1;
+        let continued = self.policy == AdmissionPolicy::Skip;
+        let source = self.source.input_label();
 
-            return match self.policy {
-                AdmissionPolicy::Error => {
-                    Err(Self::length_mismatch_error(if left_length_mismatch {
-                        left
-                    } else {
-                        right
-                    }))
-                }
-                AdmissionPolicy::Skip => {
-                    if left_length_mismatch {
-                        Self::warn_length_mismatch(left, stats);
-                    }
-                    if right_length_mismatch {
-                        Self::warn_length_mismatch(right, stats);
-                    }
-                    Ok(None)
-                }
-            };
+        match error {
+            PairConstructionError::LeftRecordLength { .. }
+            | PairConstructionError::RightRecordLength { .. } => observer.invalid_reads += 1,
+            PairConstructionError::BothRecordLengths { .. } => observer.invalid_reads += 2,
+            PairConstructionError::LeftHeaderClaimsRight { .. }
+            | PairConstructionError::RightHeaderClaimsLeft { .. }
+            | PairConstructionError::BothHeadersContradictPositions { .. }
+            | PairConstructionError::IdentifierMismatch { .. } => {}
         }
 
-        if left.pair_key() == right.pair_key() {
-            return Ok(Some(RecordPair { left, right }));
-        }
-
-        stats.invalid_pairs += 1;
-        stats.record_admission_event(AdmissionEvent::PairIdentifierMismatch {
-            source: left.source_display(),
-            left_header: String::from_utf8_lossy(left.header()).into_owned(),
-            right_header: String::from_utf8_lossy(right.header()).into_owned(),
-            reads_seen: stats.reads_seen,
-            pairs_seen: stats.pairs_seen,
-            continued: self.policy == AdmissionPolicy::Skip,
+        observer.record_invalid_input(InvalidInputEvent::PairConstructionFailure {
+            source: source.clone(),
+            error,
+            reads_seen: observer.reads_seen,
+            pairs_seen: observer.pairs_seen,
+            continued,
         })?;
 
         match self.policy {
-            AdmissionPolicy::Error => Err(Self::mate_identifier_error(left, right)),
             AdmissionPolicy::Skip => {
-                Self::warn_identifier_mismatch(left, right, stats);
+                if observer.should_emit_invalid_input_warning() {
+                    tracing::warn!(
+                        source,
+                        pair_error = %error,
+                        "skipping paired input that failed construction"
+                    );
+                } else if observer.should_emit_invalid_input_suppressed_notice() {
+                    tracing::warn!("further invalid-input warnings suppressed");
+                }
                 Ok(None)
             }
-        }
-    }
-
-    fn mate_identifier_error(left: RecordView<'_>, right: RecordView<'_>) -> RunError {
-        match left.provenance().map(|provenance| provenance.source) {
-            Some(InputSource::Ena { accession }) => IndeterminateInputError::Content {
-                accession: accession.to_owned(),
-                problem: EnaContentProblem::MateIdentifier {
-                    left_header: String::from_utf8_lossy(left.header()).into_owned(),
-                    right_header: String::from_utf8_lossy(right.header()).into_owned(),
-                },
-            }
-            .into(),
-            _ => MalformedInputError::MateIdentifier {
-                source_label: left.source_display(),
-                left_mate: left.mate_display(),
-                right_mate: right.mate_display(),
-                left_header: String::from_utf8_lossy(left.header()).into_owned(),
-                right_header: String::from_utf8_lossy(right.header()).into_owned(),
-            }
-            .into(),
-        }
-    }
-
-    fn warn_identifier_mismatch(
-        left: RecordView<'_>,
-        right: RecordView<'_>,
-        stats: &mut ReadStats,
-    ) {
-        if stats.should_emit_admission_warning(ADMISSION_WARNING_LIMIT) {
-            tracing::warn!(
-                source = %left.source_display(),
-                left_mate = %left.mate_display(),
-                right_mate = %right.mate_display(),
-                left_header = %String::from_utf8_lossy(left.header()),
-                right_header = %String::from_utf8_lossy(right.header()),
-                "skipping paired input with mismatched identifiers"
-            );
-        } else if stats.should_emit_admission_suppressed_notice() {
-            tracing::warn!("further record-admission warnings suppressed");
-        }
-    }
-}
-
-fn missing_quality_error<S: RunSource>(
-    source: &S,
-    mate: &'static str,
-    stats: &ReadStats,
-) -> RunError {
-    match source.input_origin(mate) {
-        InputOrigin::Ena(accession) => IndeterminateInputError::Content {
-            accession: accession.to_string(),
-            problem: EnaContentProblem::MissingQuality {
-                mate,
-                reads_seen: stats.reads_seen,
-                pairs_seen: stats.pairs_seen,
-                invalid_reads: stats.invalid_reads,
-                invalid_pairs: stats.invalid_pairs,
-            },
-        }
-        .into(),
-        InputOrigin::Local(_) => MalformedInputError::MissingQuality {
-            source_label: source.input_label(),
-            mate,
-            reads_seen: stats.reads_seen,
-            pairs_seen: stats.pairs_seen,
-            invalid_reads: stats.invalid_reads,
-            invalid_pairs: stats.invalid_pairs,
-        }
-        .into(),
-    }
-}
-
-fn read_stats(config: &RunConfig) -> Result<ReadStats> {
-    let mut stats = ReadStats::default();
-    if let Some(path) = &config.invalid_input_report {
-        stats.set_admission_report(AdmissionReport::create(path)?);
-    }
-    Ok(stats)
-}
-
-fn parser_error(
-    origin: InputOrigin<'_>,
-    source_label: String,
-    mate: &'static str,
-    policy: AdmissionPolicy,
-    stats: &ReadStats,
-    source: ParseError,
-) -> RunError {
-    match origin {
-        InputOrigin::Ena(accession) => IndeterminateInputError::Parser {
-            accession: accession.clone(),
-            mate: match mate {
-                "left" => Some(MateSide::Left),
-                "right" => Some(MateSide::Right),
-                _ => None,
-            },
-            reads_seen: stats.reads_seen,
-            pairs_seen: stats.pairs_seen,
-            source,
-        }
-        .into(),
-        InputOrigin::Local(path) if source.kind == ParseErrorKind::Io => IoError::LocalFastqRead {
-            path: path.to_path_buf(),
-            source,
-        }
-        .into(),
-        InputOrigin::Local(_)
-            if matches!(
-                &source.kind,
-                ParseErrorKind::UnknownFormat | ParseErrorKind::EmptyFile
-            ) =>
-        {
-            MalformedInputError::UnreadableFastq {
-                source_label,
-                mate,
-                reads_seen: stats.reads_seen,
-                pairs_seen: stats.pairs_seen,
-                parser_error_kind: parse_error_kind_name(&source.kind),
+            AdmissionPolicy::Error => Err(error::constructors::pair_construction_error(
+                self.source.left_input_origin(),
                 source,
-            }
-            .into()
+                error,
+            )),
         }
-        InputOrigin::Local(_) => MalformedInputError::LocalParser {
-            source_label,
-            mate,
-            policy: policy.to_string(),
-            reads_seen: stats.reads_seen,
-            pairs_seen: stats.pairs_seen,
-            invalid_reads: stats.invalid_reads,
-            invalid_pairs: stats.invalid_pairs,
-            parser_error_kind: parse_error_kind_name(&source.kind).to_owned(),
-            source,
-        }
-        .into(),
     }
 }
 
-fn unsupported_format_error(
-    origin: InputOrigin<'_>,
-    source_label: String,
-    mate: &'static str,
-    format: Format,
-) -> RunError {
-    match origin {
-        InputOrigin::Ena(accession) => IndeterminateInputError::Content {
-            accession: accession.to_string(),
-            problem: EnaContentProblem::UnsupportedFormat { mate, format },
-        }
-        .into(),
-        InputOrigin::Local(_) => MalformedInputError::UnsupportedFormat {
-            source_label,
-            mate,
-            format,
-        }
-        .into(),
+fn run_observer(config: &RunConfig, source_label: String) -> Result<RunObserver> {
+    let mut observer = RunObserver::new(source_label);
+    if let Some(path) = &config.invalid_input_report {
+        observer.set_invalid_input_report(InvalidInputReport::create(path)?);
     }
-}
-
-fn record_count_error(
-    source: &PairedSource,
-    present_mate: &'static str,
-    header: String,
-    stats: &ReadStats,
-) -> RunError {
-    match source {
-        PairedSource::Ena { accession } => IndeterminateInputError::Content {
-            accession: accession.to_string(),
-            problem: EnaContentProblem::RecordCount {
-                complete_pairs_seen: stats.pairs_seen,
-                present_mate,
-                header,
-            },
-        }
-        .into(),
-        PairedSource::LocalInterleaved { .. } => MalformedInputError::InterleavedRecordCount {
-            source_label: source.input_label(),
-            present_mate,
-            header,
-            complete_pairs_seen: stats.pairs_seen,
-            reads_seen: stats.reads_seen,
-        }
-        .into(),
-        PairedSource::LocalSplit { .. } => MalformedInputError::PairedRecordCount {
-            source_label: source.input_label(),
-            present_mate,
-            header,
-            complete_pairs_seen: stats.pairs_seen,
-            reads_seen: stats.reads_seen,
-        }
-        .into(),
-    }
+    Ok(observer)
 }
 
 #[cfg(test)]
@@ -1251,16 +1411,17 @@ mod tests {
         error::{
             EnaContentProblem, IndeterminateInputError, IoError, MalformedInputError, RunError,
         },
+        observer::{InvalidInputEvent, InvalidInputReport, RunObserver},
         output::{
             InterleavedOutput, OutputArgs, OutputEncoding, OutputFormat, PairedRecordOutput,
             SingleOutput, SingleRecordOutput, StreamSink,
         },
-        record::{AdmissionEvent, AdmissionReport, MateSide, ReadStats, RecordView},
+        record::{MateSide, RecordView},
     };
 
     use super::{
         InputOrigin, PairedEnd, PairedEndContext, PairedSource, RecordAdmission, RunConfig,
-        SingleEnd, SingleSource, missing_quality_error, parser_error, record_count_error,
+        SingleEnd, SingleSource, single_parser_failure,
     };
 
     fn single_output_for_vec(format: OutputFormat) -> SingleOutput<StreamSink<Vec<u8>>> {
@@ -1522,11 +1683,9 @@ mod tests {
     #[test]
     fn parser_errors_are_classified_by_origin_and_typed_kind() -> Result<()> {
         let accession = Accession::new("SRR35939766")?;
-        let stats = ReadStats {
-            reads_seen: 7,
-            pairs_seen: 3,
-            ..ReadStats::default()
-        };
+        let mut observer = RunObserver::new(format!("ena:{accession}"));
+        observer.reads_seen = 7;
+        observer.pairs_seen = 3;
 
         let parser_errors = [
             ParseError::from(io::Error::other("remote read failed")),
@@ -1540,12 +1699,11 @@ mod tests {
 
         for source in parser_errors.iter().cloned() {
             let expected_kind = source.kind.clone();
-            let error = parser_error(
+            let error = crate::error::constructors::single_parser_error(
                 InputOrigin::Ena(&accession),
                 format!("ena:{accession}"),
-                "single",
-                AdmissionPolicy::Error,
-                &stats,
+                &AdmissionPolicy::Error,
+                &observer,
                 source,
             );
             let RunError::IndeterminateInput(IndeterminateInputError::Parser {
@@ -1566,12 +1724,11 @@ mod tests {
         }
 
         let local_path = Path::new("reads.fastq");
-        let error = parser_error(
+        let error = crate::error::constructors::single_parser_error(
             InputOrigin::Local(local_path),
             "local:reads.fastq".to_owned(),
-            "single",
-            AdmissionPolicy::Error,
-            &stats,
+            &AdmissionPolicy::Error,
+            &observer,
             ParseError::from(io::Error::other("local read failed")),
         );
         let RunError::Io(IoError::LocalFastqRead { source, .. }) = error else {
@@ -1586,12 +1743,11 @@ mod tests {
             )
         }) {
             let expected_kind = source.kind.clone();
-            let error = parser_error(
+            let error = crate::error::constructors::single_parser_error(
                 InputOrigin::Local(local_path),
                 "local:reads.fastq".to_owned(),
-                "single",
-                AdmissionPolicy::Error,
-                &stats,
+                &AdmissionPolicy::Error,
+                &observer,
                 source,
             );
             assert!(
@@ -1613,11 +1769,9 @@ mod tests {
 
     #[test]
     fn local_parser_source_classification_preserves_typed_source() {
-        let stats = ReadStats {
-            reads_seen: 7,
-            pairs_seen: 3,
-            ..ReadStats::default()
-        };
+        let mut observer = RunObserver::new("local:reads.fastq".to_owned());
+        observer.reads_seen = 7;
+        observer.pairs_seen = 3;
         let local_path = Path::new("reads.fastq");
 
         for source in [
@@ -1625,12 +1779,11 @@ mod tests {
             ParseError::new_empty_file(),
         ] {
             let expected_kind = source.kind.clone();
-            let error = parser_error(
+            let error = crate::error::constructors::single_parser_error(
                 InputOrigin::Local(local_path),
                 "local:reads.fastq".to_owned(),
-                "single",
-                AdmissionPolicy::Error,
-                &stats,
+                &AdmissionPolicy::Error,
+                &observer,
                 source,
             );
             assert!(
@@ -1651,50 +1804,54 @@ mod tests {
 
     #[test]
     fn record_count_errors_preserve_origin_and_local_layout() -> Result<()> {
-        let stats = ReadStats {
-            reads_seen: 3,
-            pairs_seen: 1,
-            ..ReadStats::default()
-        };
+        let mut observer = RunObserver::new("test".to_owned());
+        observer.reads_seen = 3;
+        observer.pairs_seen = 1;
         let accession = Accession::new("SRR35939766")?;
+        let ena_source = PairedSource::Ena { accession };
+        let interleaved_source = PairedSource::LocalInterleaved {
+            input: "reads.fastq".into(),
+        };
+        let split_source = PairedSource::LocalSplit {
+            input1: "reads_1.fastq".into(),
+            input2: "reads_2.fastq".into(),
+        };
 
         assert!(matches!(
-            record_count_error(
-                &PairedSource::Ena { accession },
-                "left",
+            crate::error::constructors::left_record_count_error(
+                ena_source.left_input_origin(),
+                ena_source.input_layout(),
+                ena_source.input_label(),
                 "read2/1".to_owned(),
-                &stats,
+                &observer,
             ),
             RunError::IndeterminateInput(IndeterminateInputError::Content {
                 problem: EnaContentProblem::RecordCount {
                     complete_pairs_seen: 1,
-                    present_mate: "left",
+                    present_mate: MateSide::Left,
                     ref header,
                 },
                 ..
             }) if header == "read2/1"
         ));
         assert!(matches!(
-            record_count_error(
-                &PairedSource::LocalInterleaved {
-                    input: "reads.fastq".into(),
-                },
-                "left",
+            crate::error::constructors::left_record_count_error(
+                interleaved_source.left_input_origin(),
+                interleaved_source.input_layout(),
+                interleaved_source.input_label(),
                 "read2/1".to_owned(),
-                &stats,
+                &observer,
             ),
             RunError::MalformedInput(error)
                 if matches!(*error, MalformedInputError::InterleavedRecordCount { .. })
         ));
         assert!(matches!(
-            record_count_error(
-                &PairedSource::LocalSplit {
-                    input1: "reads_1.fastq".into(),
-                    input2: "reads_2.fastq".into(),
-                },
-                "right",
+            crate::error::constructors::right_record_count_error(
+                split_source.right_input_origin(),
+                split_source.input_layout(),
+                split_source.input_label(),
                 "read2/2".to_owned(),
-                &stats,
+                &observer,
             ),
             RunError::MalformedInput(error)
                 if matches!(*error, MalformedInputError::PairedRecordCount { .. })
@@ -1704,27 +1861,31 @@ mod tests {
 
     #[test]
     fn missing_quality_errors_preserve_input_origin() -> Result<()> {
-        let stats = ReadStats {
-            reads_seen: 7,
-            pairs_seen: 3,
-            ..ReadStats::default()
-        };
+        let mut observer = RunObserver::new("test".to_owned());
+        observer.reads_seen = 7;
+        observer.pairs_seen = 3;
         let accession = Accession::new("SRR35939766")?;
+        let ena_source = SingleSource::Ena { accession };
+        let local_source = SingleSource::Local {
+            input: "reads.fastq".into(),
+        };
 
         assert!(matches!(
-            missing_quality_error(&SingleSource::Ena { accession }, "single", &stats),
+            crate::error::constructors::missing_single_quality_error(
+                ena_source.input_origin(),
+                ena_source.input_label(),
+                &observer,
+            ),
             RunError::IndeterminateInput(IndeterminateInputError::Content {
                 problem: EnaContentProblem::MissingQuality { mate: "single", .. },
                 ..
             })
         ));
         assert!(matches!(
-            missing_quality_error(
-                &SingleSource::Local {
-                    input: "reads.fastq".into(),
-                },
-                "single",
-                &stats,
+            crate::error::constructors::missing_single_quality_error(
+                local_source.input_origin(),
+                local_source.input_label(),
+                &observer,
             ),
             RunError::MalformedInput(error)
                 if matches!(*error, MalformedInputError::MissingQuality { .. })
@@ -1733,18 +1894,20 @@ mod tests {
     }
 
     #[test]
-    fn record_length_errors_preserve_input_origin_at_admission() -> Result<()> {
+    fn record_length_errors_preserve_input_origin() -> Result<()> {
         let local_source = SingleSource::Local {
             input: PathBuf::from("reads.fastq"),
         };
         let local_admission =
             RecordAdmission::<SingleEnd>::new(&local_source, AdmissionPolicy::Error);
         let local_record =
-            RecordView::new(b"read1", b"ACGT", b"I").with_provenance(local_source.provenance());
-        let mut local_stats = ReadStats::default();
-        local_stats.record_seen(local_record.sequence().len());
+            RecordView::new(b"read1", b"ACGT", b"I").with_source(local_source.input_source());
+        let mut local_observer = RunObserver::new(local_source.input_label());
+        local_observer.record_seen(local_record.sequence().len());
 
-        let Err(local_error) = local_admission.admit_record(local_record, &mut local_stats) else {
+        let Err(local_error) =
+            local_admission.admit_record(local_record, None, None, &mut local_observer)
+        else {
             panic!("local length mismatch should fail admission");
         };
         assert!(matches!(
@@ -1752,10 +1915,10 @@ mod tests {
             RunError::MalformedInput(error)
                 if matches!(*error, MalformedInputError::RecordLength { .. })
         ));
-        assert_eq!(local_stats.invalid_reads, 1);
+        assert_eq!(local_observer.invalid_reads, 1);
         assert_eq!(
-            local_stats
-                .admission_event_counts
+            local_observer
+                .invalid_input_event_counts()
                 .get("sequence_quality_length_mismatch"),
             Some(&1)
         );
@@ -1765,11 +1928,12 @@ mod tests {
         };
         let ena_admission = RecordAdmission::<SingleEnd>::new(&ena_source, AdmissionPolicy::Error);
         let ena_record =
-            RecordView::new(b"read1", b"ACGT", b"I").with_provenance(ena_source.provenance());
-        let mut ena_stats = ReadStats::default();
-        ena_stats.record_seen(ena_record.sequence().len());
+            RecordView::new(b"read1", b"ACGT", b"I").with_source(ena_source.input_source());
+        let mut ena_observer = RunObserver::new(ena_source.input_label());
+        ena_observer.record_seen(ena_record.sequence().len());
 
-        let Err(ena_error) = ena_admission.admit_record(ena_record, &mut ena_stats) else {
+        let Err(ena_error) = ena_admission.admit_record(ena_record, None, None, &mut ena_observer)
+        else {
             panic!("ENA length mismatch should fail admission");
         };
         assert!(matches!(
@@ -1779,110 +1943,113 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(ena_stats.invalid_reads, 1);
+        assert_eq!(ena_observer.invalid_reads, 1);
         Ok(())
     }
 
     #[test]
-    fn mate_identifier_errors_preserve_input_origin_at_admission() -> Result<()> {
+    fn pair_identifier_errors_preserve_input_origin() -> Result<()> {
         let local_source = PairedSource::LocalInterleaved {
             input: PathBuf::from("reads.fastq"),
         };
         let local_admission =
             RecordAdmission::<PairedEnd>::new(&local_source, AdmissionPolicy::Error);
-        let local_left = RecordView::new(b"read1/1", b"A", b"I")
-            .with_provenance(local_source.provenance(MateSide::Left));
-        let local_right = RecordView::new(b"read2/2", b"T", b"I")
-            .with_provenance(local_source.provenance(MateSide::Right));
-        let mut local_stats = ReadStats::default();
-        local_stats.record_seen(1);
-        local_stats.record_seen(1);
+        let local_left =
+            RecordView::new(b"read1/1", b"A", b"I").with_source(local_source.input_source());
+        let local_right =
+            RecordView::new(b"read2/2", b"T", b"I").with_source(local_source.input_source());
+        let mut local_observer = RunObserver::new(local_source.input_label());
+        local_observer.record_seen(1);
+        local_observer.record_seen(1);
 
         let Err(local_error) =
-            local_admission.admit_pair(local_left, local_right, &mut local_stats)
+            local_admission.admit_pair(local_left, local_right, &mut local_observer)
         else {
             panic!("local mate mismatch should fail admission");
         };
         assert!(matches!(
             local_error,
             RunError::MalformedInput(error)
-                if matches!(*error, MalformedInputError::MateIdentifier { .. })
+                if matches!(*error, MalformedInputError::PairConstruction { .. })
         ));
-        assert_eq!(local_stats.invalid_pairs, 1);
+        assert_eq!(local_observer.invalid_pairs, 1);
 
         let ena_source = PairedSource::Ena {
             accession: Accession::new("SRR35939766")?,
         };
         let ena_admission = RecordAdmission::<PairedEnd>::new(&ena_source, AdmissionPolicy::Error);
-        let ena_left = RecordView::new(b"read1/1", b"A", b"I")
-            .with_provenance(ena_source.provenance(MateSide::Left));
-        let ena_right = RecordView::new(b"read2/2", b"T", b"I")
-            .with_provenance(ena_source.provenance(MateSide::Right));
-        let mut ena_stats = ReadStats::default();
-        ena_stats.record_seen(1);
-        ena_stats.record_seen(1);
+        let ena_left =
+            RecordView::new(b"read1/1", b"A", b"I").with_source(ena_source.input_source());
+        let ena_right =
+            RecordView::new(b"read2/2", b"T", b"I").with_source(ena_source.input_source());
+        let mut ena_observer = RunObserver::new(ena_source.input_label());
+        ena_observer.record_seen(1);
+        ena_observer.record_seen(1);
 
-        let Err(ena_error) = ena_admission.admit_pair(ena_left, ena_right, &mut ena_stats) else {
+        let Err(ena_error) = ena_admission.admit_pair(ena_left, ena_right, &mut ena_observer)
+        else {
             panic!("ENA mate mismatch should fail admission");
         };
         assert!(matches!(
             ena_error,
             RunError::IndeterminateInput(IndeterminateInputError::Content {
-                problem: EnaContentProblem::MateIdentifier { .. },
+                problem: EnaContentProblem::PairConstruction { .. },
                 ..
             })
         ));
-        assert_eq!(ena_stats.invalid_pairs, 1);
+        assert_eq!(ena_observer.invalid_pairs, 1);
         Ok(())
     }
 
     #[test]
-    fn parser_io_failure_is_not_an_admission_event() -> Result<()> {
+    fn parser_io_failure_is_not_an_invalid_input_event() -> Result<()> {
         let temp = tempdir()?;
         let report_path = temp.path().join("invalid-input.jsonl");
         let source = SingleSource::Local {
             input: PathBuf::from("reads.fastq"),
         };
-        let admission = RecordAdmission::<SingleEnd>::new(&source, AdmissionPolicy::Skip);
-        let mut stats = ReadStats::default();
-        stats.set_admission_report(AdmissionReport::create(&report_path)?);
+        let mut observer = RunObserver::new(source.input_label());
+        observer.set_invalid_input_report(InvalidInputReport::create(&report_path)?);
 
-        let error = admission
-            .parse(
-                "single",
-                &mut stats,
-                Err(ParseError::from(io::Error::other("synthetic read failure"))),
-            )
-            .expect_err("I/O failure should remain fatal");
+        let error = single_parser_failure::<()>(
+            &source,
+            AdmissionPolicy::Skip,
+            &mut observer,
+            ParseError::from(io::Error::other("synthetic read failure")),
+        )
+        .expect_err("I/O failure should remain fatal");
 
         assert!(
             matches!(error, RunError::Io(IoError::LocalFastqRead { .. })),
             "I/O parser failure should be classified as local read I/O"
         );
-        assert_eq!(stats.invalid_reads, 0);
-        assert!(stats.admission_event_counts.is_empty());
+        assert_eq!(observer.invalid_reads, 0);
+        assert!(observer.invalid_input_event_counts().is_empty());
         assert_eq!(std::fs::read_to_string(report_path)?, "");
         Ok(())
     }
 
     #[test]
-    fn parser_source_classification_failures_are_not_admission_events() -> Result<()> {
+    fn parser_source_classification_failures_are_not_invalid_input_events() -> Result<()> {
         let temp = tempdir()?;
         let report_path = temp.path().join("invalid-input.jsonl");
         let source = SingleSource::Local {
             input: PathBuf::from("reads.fastq"),
         };
-        let admission = RecordAdmission::<SingleEnd>::new(&source, AdmissionPolicy::Skip);
-        let mut stats = ReadStats::default();
-        stats.set_admission_report(AdmissionReport::create(&report_path)?);
+        let mut observer = RunObserver::new(source.input_label());
+        observer.set_invalid_input_report(InvalidInputReport::create(&report_path)?);
 
         for parse_error in [
             ParseError::new_unknown_format(b'!'),
             ParseError::new_empty_file(),
         ] {
-            let error = admission
-                .parse("single", &mut stats, Err(parse_error))
-                .expect_err("source classification failure should remain fatal");
+            let error = single_parser_failure::<()>(
+                &source,
+                AdmissionPolicy::Skip,
+                &mut observer,
+                parse_error,
+            )
+            .expect_err("source classification failure should remain fatal");
             assert!(
                 error
                     .to_string()
@@ -1890,14 +2057,14 @@ mod tests {
             );
         }
 
-        assert_eq!(stats.invalid_reads, 0);
-        assert!(stats.admission_event_counts.is_empty());
+        assert_eq!(observer.invalid_reads, 0);
+        assert!(observer.invalid_input_event_counts().is_empty());
         assert_eq!(std::fs::read_to_string(report_path)?, "");
         Ok(())
     }
 
     #[test]
-    fn malformed_pair_admission_is_atomic_for_each_invalid_mate() -> Result<()> {
+    fn malformed_pair_handling_is_atomic_for_each_invalid_mate() -> Result<()> {
         for (invalid_mate, left_quality, right_quality) in [
             ("left", b"I".as_slice(), b"KKKK".as_slice()),
             ("right", b"IIII".as_slice(), b"K".as_slice()),
@@ -1909,14 +2076,15 @@ mod tests {
                 };
                 let admission = RecordAdmission::<PairedEnd>::new(&source, policy);
                 let left = RecordView::new(b"read1/1", b"AAAA", left_quality)
-                    .with_provenance(source.provenance(MateSide::Left));
+                    .with_source(source.input_source());
                 let right = RecordView::new(b"read1/2", b"TTTT", right_quality)
-                    .with_provenance(source.provenance(MateSide::Right));
-                let mut stats = ReadStats::default();
-                stats.record_seen(left.sequence().len());
-                stats.record_seen(right.sequence().len());
+                    .with_source(source.input_source());
+                let mut observer = RunObserver::new(source.input_label());
+                observer.pairs_seen = 1;
+                observer.record_seen(left.sequence().len());
+                observer.record_seen(right.sequence().len());
 
-                let result = admission.admit_pair(left, right, &mut stats);
+                let result = admission.admit_pair(left, right, &mut observer);
                 match policy {
                     AdmissionPolicy::Error => {
                         assert!(
@@ -1932,24 +2100,23 @@ mod tests {
                     }
                 }
 
-                assert_eq!(stats.pairs_seen, 1);
-                assert_eq!(stats.invalid_pairs, 1);
-                assert_eq!(stats.invalid_reads, 1);
+                assert_eq!(observer.pairs_seen, 1);
+                assert_eq!(observer.invalid_pairs, 1);
+                assert_eq!(observer.invalid_reads, 1);
+                let expected_code = "sequence_quality_length_mismatch";
                 assert_eq!(
-                    stats
-                        .admission_event_counts
-                        .get("sequence_quality_length_mismatch"),
+                    observer.invalid_input_event_counts().get(expected_code),
                     Some(&1)
                 );
                 let [
-                    AdmissionEvent::SequenceQualityLengthMismatch {
-                        mate, continued, ..
+                    InvalidInputEvent::PairConstructionFailure {
+                        error, continued, ..
                     },
-                ] = stats.admission_samples.as_slice()
+                ] = observer.invalid_input_samples()
                 else {
                     panic!("exactly one length-mismatch event should identify the invalid mate");
                 };
-                assert_eq!(*mate, invalid_mate);
+                assert_eq!(error.code(), expected_code);
                 assert_eq!(*continued, policy == AdmissionPolicy::Skip);
             }
         }
@@ -1964,15 +2131,16 @@ mod tests {
                 input2: PathBuf::from("reads_2.fastq"),
             };
             let admission = RecordAdmission::<PairedEnd>::new(&source, policy);
-            let left = RecordView::new(b"read1/1", b"AAAA", b"I")
-                .with_provenance(source.provenance(MateSide::Left));
-            let right = RecordView::new(b"read1/2", b"TTTT", b"K")
-                .with_provenance(source.provenance(MateSide::Right));
-            let mut stats = ReadStats::default();
-            stats.record_seen(left.sequence().len());
-            stats.record_seen(right.sequence().len());
+            let left =
+                RecordView::new(b"read1/1", b"AAAA", b"I").with_source(source.input_source());
+            let right =
+                RecordView::new(b"read1/2", b"TTTT", b"K").with_source(source.input_source());
+            let mut observer = RunObserver::new(source.input_label());
+            observer.pairs_seen = 1;
+            observer.record_seen(left.sequence().len());
+            observer.record_seen(right.sequence().len());
 
-            let result = admission.admit_pair(left, right, &mut stats);
+            let result = admission.admit_pair(left, right, &mut observer);
             match policy {
                 AdmissionPolicy::Error => {
                     assert!(
@@ -1985,14 +2153,14 @@ mod tests {
                 }
             }
 
-            assert_eq!(stats.pairs_seen, 1);
-            assert_eq!(stats.invalid_pairs, 1);
-            assert_eq!(stats.invalid_reads, 2);
+            assert_eq!(observer.pairs_seen, 1);
+            assert_eq!(observer.invalid_pairs, 1);
+            assert_eq!(observer.invalid_reads, 2);
             assert_eq!(
-                stats
-                    .admission_event_counts
+                observer
+                    .invalid_input_event_counts()
                     .get("sequence_quality_length_mismatch"),
-                Some(&2)
+                Some(&1)
             );
         }
         Ok(())

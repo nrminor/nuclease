@@ -15,6 +15,7 @@ mod cli;
 mod ena;
 mod error;
 mod filter;
+mod observer;
 mod output;
 mod pair_merge;
 mod pipeline;
