@@ -944,8 +944,7 @@ dependencies = [
 [[package]]
 name = "needletail"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "159c0519d18efd0c256a2284f396fa556c8f73a8572db1a3f7487921c26c76fa"
+source = "git+https://github.com/nrminor/needletail?rev=d94e3d6c#d94e3d6c83ebef1d5840b94b3ab3e04eb3a4e763"
 dependencies = [
  "buffer-redux",
  "bytecount",

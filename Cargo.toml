@@ -23,7 +23,7 @@ color-eyre = "0.6.5"
 bumpalo = "3.17.0"
 bytecount = "0.6.9"
 flate2 = "1.1.5"
-needletail = "0.7.3"
+needletail = { git = "https://github.com/nrminor/needletail", rev = "d94e3d6c" }
 reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
