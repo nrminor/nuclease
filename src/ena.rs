@@ -18,13 +18,12 @@ use reqwest::{
         HeaderValue, RANGE,
     },
 };
-use thiserror::Error;
 use url::Url;
 
 use crate::{
     error::{
-        AccessionParseError, EnaAvailabilityProblem, EnaMetadataProblem, IndeterminateInputError,
-        InternalError, Result, RunError, UnavailableInputError,
+        AccessionParseError, EnaAvailabilityProblem, EnaMetadataProblem, EnaStreamProblem,
+        IndeterminateInputError, InternalError, Result, RunError, UnavailableInputError,
     },
     record::MateSide,
 };
@@ -91,31 +90,6 @@ pub(crate) struct EnaFastq {
     url: Url,
     expected_bytes: u64,
     expected_md5: [u8; 16],
-}
-
-#[derive(Debug, Error)]
-#[error("{message}: HTTP status {status}")]
-struct EnaHttpStatusError {
-    status: StatusCode,
-    message: String,
-}
-
-#[derive(Debug, Error)]
-#[error(
-    "ENA stream could not resume: accession={accession} mate={mate:?} source_url={source_url} final_url={final_url} compressed_offset={compressed_offset} expected_compressed_bytes={expected_bytes} reconnects={reconnects} consecutive_failures={consecutive_failures} last_error_kind={last_error_kind:?} last_error={source}"
-)]
-struct EnaRetryExhaustedError {
-    accession: Accession,
-    mate: Option<MateSide>,
-    source_url: Url,
-    final_url: String,
-    compressed_offset: u64,
-    expected_bytes: u64,
-    reconnects: u32,
-    consecutive_failures: u32,
-    last_error_kind: io::ErrorKind,
-    #[source]
-    source: io::Error,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -607,21 +581,19 @@ impl EnaStream {
     fn retry_exhausted(&self, cause: io::Error) -> io::Error {
         let final_url = self.final_url.as_ref().map_or("<unknown>", Url::as_str);
         let kind = cause.kind();
-        io::Error::new(
-            kind,
-            EnaRetryExhaustedError {
-                accession: self.fastq.accession.clone(),
-                mate: self.fastq.mate,
-                source_url: self.fastq.url.clone(),
-                final_url: final_url.to_owned(),
-                compressed_offset: self.compressed_offset,
-                expected_bytes: self.fastq.expected_bytes,
-                reconnects: self.reconnects,
-                consecutive_failures: self.consecutive_failures,
-                last_error_kind: kind,
-                source: cause,
-            },
-        )
+        EnaStreamProblem::RetryExhausted {
+            accession: self.fastq.accession.clone(),
+            mate: self.fastq.mate,
+            source_url: self.fastq.url.clone(),
+            final_url: final_url.to_owned(),
+            compressed_offset: self.compressed_offset,
+            expected_bytes: self.fastq.expected_bytes,
+            reconnects: self.reconnects,
+            consecutive_failures: self.consecutive_failures,
+            last_error_kind: kind,
+            source: cause,
+        }
+        .into_io_error()
     }
 
     fn account(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -724,7 +696,11 @@ impl ActiveResponse {
             return if is_retryable_http_status(response.status()) {
                 Err(io::Error::other(message))
             } else {
-                Err(http_status_error(response.status(), message))
+                Err(EnaStreamProblem::HttpStatus {
+                    status: response.status(),
+                    message,
+                }
+                .into_io_error())
             };
         }
         validate_identity_content_encoding(&response)?;
@@ -778,7 +754,11 @@ impl ActiveResponse {
             return if is_retryable_http_status(response.status()) {
                 Err(io::Error::other(message))
             } else {
-                Err(http_status_error(response.status(), message))
+                Err(EnaStreamProblem::HttpStatus {
+                    status: response.status(),
+                    message,
+                }
+                .into_io_error())
             };
         }
         validate_identity_content_encoding(&response)?;
@@ -963,13 +943,6 @@ fn full_jitter(upper_bound: Duration) -> Duration {
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
-}
-
-fn http_status_error(status: StatusCode, message: String) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        EnaHttpStatusError { status, message },
-    )
 }
 
 fn response_text_or_error(accession: &Accession, response: Response) -> Result<String> {

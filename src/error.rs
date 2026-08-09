@@ -13,6 +13,7 @@ use needletail::{errors::ParseError, parser::Format};
 use reqwest::StatusCode;
 use serde::{Serialize, Serializer};
 use thiserror::Error;
+use url::Url;
 
 use crate::{ena::Accession, record::MateSide};
 
@@ -943,6 +944,51 @@ pub(crate) enum ReportWriteError {
     Json(serde_json::Error),
     #[error(transparent)]
     Bytes(io::Error),
+}
+
+/// Concrete failures encountered while opening or reconnecting an ENA byte stream.
+#[derive(Debug, Error)]
+pub(crate) enum EnaStreamProblem {
+    #[error("{message}: HTTP status {status}")]
+    HttpStatus { status: StatusCode, message: String },
+
+    #[error(
+        "ENA stream could not resume: \
+         accession={accession} mate={mate:?} \
+         source_url={source_url} final_url={final_url} \
+         compressed_offset={compressed_offset} \
+         expected_compressed_bytes={expected_bytes} \
+         reconnects={reconnects} \
+         consecutive_failures={consecutive_failures} \
+         last_error_kind={last_error_kind:?} \
+         last_error={source}"
+    )]
+    RetryExhausted {
+        accession: Accession,
+        mate: Option<MateSide>,
+        source_url: Url,
+        final_url: String,
+        compressed_offset: u64,
+        expected_bytes: u64,
+        reconnects: u32,
+        consecutive_failures: u32,
+        last_error_kind: io::ErrorKind,
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl EnaStreamProblem {
+    pub(crate) fn into_io_error(self) -> io::Error {
+        let kind = match &self {
+            Self::HttpStatus { .. } => io::ErrorKind::InvalidData,
+            Self::RetryExhausted {
+                last_error_kind, ..
+            } => *last_error_kind,
+        };
+
+        io::Error::new(kind, self)
+    }
 }
 
 /// ENA failures for which this run could not establish trustworthy input evidence.
