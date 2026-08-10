@@ -976,12 +976,50 @@ pub(crate) enum EnaStreamProblem {
         #[source]
         source: io::Error,
     },
+
+    #[error(
+        "ENA FASTQ could not be resumed safely after an interruption\n\
+         accession: {accession}\n\
+         mate: {mate:?}\n\
+         compressed_offset: {compressed_offset}\n\
+         reconnects: {reconnects}\n\
+         reason: the interrupted response did not provide enough information \
+         to verify that a resumed response would contain the same file\n\
+         help: retry the complete ENA-backed run"
+    )]
+    ResumeIdentityUnavailable {
+        accession: Accession,
+        mate: Option<MateSide>,
+        compressed_offset: u64,
+        reconnects: u32,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error(
+        "ENA FASTQ could not be resumed safely\n\
+         accession: {accession}\n\
+         mate: {mate:?}\n\
+         compressed_offset: {compressed_offset}\n\
+         reconnects: {reconnects}\n\
+         reason: the resumed response could not be verified as the same file\n\
+         help: retry the complete ENA-backed run; nuclease stopped before \
+         combining the responses"
+    )]
+    ResumeIdentityInvalidated {
+        accession: Accession,
+        mate: Option<MateSide>,
+        compressed_offset: u64,
+        reconnects: u32,
+    },
 }
 
 impl EnaStreamProblem {
     pub(crate) fn into_io_error(self) -> io::Error {
         let kind = match &self {
-            Self::HttpStatus { .. } => io::ErrorKind::InvalidData,
+            Self::HttpStatus { .. }
+            | Self::ResumeIdentityUnavailable { .. }
+            | Self::ResumeIdentityInvalidated { .. } => io::ErrorKind::InvalidData,
             Self::RetryExhausted {
                 last_error_kind, ..
             } => *last_error_kind,
