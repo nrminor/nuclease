@@ -14,8 +14,8 @@ use reqwest::{
     StatusCode,
     blocking::{Client, Response},
     header::{
-        ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
-        HeaderValue, RANGE,
+        ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+        HeaderValue, IF_RANGE, RANGE,
     },
 };
 use url::Url;
@@ -44,6 +44,31 @@ const ENA_RETRY_RESET_BYTES: u64 = 1024 * 1024;
 const ENA_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 /// Maximum upper bound for a full-jitter reconnect delay.
 const ENA_MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StrongEtag(HeaderValue);
+
+impl StrongEtag {
+    fn from_header(value: &HeaderValue) -> Option<Self> {
+        let bytes = value.as_bytes();
+
+        if bytes.starts_with(b"W/") {
+            return None;
+        }
+
+        let inner = bytes.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
+
+        let valid = inner
+            .iter()
+            .all(|byte| matches!(byte, 0x21 | 0x23..=0x7e | 0x80..=0xff));
+
+        valid.then(|| Self(value.clone()))
+    }
+
+    fn as_header_value(&self) -> &HeaderValue {
+        &self.0
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 /// ENA run accession constrained to the run-level prefixes accepted by this tool.
@@ -421,6 +446,7 @@ pub(crate) struct EnaStream {
     client: EnaClient,
     fastq: EnaFastq,
     body: Option<ActiveResponse>,
+    etag: Option<StrongEtag>,
     final_url: Option<Url>,
     compressed_offset: u64,
     digest: Md5,
@@ -442,6 +468,7 @@ impl EnaStream {
             client,
             fastq,
             body: None,
+            etag: None,
             final_url: None,
             compressed_offset: 0,
             digest: Md5::new(),
@@ -496,17 +523,45 @@ impl EnaStream {
         if self.compressed_offset > 0 {
             // Range offsets count compressed bytes already delivered to the consumer, not bytes
             // merely prefetched from an HTTP response during validation.
-            request = request.header(RANGE, format!("bytes={}-", self.compressed_offset));
+            let etag = self.etag.as_ref().ok_or_else(|| {
+                EnaStreamProblem::ResumeIdentityUnavailable {
+                    accession: self.fastq.accession.clone(),
+                    mate: self.fastq.mate,
+                    compressed_offset: self.compressed_offset,
+                    reconnects: self.reconnects,
+                    source: io::Error::other(
+                        "nonzero ENA resume did not retain a usable response identity",
+                    ),
+                }
+                .into_io_error()
+            })?;
+            request = request
+                .header(RANGE, format!("bytes={}-", self.compressed_offset))
+                .header(IF_RANGE, etag.as_header_value().clone());
         }
 
         let response = request.send().map_err(io::Error::other)?;
         self.final_url = Some(response.url().clone());
-        let body = if self.compressed_offset == 0 {
-            ActiveResponse::initial(response, &self.fastq)?
+        if self.compressed_offset == 0 {
+            let body = ActiveResponse::initial(response, &self.fastq)?;
+            let etag = body.strong_etag();
+
+            self.etag = etag;
+            self.body = Some(body);
         } else {
-            ActiveResponse::resumed(response, &self.fastq, self.compressed_offset)?
-        };
-        self.body = Some(body);
+            let expected = self
+                .etag
+                .as_ref()
+                .expect("nonzero ENA resume should retain a strong ETag");
+            let body = ActiveResponse::resumed(
+                response,
+                &self.fastq,
+                self.compressed_offset,
+                self.reconnects,
+                expected,
+            )?;
+            self.body = Some(body);
+        }
         Ok(())
     }
 
@@ -516,6 +571,17 @@ impl EnaStream {
         }
         if !Self::should_retry_io_error(&error) {
             return Err(error);
+        }
+
+        if self.compressed_offset > 0 && self.etag.is_none() {
+            return Err(EnaStreamProblem::ResumeIdentityUnavailable {
+                accession: self.fastq.accession.clone(),
+                mate: self.fastq.mate,
+                compressed_offset: self.compressed_offset,
+                reconnects: self.reconnects,
+                source: error,
+            }
+            .into_io_error());
         }
 
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
@@ -686,6 +752,17 @@ struct ActiveResponse {
 }
 
 impl ActiveResponse {
+    fn strong_etag(&self) -> Option<StrongEtag> {
+        let mut values = self.response.headers().get_all(ETAG).iter();
+        let value = values.next()?;
+
+        if values.next().is_some() {
+            return None;
+        }
+
+        StrongEtag::from_header(value)
+    }
+
     fn initial(response: Response, fastq: &EnaFastq) -> io::Result<Self> {
         if response.status() != StatusCode::OK {
             let message = format!(
@@ -742,24 +819,43 @@ impl ActiveResponse {
         Ok(Self::new(response, 0..fastq.expected_bytes))
     }
 
-    fn resumed(response: Response, fastq: &EnaFastq, expected_offset: u64) -> io::Result<Self> {
-        if response.status() != StatusCode::PARTIAL_CONTENT {
-            let message = format!(
-                "ranged ENA stream request for {} failed with status {}",
-                fastq.accession,
-                response.status()
+    fn resumed(
+        response: Response,
+        fastq: &EnaFastq,
+        expected_offset: u64,
+        reconnects: u32,
+        expected_etag: &StrongEtag,
+    ) -> io::Result<Self> {
+        let status = response.status();
+        let message = format!(
+            "ranged ENA stream request for {} failed with status {status}",
+            fastq.accession
+        );
+        if is_retryable_http_status(status) {
+            return Err(io::Error::other(message));
+        }
+        if status == StatusCode::OK {
+            tracing::info!(
+                accession = %fastq.accession,
+                mate = ?fastq.mate,
+                compressed_offset = expected_offset,
+                reconnects,
+                expected_etag = ?expected_etag.as_header_value(),
+                observed_etag = ?response.headers().get(ETAG),
+                response_status = %response.status(),
+                final_url = %response.url(),
+                "resumed ENA response did not preserve response identity"
             );
-            // A ranged 200 starts at byte zero. Appending it at a nonzero offset would duplicate
-            // compressed bytes, so reject it rather than attempting unsafe continuation.
-            return if is_retryable_http_status(response.status()) {
-                Err(io::Error::other(message))
-            } else {
-                Err(EnaStreamProblem::HttpStatus {
-                    status: response.status(),
-                    message,
-                }
-                .into_io_error())
-            };
+            return Err(EnaStreamProblem::ResumeIdentityInvalidated {
+                accession: fastq.accession.clone(),
+                mate: fastq.mate,
+                compressed_offset: expected_offset,
+                reconnects,
+            }
+            .into_io_error());
+        }
+        if status != StatusCode::PARTIAL_CONTENT {
+            return Err(EnaStreamProblem::HttpStatus { status, message }.into_io_error());
         }
         validate_identity_content_encoding(&response)?;
 
@@ -804,7 +900,29 @@ impl ActiveResponse {
             )));
         }
 
-        Ok(Self::new(response, parsed.start..parsed.end + 1))
+        let body = Self::new(response, parsed.start..parsed.end + 1);
+        if body.strong_etag().as_ref() != Some(expected_etag) {
+            tracing::info!(
+                accession = %fastq.accession,
+                mate = ?fastq.mate,
+                compressed_offset = expected_offset,
+                reconnects,
+                expected_etag = ?expected_etag.as_header_value(),
+                observed_etag = ?body.response.headers().get(ETAG),
+                response_status = %body.response.status(),
+                final_url = %body.response.url(),
+                "resumed ENA response did not preserve response identity"
+            );
+            return Err(EnaStreamProblem::ResumeIdentityInvalidated {
+                accession: fastq.accession.clone(),
+                mate: fastq.mate,
+                compressed_offset: expected_offset,
+                reconnects,
+            }
+            .into_io_error());
+        }
+
+        Ok(body)
     }
 
     fn new(response: Response, promised: Range<u64>) -> Self {
@@ -1725,8 +1843,11 @@ mod tests {
     #[test]
     fn ena_stream_resumes_after_premature_eof() -> Result<()> {
         let server = TestServer::spawn(vec![
-            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10),
-            Exchange::ranged(TEST_FASTQ_BYTES, 10),
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10)
+                .with_header("ETag", TEST_STRONG_ETAG),
+            Exchange::ranged(TEST_FASTQ_BYTES, 10)
+                .with_header("ETag", TEST_STRONG_ETAG)
+                .expect_if_range(TEST_STRONG_ETAG),
         ])?;
         let fastq = test_fastq(&server)?;
         let mut stream = test_client(2)?.stream(fastq)?;
@@ -1737,6 +1858,171 @@ mod tests {
         read_result?;
 
         assert_eq!(output, TEST_FASTQ_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_rejects_changed_resumed_etag_before_delivering_suffix() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10)
+                .with_header("ETag", TEST_STRONG_ETAG),
+            Exchange::ranged(TEST_FASTQ_BYTES, 10)
+                .with_header("ETag", REPLACEMENT_STRONG_ETAG)
+                .expect_if_range(TEST_STRONG_ETAG),
+        ])?;
+        let fastq = test_fastq(&server)?;
+        let mut stream = test_client(1)?.stream(fastq)?;
+
+        let mut output = Vec::new();
+        let error = stream
+            .read_to_end(&mut output)
+            .expect_err("changed response identity should prevent resumed suffix delivery");
+        server.finish()?;
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("could not be verified as the same file")
+        );
+        assert_eq!(output, &TEST_FASTQ_BYTES[..10]);
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_rejects_missing_resumed_etag_before_delivering_suffix() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10)
+                .with_header("ETag", TEST_STRONG_ETAG),
+            Exchange::ranged(TEST_FASTQ_BYTES, 10)
+                .without_header("ETag")
+                .expect_if_range(TEST_STRONG_ETAG),
+        ])?;
+        let fastq = test_fastq(&server)?;
+        let mut stream = test_client(1)?.stream(fastq)?;
+
+        let mut output = Vec::new();
+        let error = stream
+            .read_to_end(&mut output)
+            .expect_err("missing resumed identity should prevent suffix delivery");
+        server.finish()?;
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("could not be verified as the same file")
+        );
+        assert_eq!(output, &TEST_FASTQ_BYTES[..10]);
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_classifies_resumed_ok_after_if_range_as_identity_change() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10)
+                .with_header("ETag", TEST_STRONG_ETAG),
+            Exchange::ranged(TEST_FASTQ_BYTES, 10)
+                .with_status(StatusCode::OK)
+                .with_header("ETag", REPLACEMENT_STRONG_ETAG)
+                .expect_if_range(TEST_STRONG_ETAG),
+        ])?;
+        let fastq = test_fastq(&server)?;
+        let mut stream = test_client(1)?.stream(fastq)?;
+
+        let mut output = Vec::new();
+        let error = stream
+            .read_to_end(&mut output)
+            .expect_err("a complete response after If-Range should indicate replacement");
+        server.finish()?;
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("could not be verified as the same file")
+        );
+        assert_eq!(output, &TEST_FASTQ_BYTES[..10]);
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_refuses_nonzero_resume_without_strong_etag() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10).without_header("ETag"),
+        ])?;
+        let fastq = test_fastq(&server)?;
+        let mut stream = test_client(1)?.stream(fastq)?;
+
+        let mut output = Vec::new();
+        let error = stream
+            .read_to_end(&mut output)
+            .expect_err("a nonzero resume without identity evidence should fail closed");
+        server.finish()?;
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(message.contains("did not provide enough information"));
+        assert!(message.contains("compressed_offset: 10"));
+        assert!(message.contains("reconnects: 0"));
+        assert_eq!(output, &TEST_FASTQ_BYTES[..10]);
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_retries_from_offset_zero_without_strong_etag() -> Result<()> {
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 0).without_header("ETag"),
+            Exchange::initial(TEST_FASTQ_BYTES).without_header("ETag"),
+        ])?;
+        let fastq = test_fastq(&server)?;
+
+        let mut stream = test_client(1)?.stream(fastq)?;
+        let mut output = Vec::new();
+        let read_result = stream.read_to_end(&mut output);
+        server.finish()?;
+        read_result?;
+
+        assert_eq!(output, TEST_FASTQ_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn ena_stream_does_not_resume_with_unusable_initial_etag() -> Result<()> {
+        let cases: [(&str, &[&str]); 3] = [
+            ("weak", &["W/\"weak-representation\""]),
+            ("malformed", &["not-quoted"]),
+            (
+                "duplicate",
+                &["\"first-representation\"", "\"second-representation\""],
+            ),
+        ];
+
+        for (case, etags) in cases {
+            let mut initial =
+                Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10).without_header("ETag");
+            for etag in etags {
+                initial = initial.add_header("ETag", *etag);
+            }
+            let server = TestServer::spawn(vec![initial])?;
+            let fastq = test_fastq(&server)?;
+            let mut stream = test_client(1)?.stream(fastq)?;
+
+            let mut output = Vec::new();
+            let error = stream
+                .read_to_end(&mut output)
+                .expect_err("unusable initial ETag should prohibit a nonzero resume");
+            server.finish()?;
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "case: {case}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("did not provide enough information"),
+                "case: {case}"
+            );
+            assert_eq!(output, &TEST_FASTQ_BYTES[..10], "case: {case}");
+        }
         Ok(())
     }
 
@@ -1889,9 +2175,15 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
         ] {
             let server = TestServer::spawn(vec![
-                Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10),
-                Exchange::ranged(TEST_FASTQ_BYTES, 10).with_status(status),
-                Exchange::ranged(TEST_FASTQ_BYTES, 10),
+                Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10)
+                    .with_header("ETag", TEST_STRONG_ETAG),
+                Exchange::ranged(TEST_FASTQ_BYTES, 10)
+                    .with_status(status)
+                    .without_header("ETag")
+                    .expect_if_range(TEST_STRONG_ETAG),
+                Exchange::ranged(TEST_FASTQ_BYTES, 10)
+                    .with_header("ETag", TEST_STRONG_ETAG)
+                    .expect_if_range(TEST_STRONG_ETAG),
             ])?;
             let fastq = test_fastq(&server)?;
             let mut stream = test_client(2)?.stream(fastq)?;
@@ -1967,10 +2259,6 @@ mod tests {
     fn ena_stream_rejects_invalid_ranged_responses() -> Result<()> {
         let cases = [
             (
-                Exchange::ranged(TEST_FASTQ_BYTES, 10).with_status(StatusCode::OK),
-                "failed with status",
-            ),
-            (
                 Exchange::ranged(TEST_FASTQ_BYTES, 10).without_header("Content-Range"),
                 "did not include Content-Range",
             ),
@@ -2016,6 +2304,7 @@ mod tests {
         let redirect = Exchange {
             expected_target: FASTQ_TARGET.to_owned(),
             expected_range_offset: None,
+            expected_if_range: None,
             status: StatusCode::FOUND,
             headers: vec![
                 ("Location".to_owned(), "/".to_owned()),
@@ -2042,6 +2331,36 @@ mod tests {
     }
 
     #[test]
+    fn ena_stream_preserves_range_and_if_range_across_resume_redirect() -> Result<()> {
+        const REDIRECTED_TARGET: &str = "/redirected.fastq.gz";
+
+        let redirect = Exchange::ranged(TEST_FASTQ_BYTES, 10)
+            .with_status(StatusCode::FOUND)
+            .with_header("Location", REDIRECTED_TARGET)
+            .expect_if_range(TEST_STRONG_ETAG);
+        let mut resumed = Exchange::ranged(TEST_FASTQ_BYTES, 10)
+            .with_header("ETag", TEST_STRONG_ETAG)
+            .expect_if_range(TEST_STRONG_ETAG);
+        resumed.expected_target = REDIRECTED_TARGET.to_owned();
+        let server = TestServer::spawn(vec![
+            Exchange::promised_suffix(TEST_FASTQ_BYTES, 0, 10)
+                .with_header("ETag", TEST_STRONG_ETAG),
+            redirect,
+            resumed,
+        ])?;
+        let fastq = test_fastq(&server)?;
+        let mut stream = test_client(1)?.stream(fastq)?;
+
+        let mut output = Vec::new();
+        let read_result = stream.read_to_end(&mut output);
+        server.finish()?;
+        read_result?;
+
+        assert_eq!(output, TEST_FASTQ_BYTES);
+        Ok(())
+    }
+
+    #[test]
     fn scripted_server_reports_request_range_mismatches() -> Result<()> {
         let server = TestServer::spawn(vec![Exchange::ranged(TEST_FASTQ_BYTES, 10)])?;
         let url = server.fastq_url()?;
@@ -2064,6 +2383,8 @@ mod tests {
     const FASTQ_TARGET: &str = "/reads.fastq.gz";
     const SHUTDOWN_TARGET: &str = "/__nuclease_test_shutdown";
     const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
+    const TEST_STRONG_ETAG: &str = "\"test-representation\"";
+    const REPLACEMENT_STRONG_ETAG: &str = "\"replacement-representation\"";
 
     struct TestServer {
         address: SocketAddr,
@@ -2116,6 +2437,7 @@ mod tests {
     struct Exchange {
         expected_target: String,
         expected_range_offset: Option<u64>,
+        expected_if_range: Option<String>,
         status: StatusCode,
         headers: Vec<(String, String)>,
         body: Vec<u8>,
@@ -2143,6 +2465,7 @@ mod tests {
                 ),
                 ("Accept-Ranges".to_owned(), "bytes".to_owned()),
                 ("Content-Type".to_owned(), "application/x-gzip".to_owned()),
+                ("ETag".to_owned(), TEST_STRONG_ETAG.to_owned()),
             ];
             if offset > 0 {
                 headers.push((
@@ -2154,6 +2477,7 @@ mod tests {
             Self {
                 expected_target: FASTQ_TARGET.to_owned(),
                 expected_range_offset: (offset > 0).then_some(offset as u64),
+                expected_if_range: (offset > 0).then(|| TEST_STRONG_ETAG.to_owned()),
                 status,
                 headers,
                 body: payload[offset..delivered_end].to_vec(),
@@ -2162,6 +2486,11 @@ mod tests {
 
         fn with_status(mut self, status: StatusCode) -> Self {
             self.status = status;
+            self
+        }
+
+        fn expect_if_range(mut self, value: &str) -> Self {
+            self.expected_if_range = Some(value.to_owned());
             self
         }
 
@@ -2176,6 +2505,11 @@ mod tests {
             } else {
                 self.headers.push((name.to_owned(), value));
             }
+            self
+        }
+
+        fn add_header(mut self, name: &str, value: impl Into<String>) -> Self {
+            self.headers.push((name.to_owned(), value.into()));
             self
         }
 
@@ -2204,6 +2538,7 @@ mod tests {
 
             let mut accept_encoding = None;
             let mut range = None;
+            let mut if_range = None;
             for line in lines.take_while(|line| !line.is_empty()) {
                 let Some((name, value)) = line.split_once(':') else {
                     bail!("malformed HTTP request header: {line}");
@@ -2218,6 +2553,11 @@ mod tests {
                     ensure!(
                         range.replace(value).is_none(),
                         "HTTP request repeated Range"
+                    );
+                } else if name.eq_ignore_ascii_case("If-Range") {
+                    ensure!(
+                        if_range.replace(value).is_none(),
+                        "HTTP request repeated If-Range"
                     );
                 }
             }
@@ -2236,6 +2576,18 @@ mod tests {
                     range.is_none(),
                     "unexpected Range header on initial request: {}",
                     range.unwrap_or("<missing>")
+                ),
+            }
+            match self.expected_if_range.as_deref() {
+                Some(expected) => ensure!(
+                    if_range == Some(expected),
+                    "unexpected If-Range header: expected `{expected}`, observed `{}`",
+                    if_range.unwrap_or("<missing>")
+                ),
+                None => ensure!(
+                    if_range.is_none(),
+                    "unexpected If-Range header: expected `<missing>`, observed `{}`",
+                    if_range.unwrap_or("<missing>")
                 ),
             }
 
