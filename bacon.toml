@@ -1,0 +1,33 @@
+default_job = "check"
+wrap = false
+watch = ["Cargo.lock", "mise.toml", "mise.lock", "rust-toolchain.toml", ".mise", "INSTALL.sh"]
+on_change_strategy = "wait_then_restart"
+extraneous_args = false
+
+[env]
+CARGO_TARGET_DIR = "target/bacon"
+
+[jobs.check]
+command = ["mise", "run", "check-compile"]
+
+[jobs.clippy]
+command = ["mise", "run", "lint"]
+
+[jobs.build]
+command = ["mise", "run", "build"]
+
+[jobs.nextest]
+command = ["mise", "run", "test"]
+analyzer = "nextest"
+need_stdout = true
+
+[jobs.doc]
+command = ["mise", "run", "doc-check"]
+
+[jobs.full-check]
+command = ["mise", "run", "check"]
+need_stdout = true
+
+[keybindings]
+c = "job:clippy"
+t = "job:nextest"

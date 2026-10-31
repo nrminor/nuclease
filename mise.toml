@@ -1,15 +1,19 @@
-min_version = "2026.7.13"
+min_version = "2026.9.2"
 
 [settings]
 idiomatic_version_file_enable_tools = ["rust"]
 
 [tools]
+rust = { version = "1.96.0", profile = "minimal", components = ["clippy", "rustfmt", "rust-analyzer", "rust-src"], mr_boxington = true }
+mr-boxington = "1.29.0"
+"cargo:bacon" = "3.24.0"
 "github:nextest-rs/nextest" = { version = "0.9.140", version_prefix = "cargo-nextest-" }
 git-cliff = "2.13.1"
 shellcheck = "0.11.0"
 
 [env]
 _.source = ".mise/development-env.sh"
+MBX_SCHEDULER_TESTS = "1"
 
 [tasks.check]
 description = "Run all pre-commit checks"
@@ -62,7 +66,32 @@ run = "cargo nextest run --all-features --no-capture --no-tests=pass"
 
 [tasks.build]
 description = "Build Nuclease in debug mode"
+alias = "b"
 run = "cargo build"
+
+[tasks."bacon:check"]
+description = "Watch all targets and features with Bacon"
+alias = "bc"
+interactive = true
+run = "bacon check"
+
+[tasks."bacon:build"]
+description = "Watch development builds with Bacon"
+alias = "bb"
+interactive = true
+run = "bacon build"
+
+[tasks."bacon:nextest"]
+description = "Watch nextest runs with Bacon"
+alias = "bn"
+interactive = true
+run = "bacon nextest"
+
+[tasks."mbx:tui"]
+description = "Show mbx build and scheduler activity"
+alias = "mt"
+interactive = true
+run = "mbx tui"
 
 [tasks.build-release]
 description = "Build Nuclease with the release profile"
