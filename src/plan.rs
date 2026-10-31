@@ -6,7 +6,8 @@ use bumpalo::Bump;
 
 use crate::{
     error::{InternalError, Result},
-    record::{ReadStats, RecordView},
+    observer::RunObserver,
+    record::{RecordPair, RecordView},
 };
 
 /// Typestate marker for a logical preprocessing plan still being authored.
@@ -92,6 +93,25 @@ pub(crate) enum ActiveUnit<'a> {
     Pair(RecordPair<'a>),
 }
 
+impl<'record> From<RecordPair<'record>> for ActiveUnit<'record> {
+    fn from(pair: RecordPair<'record>) -> Self {
+        Self::Pair(pair)
+    }
+}
+
+impl<'record> ActiveUnit<'record> {
+    fn map_records(self, mut map: impl FnMut(RecordView<'record>) -> RecordView<'record>) -> Self {
+        match self {
+            Self::Single(record) => Self::Single(map(record)),
+            Self::Pair(pair) => {
+                let left = map(pair.left());
+                let right = map(pair.right());
+                Self::Pair(pair.with_records(left, right))
+            }
+        }
+    }
+}
+
 /// Emitted unit produced by an execution plan.
 #[derive(Clone, Copy)]
 pub(crate) enum EmittedUnit<'a> {
@@ -172,21 +192,21 @@ pub(crate) enum StepOutcome<'a> {
 }
 
 /// Mutable execution context shared by runtime steps for one execution unit.
-pub(crate) struct StepContext<'a, 'stats> {
+pub(crate) struct StepContext<'a, 'observer> {
     arena: &'a TransformArena,
-    stats: &'stats mut ReadStats,
+    observer: &'observer mut RunObserver,
     orphan_policy: OrphanPolicy,
     rejection_count: usize,
 }
 
 impl StepContext<'_, '_> {
     fn record_rejection(&mut self, code: &'static str) {
-        self.stats.record_rejected(code);
+        self.observer.record_rejected(code);
         self.rejection_count += 1;
     }
 
     fn record_transform(&mut self, code: &'static str) {
-        self.stats.record_transform(code);
+        self.observer.record_transform(code);
     }
 
     fn outcome<'a>(&self, emitted: EmittedUnit<'a>) -> ExecutionOutcome<'a> {
@@ -323,8 +343,12 @@ fn apply_filter_to_pair<'a, F>(
 where
     F: ReadFilter,
 {
-    let left = filter.evaluate(&pair.left).map_err(|reason| reason.code());
-    let right = filter.evaluate(&pair.right).map_err(|reason| reason.code());
+    let left = filter
+        .evaluate(&pair.left())
+        .map_err(|reason| reason.code());
+    let right = filter
+        .evaluate(&pair.right())
+        .map_err(|reason| reason.code());
 
     match (left, right) {
         (Ok(()), Ok(())) => StepOutcome::Continue(ActiveUnit::Pair(pair)),
@@ -332,14 +356,14 @@ where
             context.record_rejection(left_reason);
             match context.orphan_policy {
                 OrphanPolicy::DropPair => StepOutcome::Stop(context.outcome(EmittedUnit::None)),
-                OrphanPolicy::EmitOrphan => StepOutcome::Continue(ActiveUnit::Single(pair.right)),
+                OrphanPolicy::EmitOrphan => StepOutcome::Continue(ActiveUnit::Single(pair.right())),
             }
         }
         (Ok(()), Err(right_reason)) => {
             context.record_rejection(right_reason);
             match context.orphan_policy {
                 OrphanPolicy::DropPair => StepOutcome::Stop(context.outcome(EmittedUnit::None)),
-                OrphanPolicy::EmitOrphan => StepOutcome::Continue(ActiveUnit::Single(pair.left)),
+                OrphanPolicy::EmitOrphan => StepOutcome::Continue(ActiveUnit::Single(pair.left())),
             }
         }
         (Err(left_reason), Err(right_reason)) => {
@@ -371,13 +395,7 @@ where
             result.record
         };
 
-        Ok(StepOutcome::Continue(match unit {
-            ActiveUnit::Single(record) => ActiveUnit::Single(map_one(record)),
-            ActiveUnit::Pair(pair) => ActiveUnit::Pair(RecordPair {
-                left: map_one(pair.left),
-                right: map_one(pair.right),
-            }),
-        }))
+        Ok(StepOutcome::Continue(unit.map_records(&mut map_one)))
     }
 }
 
@@ -528,15 +546,6 @@ impl BuildPlan for Plan<Logical> {
     }
 }
 
-/// Paired execution unit carrying mate-preserving borrowed record views.
-#[derive(Clone, Copy)]
-pub(crate) struct RecordPair<'a> {
-    /// Left mate.
-    pub left: RecordView<'a>,
-    /// Right mate.
-    pub right: RecordView<'a>,
-}
-
 /// Shared final execution result for single-read and paired-read execution.
 pub(crate) struct ExecutionOutcome<'a> {
     emitted: EmittedUnit<'a>,
@@ -554,7 +563,7 @@ impl<'a> ExecutionOutcome<'a> {
         let records = match self.emitted {
             EmittedUnit::None => [None, None],
             EmittedUnit::Single(record) => [Some(record), None],
-            EmittedUnit::Pair(pair) => [Some(pair.left), Some(pair.right)],
+            EmittedUnit::Pair(pair) => [Some(pair.left()), Some(pair.right())],
         };
         records.into_iter().flatten()
     }
@@ -572,7 +581,7 @@ pub(crate) trait Execute<'a, In> {
         &mut self,
         input: In,
         arena: &'a mut TransformArena,
-        stats: &mut ReadStats,
+        observer: &mut RunObserver,
     ) -> Result<ExecutionOutcome<'a>>;
 }
 
@@ -582,11 +591,11 @@ impl Plan<Execution> {
         &mut self,
         mut unit: ActiveUnit<'a>,
         arena: &'a mut TransformArena,
-        stats: &mut ReadStats,
+        observer: &mut RunObserver,
     ) -> Result<ExecutionOutcome<'a>> {
         let mut context = StepContext {
             arena,
-            stats,
+            observer,
             orphan_policy: self.orphan_policy,
             rejection_count: 0,
         };
@@ -623,9 +632,9 @@ impl<'a> Execute<'a, RecordView<'a>> for Plan<Execution> {
         &mut self,
         input: RecordView<'a>,
         arena: &'a mut TransformArena,
-        stats: &mut ReadStats,
+        observer: &mut RunObserver,
     ) -> Result<ExecutionOutcome<'a>> {
-        self.execute_unit(ActiveUnit::Single(input), arena, stats)
+        self.execute_unit(ActiveUnit::Single(input), arena, observer)
     }
 }
 
@@ -634,9 +643,9 @@ impl<'a> Execute<'a, RecordPair<'a>> for Plan<Execution> {
         &mut self,
         input: RecordPair<'a>,
         arena: &'a mut TransformArena,
-        stats: &mut ReadStats,
+        observer: &mut RunObserver,
     ) -> Result<ExecutionOutcome<'a>> {
-        self.execute_unit(ActiveUnit::Pair(input), arena, stats)
+        self.execute_unit(input.into(), arena, observer)
     }
 }
 
@@ -650,7 +659,8 @@ mod tests {
     };
     use crate::{
         error::{InternalError, RunError},
-        record::{ReadStats, RecordView},
+        observer::RunObserver,
+        record::RecordView,
     };
     use color_eyre::eyre::Result;
 
@@ -753,6 +763,11 @@ mod tests {
         RecordView::new(b"read1", sequence, quality)
     }
 
+    fn pair(left: &'static [u8], right: &'static [u8]) -> RecordPair<'static> {
+        RecordPair::try_new(record(left).into(), record(right).into())
+            .expect("test records should form a valid pair")
+    }
+
     #[test]
     fn logical_plan_accumulates_steps_and_compiles() {
         let _plan = Plan::<Logical>::new()
@@ -805,9 +820,9 @@ mod tests {
             .read_set_transform(FakeReadSetTransform)
             .compile();
         let mut arena = TransformArena::new();
-        let mut stats = ReadStats::default();
+        let mut observer = RunObserver::new("test".to_owned());
 
-        let Err(error) = plan.execute(record(b"ACGT"), &mut arena, &mut stats) else {
+        let Err(error) = plan.execute(record(b"ACGT"), &mut arena, &mut observer) else {
             panic!("per-unit execution should reject read-set transforms");
         };
 
@@ -822,25 +837,25 @@ mod tests {
     fn single_execution_rejects_record_when_filter_fails() {
         let mut plan = Plan::<Logical>::new().step(MinLength::new(6)).compile();
         let mut arena = TransformArena::new();
-        let mut stats = ReadStats::default();
+        let mut observer = RunObserver::new("test".to_owned());
 
         let outcome = plan
-            .execute(record(b"ACGT"), &mut arena, &mut stats)
+            .execute(record(b"ACGT"), &mut arena, &mut observer)
             .expect("single-record filter failure should produce a rejected outcome");
 
         assert_eq!(outcome.emitted().count(), 0);
         assert_eq!(outcome.rejection_count(), 1);
-        assert_eq!(stats.rejection_counts.get("too_short"), Some(&1));
+        assert_eq!(observer.rejection_counts.get("too_short"), Some(&1));
     }
 
     #[test]
     fn single_execution_applies_transform_in_order() {
         let mut plan = Plan::<Logical>::new().step(TrimPrefix::new(1)).compile();
         let mut arena = TransformArena::new();
-        let mut stats = ReadStats::default();
+        let mut observer = RunObserver::new("test".to_owned());
 
         let outcome = plan
-            .execute(record(b"ACGT"), &mut arena, &mut stats)
+            .execute(record(b"ACGT"), &mut arena, &mut observer)
             .expect("single-record transform should produce an emitted outcome");
 
         assert_eq!(outcome.emitted().count(), 1);
@@ -858,17 +873,10 @@ mod tests {
     fn paired_execution_drops_orphan_by_default() {
         let mut plan = Plan::<Logical>::new().step(MinLength::new(6)).compile();
         let mut arena = TransformArena::new();
-        let mut stats = ReadStats::default();
+        let mut observer = RunObserver::new("test".to_owned());
 
         let outcome = plan
-            .execute(
-                RecordPair {
-                    left: record(b"ACGTAC"),
-                    right: record(b"ACGT"),
-                },
-                &mut arena,
-                &mut stats,
-            )
+            .execute(pair(b"ACGTAC", b"ACGT"), &mut arena, &mut observer)
             .expect("paired filter failure should produce a rejected outcome");
 
         assert_eq!(outcome.emitted().count(), 0);
@@ -882,17 +890,10 @@ mod tests {
             .orphan_policy(OrphanPolicy::EmitOrphan)
             .compile();
         let mut arena = TransformArena::new();
-        let mut stats = ReadStats::default();
+        let mut observer = RunObserver::new("test".to_owned());
 
         let outcome = plan
-            .execute(
-                RecordPair {
-                    left: record(b"ACGTAC"),
-                    right: record(b"ACGT"),
-                },
-                &mut arena,
-                &mut stats,
-            )
+            .execute(pair(b"ACGTAC", b"ACGT"), &mut arena, &mut observer)
             .expect("paired orphan policy should produce an emitted orphan outcome");
 
         assert_eq!(outcome.emitted().count(), 1);
@@ -902,10 +903,7 @@ mod tests {
     #[test]
     fn emitted_iterator_preserves_slot_order() {
         let outcome = ExecutionOutcome {
-            emitted: super::EmittedUnit::Pair(RecordPair {
-                left: record(b"AAAAAA"),
-                right: record(b"CCCCCC"),
-            }),
+            emitted: super::EmittedUnit::Pair(pair(b"AAAAAA", b"CCCCCC")),
             rejection_count: 0,
         };
 
