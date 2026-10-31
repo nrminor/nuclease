@@ -13,8 +13,9 @@ use thiserror::Error;
 
 use crate::{
     error::{InternalError, IoError, OutputDestination, Result, RunError, UsageError},
+    observer::RunObserver,
     plan::{EmittedUnit, ExecutionOutcome},
-    record::{ReadStats, RecordView, SequenceRecordRef},
+    record::{RecordView, SequenceRecordRef},
 };
 
 /// Raw output arguments selected by the CLI before they are resolved into valid output handles.
@@ -859,7 +860,7 @@ pub(crate) trait UnitOutput {
     fn write_outcome(
         &mut self,
         outcome: &ExecutionOutcome<'_>,
-        stats: &mut ReadStats,
+        observer: &mut RunObserver,
     ) -> Result<()>;
 }
 
@@ -1008,11 +1009,11 @@ impl UnitOutput for SingleOutputHandle {
     fn write_outcome(
         &mut self,
         outcome: &ExecutionOutcome<'_>,
-        stats: &mut ReadStats,
+        observer: &mut RunObserver,
     ) -> Result<()> {
         for record in outcome.emitted() {
             self.write_record(record)?;
-            stats.record_emitted(record.sequence().len());
+            observer.record_emitted(record.sequence().len());
         }
         Ok(())
     }
@@ -1105,20 +1106,20 @@ impl UnitOutput for PairedOutputHandle {
     fn write_outcome(
         &mut self,
         outcome: &ExecutionOutcome<'_>,
-        stats: &mut ReadStats,
+        observer: &mut RunObserver,
     ) -> Result<()> {
         match outcome.emitted_unit() {
             EmittedUnit::None => {
                 if outcome.rejection_count() > 0 {
-                    stats.record_pair_rejected();
+                    observer.record_pair_rejected();
                 }
                 Ok(())
             }
             EmittedUnit::Single(record) => match self {
                 Self::Interleaved(output) => {
                     output.write_record(record)?;
-                    stats.record_emitted(record.sequence().len());
-                    stats.record_pair_emitted();
+                    observer.record_emitted(record.sequence().len());
+                    observer.record_pair_emitted();
                     Ok(())
                 }
                 Self::Split(_) => Err(InternalError::PlanInvariant {
@@ -1127,10 +1128,10 @@ impl UnitOutput for PairedOutputHandle {
                 .into()),
             },
             EmittedUnit::Pair(pair) => {
-                self.write_pair(pair.left, pair.right)?;
-                stats.record_emitted(pair.left.sequence().len());
-                stats.record_emitted(pair.right.sequence().len());
-                stats.record_pair_emitted();
+                self.write_pair(pair.left(), pair.right())?;
+                observer.record_emitted(pair.left().sequence().len());
+                observer.record_emitted(pair.right().sequence().len());
+                observer.record_pair_emitted();
                 Ok(())
             }
         }

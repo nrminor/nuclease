@@ -11,8 +11,8 @@ use std::{
 use serde::Serialize;
 
 use crate::{
-    error::{InternalError, IoError, ReportWriteError, Result, RunError},
-    record::{AdmissionEvent, ReadStats},
+    error::{self, IoError, Result},
+    observer::{InvalidInputEvent, RunObserver},
 };
 
 /// Lightweight run context needed to explain a preprocessing run.
@@ -108,12 +108,15 @@ pub struct RunSummary {
     pub pair_rejection_fraction: Option<f64>,
     /// Fraction of pairs dropped at ingress for FASTQ invalidity.
     pub invalid_pair_fraction: Option<f64>,
-    /// First record-admission failures observed during this run.
-    pub admission_samples: Vec<AdmissionEvent>,
-    /// Whether admission samples were truncated to the bounded summary limit.
-    pub admission_samples_truncated: bool,
-    /// Admission-failure breakdown sorted by descending count.
-    pub admission_event_breakdown: Vec<CountBreakdown>,
+    /// First invalid-input events observed during this run.
+    #[serde(rename = "admission_samples")]
+    pub invalid_input_samples: Vec<InvalidInputEvent>,
+    /// Whether invalid-input samples were truncated to the bounded summary limit.
+    #[serde(rename = "admission_samples_truncated")]
+    pub invalid_input_samples_truncated: bool,
+    /// Invalid-input breakdown sorted by descending count.
+    #[serde(rename = "admission_event_breakdown")]
+    pub invalid_input_event_breakdown: Vec<CountBreakdown>,
     /// Rejection breakdown sorted by descending count.
     pub rejection_breakdown: Vec<CountBreakdown>,
     /// Transform breakdown sorted by descending count.
@@ -122,50 +125,51 @@ pub struct RunSummary {
 
 impl RunSummary {
     /// Build an owned summary from run context, counters, and elapsed wall time.
-    pub fn from_stats(context: RunContext, stats: &ReadStats, elapsed: Duration) -> Self {
+    pub fn from_observer(context: RunContext, observer: &RunObserver, elapsed: Duration) -> Self {
         let elapsed_seconds = elapsed.as_secs_f64();
         let paired = context.layout == RunLayout::Paired;
 
         Self {
             context,
             elapsed_seconds,
-            reads_per_second: rate(stats.reads_seen, elapsed_seconds),
-            bases_per_second: rate(stats.bases_seen, elapsed_seconds),
-            reads_seen: stats.reads_seen,
-            reads_emitted: stats.reads_emitted,
-            reads_rejected: stats.reads_rejected,
-            invalid_reads: stats.invalid_reads,
-            read_retention_fraction: fraction(stats.reads_emitted, stats.reads_seen),
-            read_rejection_fraction: fraction(stats.reads_rejected, stats.reads_seen),
-            invalid_read_fraction: fraction(stats.invalid_reads, stats.reads_seen),
-            bases_seen: stats.bases_seen,
-            bases_emitted: stats.bases_emitted,
-            base_retention_fraction: fraction(stats.bases_emitted, stats.bases_seen),
-            pairs_seen: paired.then_some(stats.pairs_seen),
-            pairs_emitted: paired.then_some(stats.pairs_emitted),
-            pairs_rejected: paired.then_some(stats.pairs_rejected),
-            invalid_pairs: paired.then_some(stats.invalid_pairs),
+            reads_per_second: rate(observer.reads_seen, elapsed_seconds),
+            bases_per_second: rate(observer.bases_seen, elapsed_seconds),
+            reads_seen: observer.reads_seen,
+            reads_emitted: observer.reads_emitted,
+            reads_rejected: observer.reads_rejected,
+            invalid_reads: observer.invalid_reads,
+            read_retention_fraction: fraction(observer.reads_emitted, observer.reads_seen),
+            read_rejection_fraction: fraction(observer.reads_rejected, observer.reads_seen),
+            invalid_read_fraction: fraction(observer.invalid_reads, observer.reads_seen),
+            bases_seen: observer.bases_seen,
+            bases_emitted: observer.bases_emitted,
+            base_retention_fraction: fraction(observer.bases_emitted, observer.bases_seen),
+            pairs_seen: paired.then_some(observer.pairs_seen),
+            pairs_emitted: paired.then_some(observer.pairs_emitted),
+            pairs_rejected: paired.then_some(observer.pairs_rejected),
+            invalid_pairs: paired.then_some(observer.invalid_pairs),
             pair_retention_fraction: paired
-                .then(|| fraction(stats.pairs_emitted, stats.pairs_seen)),
+                .then(|| fraction(observer.pairs_emitted, observer.pairs_seen)),
             pair_rejection_fraction: paired
-                .then(|| fraction(stats.pairs_rejected, stats.pairs_seen)),
-            invalid_pair_fraction: paired.then(|| fraction(stats.invalid_pairs, stats.pairs_seen)),
-            admission_samples: stats.admission_samples.clone(),
-            admission_samples_truncated: stats.admission_samples_truncated,
-            admission_event_breakdown: breakdowns(
-                &stats.admission_event_counts,
-                stats.reads_seen,
-                stats.admission_event_counts.values().sum(),
+                .then(|| fraction(observer.pairs_rejected, observer.pairs_seen)),
+            invalid_pair_fraction: paired
+                .then(|| fraction(observer.invalid_pairs, observer.pairs_seen)),
+            invalid_input_samples: observer.invalid_input_samples().to_vec(),
+            invalid_input_samples_truncated: observer.invalid_input_samples_truncated(),
+            invalid_input_event_breakdown: breakdowns(
+                observer.invalid_input_event_counts(),
+                observer.reads_seen,
+                observer.invalid_input_event_counts().values().sum(),
             ),
             rejection_breakdown: breakdowns(
-                &stats.rejection_counts,
-                stats.reads_seen,
-                stats.reads_rejected,
+                &observer.rejection_counts,
+                observer.reads_seen,
+                observer.reads_rejected,
             ),
             transform_breakdown: breakdowns(
-                &stats.transform_counts,
-                stats.reads_seen,
-                stats.transform_counts.values().sum(),
+                &observer.transform_counts,
+                observer.reads_seen,
+                observer.transform_counts.values().sum(),
             ),
         }
     }
@@ -198,34 +202,13 @@ fn write_summary_to(
     summary: &RunSummary,
 ) -> Result<()> {
     serde_json::to_writer_pretty(&mut *writer, summary)
-        .map_err(|source| classify_json_error("run summary", path, source))?;
+        .map_err(|source| error::constructors::json_report_error("run summary", path, source))?;
     writer.flush().map_err(|source| IoError::FinalizeReport {
         report_kind: "run summary",
         path: path.to_path_buf(),
         source,
     })?;
     Ok(())
-}
-
-fn classify_json_error(
-    report_kind: &'static str,
-    path: &Path,
-    source: serde_json::Error,
-) -> RunError {
-    if source.io_error_kind().is_some() {
-        IoError::WriteReport {
-            report_kind,
-            path: path.to_path_buf(),
-            source: ReportWriteError::Json(source),
-        }
-        .into()
-    } else {
-        InternalError::SerializeReport {
-            report_kind,
-            source,
-        }
-        .into()
-    }
 }
 
 fn render_summary(summary: &RunSummary) -> String {
@@ -235,7 +218,7 @@ fn render_summary(summary: &RunSummary) -> String {
     write_context(&mut output, summary);
     write_totals(&mut output, summary);
     write_pairs(&mut output, summary);
-    write_admission_samples(&mut output, summary);
+    write_invalid_input_samples(&mut output, summary);
     write_breakdowns(&mut output, summary);
     output
 }
@@ -338,15 +321,15 @@ fn write_pairs(output: &mut String, summary: &RunSummary) {
     }
 }
 
-fn write_admission_samples(output: &mut String, summary: &RunSummary) {
-    if summary.admission_samples.is_empty() {
+fn write_invalid_input_samples(output: &mut String, summary: &RunSummary) {
+    if summary.invalid_input_samples.is_empty() {
         return;
     }
 
-    output.push_str("\n  record-admission samples:\n");
-    for event in &summary.admission_samples {
+    output.push_str("\n  invalid-input samples:\n");
+    for event in &summary.invalid_input_samples {
         match event {
-            AdmissionEvent::SequenceQualityLengthMismatch {
+            InvalidInputEvent::SequenceQualityLengthMismatch {
                 source,
                 mate,
                 header,
@@ -356,6 +339,7 @@ fn write_admission_samples(output: &mut String, summary: &RunSummary) {
                 pairs_seen,
                 continued,
             } => {
+                let mate = mate.map_or_else(|| "single".to_owned(), |mate| mate.to_string());
                 let _ = writeln!(
                     output,
                     "    sequence_quality_length_mismatch source={source} mate={mate} header={header} sequence_len={sequence_len} quality_len={quality_len} reads_seen={reads_seen} pairs_seen={} continued={continued}",
@@ -363,20 +347,20 @@ fn write_admission_samples(output: &mut String, summary: &RunSummary) {
                         .map_or_else(|| "n/a".to_owned(), |pairs_seen| pairs_seen.to_string()),
                 );
             }
-            AdmissionEvent::PairIdentifierMismatch {
+            InvalidInputEvent::PairConstructionFailure {
                 source,
-                left_header,
-                right_header,
+                error,
                 reads_seen,
                 pairs_seen,
                 continued,
             } => {
                 let _ = writeln!(
                     output,
-                    "    pair_identifier_mismatch source={source} left_header={left_header} right_header={right_header} reads_seen={reads_seen} pairs_seen={pairs_seen} continued={continued}",
+                    "    {} source={source} error={error} reads_seen={reads_seen} pairs_seen={pairs_seen} continued={continued}",
+                    error.code(),
                 );
             }
-            AdmissionEvent::MissingMate {
+            InvalidInputEvent::MissingMate {
                 source,
                 present_mate,
                 header,
@@ -386,42 +370,58 @@ fn write_admission_samples(output: &mut String, summary: &RunSummary) {
             } => {
                 let _ = writeln!(
                     output,
-                    "    missing_mate source={source} present_mate={present_mate:?} header={header} reads_seen={reads_seen} pairs_seen={pairs_seen} continued={continued}",
+                    "    missing_mate source={source} present_mate={present_mate} header={header} reads_seen={reads_seen} pairs_seen={pairs_seen} continued={continued}",
                 );
             }
-            AdmissionEvent::RecordParseFailure {
+            InvalidInputEvent::SingleRecordParseFailure {
+                source,
+                failure,
+                reads_seen,
+                continued,
+            } => {
+                let _ = writeln!(
+                    output,
+                    "    record_parse_failure source={source} parser_kind={} message={} line={} reads_seen={reads_seen} continued={continued}",
+                    failure.parser_kind,
+                    failure.message,
+                    failure
+                        .line
+                        .map_or_else(|| "n/a".to_owned(), |line| line.to_string()),
+                );
+            }
+            InvalidInputEvent::PairedRecordParseFailure {
                 source,
                 mate,
-                parser_kind,
-                message,
-                line,
+                failure,
                 reads_seen,
                 pairs_seen,
                 continued,
             } => {
                 let _ = writeln!(
                     output,
-                    "    record_parse_failure source={source} mate={mate} parser_kind={parser_kind} message={message} line={} reads_seen={reads_seen} pairs_seen={} continued={continued}",
-                    line.map_or_else(|| "n/a".to_owned(), |line| line.to_string()),
-                    pairs_seen
-                        .map_or_else(|| "n/a".to_owned(), |pairs_seen| pairs_seen.to_string()),
+                    "    record_parse_failure source={source} mate={mate} parser_kind={} message={} line={} reads_seen={reads_seen} pairs_seen={pairs_seen} continued={continued}",
+                    failure.parser_kind,
+                    failure.message,
+                    failure
+                        .line
+                        .map_or_else(|| "n/a".to_owned(), |line| line.to_string()),
                 );
             }
         }
     }
 
-    if summary.admission_samples_truncated {
-        output.push_str("    ... additional record-admission events omitted from summary\n");
+    if summary.invalid_input_samples_truncated {
+        output.push_str("    ... additional invalid-input events omitted from summary\n");
     }
 }
 
 fn write_breakdowns(output: &mut String, summary: &RunSummary) {
-    if !summary.admission_event_breakdown.is_empty() {
-        output.push_str("\n  record-admission failures:\n");
-        for breakdown in &summary.admission_event_breakdown {
+    if !summary.invalid_input_event_breakdown.is_empty() {
+        output.push_str("\n  invalid-input events:\n");
+        for breakdown in &summary.invalid_input_event_breakdown {
             let _ = writeln!(
                 output,
-                "    {:<32} {:>10} ({:.2}% of reads, {:.2}% of admission events)",
+                "    {:<32} {:>10} ({:.2}% of reads, {:.2}% of invalid-input events)",
                 breakdown.code,
                 breakdown.count,
                 breakdown.fraction_of_reads_seen * 100.0,
@@ -508,7 +508,6 @@ fn u64_to_f64(value: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
         io::{self, Write},
         time::Duration,
     };
@@ -521,7 +520,8 @@ mod tests {
     };
     use crate::{
         error::{IoError, ReportWriteError, RunError},
-        record::{AdmissionEvent, ReadStats},
+        observer::{InvalidInputEvent, RunObserver},
+        record::MateSide,
     };
 
     struct FailingWriter {
@@ -553,46 +553,34 @@ mod tests {
         }
     }
 
-    fn sample_stats() -> ReadStats {
-        let mut rejection_counts = BTreeMap::new();
-        rejection_counts.insert("too_short", 3);
-        rejection_counts.insert("too_many_ns", 1);
-
-        let mut transform_counts = BTreeMap::new();
-        transform_counts.insert("trim_adapters", 4);
-
-        let mut admission_event_counts = BTreeMap::new();
-        admission_event_counts.insert("sequence_quality_length_mismatch", 1);
-
-        ReadStats {
-            reads_seen: 10,
-            reads_emitted: 6,
-            reads_rejected: 4,
-            invalid_reads: 1,
-            bases_seen: 100,
-            bases_emitted: 72,
-            pairs_seen: 5,
-            pairs_emitted: 3,
-            pairs_rejected: 2,
-            invalid_pairs: 1,
-            rejection_counts,
-            transform_counts,
-            admission_event_counts,
-            admission_warnings_emitted: 0,
-            admission_warnings_suppressed: false,
-            admission_samples: vec![AdmissionEvent::SequenceQualityLengthMismatch {
+    fn sample_observer() -> RunObserver {
+        let mut observer = RunObserver::new("ena:SRR35939766".to_owned());
+        observer.reads_seen = 10;
+        observer.reads_emitted = 6;
+        observer.reads_rejected = 4;
+        observer.invalid_reads = 1;
+        observer.bases_seen = 100;
+        observer.bases_emitted = 72;
+        observer.pairs_seen = 5;
+        observer.pairs_emitted = 3;
+        observer.pairs_rejected = 2;
+        observer.invalid_pairs = 1;
+        observer.rejection_counts.insert("too_short", 3);
+        observer.rejection_counts.insert("too_many_ns", 1);
+        observer.transform_counts.insert("trim_adapters", 4);
+        observer
+            .record_invalid_input(InvalidInputEvent::SequenceQualityLengthMismatch {
                 source: "ena:SRR35939766".to_owned(),
-                mate: "right",
+                mate: Some(MateSide::Right),
                 header: "SRR35939766.42 instrument/2".to_owned(),
                 sequence_len: 267,
                 quality_len: 20,
                 reads_seen: 84,
                 pairs_seen: Some(42),
                 continued: true,
-            }],
-            admission_samples_truncated: false,
-            admission_report: None,
-        }
+            })
+            .expect("sample invalid-input event should be recorded");
+        observer
     }
 
     fn sample_context() -> RunContext {
@@ -608,7 +596,7 @@ mod tests {
     #[test]
     fn run_summary_sorts_breakdowns_by_count() {
         let summary =
-            RunSummary::from_stats(sample_context(), &sample_stats(), Duration::from_secs(2));
+            RunSummary::from_observer(sample_context(), &sample_observer(), Duration::from_secs(2));
 
         assert_eq!(summary.rejection_breakdown[0].code, "too_short");
         assert_eq!(summary.rejection_breakdown[0].count, 3);
@@ -619,7 +607,7 @@ mod tests {
     #[test]
     fn render_summary_includes_breakdowns_and_metadata() {
         let summary =
-            RunSummary::from_stats(sample_context(), &sample_stats(), Duration::from_secs(2));
+            RunSummary::from_observer(sample_context(), &sample_observer(), Duration::from_secs(2));
         let rendered = render_summary(&summary);
 
         assert!(rendered.contains("ingress mode:        ena"));
@@ -628,7 +616,7 @@ mod tests {
         assert!(rendered.contains("too_short"));
         assert!(rendered.contains("transforms applied:"));
         assert!(rendered.contains("trim_adapters"));
-        assert!(rendered.contains("record-admission samples:"));
+        assert!(rendered.contains("invalid-input samples:"));
         assert!(rendered.contains("SRR35939766.42 instrument/2"));
     }
 
@@ -637,7 +625,7 @@ mod tests {
         let temp = tempdir().expect("tempdir should exist");
         let path = temp.path().join("summary.json");
         let summary =
-            RunSummary::from_stats(sample_context(), &sample_stats(), Duration::from_secs(2));
+            RunSummary::from_observer(sample_context(), &sample_observer(), Duration::from_secs(2));
 
         write_summary_json(&path, &summary).expect("json summary should write");
 
@@ -652,7 +640,7 @@ mod tests {
     #[test]
     fn summary_write_failure_retains_path_and_json_io_source() {
         let summary =
-            RunSummary::from_stats(sample_context(), &sample_stats(), Duration::from_secs(2));
+            RunSummary::from_observer(sample_context(), &sample_observer(), Duration::from_secs(2));
         let path = std::path::Path::new("summary.json");
         let mut writer = FailingWriter {
             fail_write: true,
@@ -674,7 +662,7 @@ mod tests {
     #[test]
     fn summary_flush_failure_is_report_finalization() {
         let summary =
-            RunSummary::from_stats(sample_context(), &sample_stats(), Duration::from_secs(2));
+            RunSummary::from_observer(sample_context(), &sample_observer(), Duration::from_secs(2));
         let path = std::path::Path::new("summary.json");
         let mut writer = FailingWriter {
             fail_write: false,
@@ -698,7 +686,7 @@ mod tests {
         let temp = tempdir().expect("tempdir should exist");
         let path = temp.path().join("missing-parent").join("summary.json");
         let summary =
-            RunSummary::from_stats(sample_context(), &sample_stats(), Duration::from_secs(2));
+            RunSummary::from_observer(sample_context(), &sample_observer(), Duration::from_secs(2));
 
         let error = write_summary_json(&path, &summary)
             .expect_err("summary under missing parent should fail to open");

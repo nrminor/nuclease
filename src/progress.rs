@@ -7,7 +7,7 @@ use std::{
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
-use crate::record::ReadStats;
+use crate::observer::RunObserver;
 
 /// Progress rendering mode selected from CLI quietness and terminal capabilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,15 +53,15 @@ impl ProgressReporter {
     }
 
     /// Emit a progress update if the next threshold has been crossed.
-    pub fn maybe_report(&mut self, stats: &ReadStats) {
+    pub fn maybe_report(&mut self, observer: &RunObserver) {
         if self.mode == ProgressMode::Off
             || self.every == 0
-            || stats.reads_seen < self.next_threshold
+            || observer.reads_seen < self.next_threshold
         {
             return;
         }
 
-        let message = render_message(stats, self.started_at.elapsed().as_secs_f64());
+        let message = render_message(observer, self.started_at.elapsed().as_secs_f64());
 
         match self.mode {
             ProgressMode::Live => {
@@ -87,36 +87,42 @@ impl ProgressReporter {
     }
 }
 
-fn render_message(stats: &ReadStats, elapsed_seconds: f64) -> String {
-    let reads_per_second = rate(stats.reads_seen, elapsed_seconds);
-    let bases_per_second = rate(stats.bases_seen, elapsed_seconds);
-    let (retained_fraction, retained_unit) = if stats.pairs_seen > 0 {
-        (fraction(stats.pairs_emitted, stats.pairs_seen), "pairs")
+fn render_message(observer: &RunObserver, elapsed_seconds: f64) -> String {
+    let reads_per_second = rate(observer.reads_seen, elapsed_seconds);
+    let bases_per_second = rate(observer.bases_seen, elapsed_seconds);
+    let (retained_fraction, retained_unit) = if observer.pairs_seen > 0 {
+        (
+            fraction(observer.pairs_emitted, observer.pairs_seen),
+            "pairs",
+        )
     } else {
-        (fraction(stats.reads_emitted, stats.reads_seen), "reads")
+        (
+            fraction(observer.reads_emitted, observer.reads_seen),
+            "reads",
+        )
     };
-    let top_rejection = top_rejection_reason(stats).map_or_else(
+    let top_rejection = top_rejection_reason(observer).map_or_else(
         || "none".to_owned(),
         |(code, count)| format!("{code}:{count}"),
     );
 
     format!(
         "reads={} emitted={} rejected={} ({:.1}% {} retained) bases={} emitted_bases={} {:.0} reads/s {:.1} bases/s top_reject={}",
-        stats.reads_seen,
-        stats.reads_emitted,
-        stats.reads_rejected,
+        observer.reads_seen,
+        observer.reads_emitted,
+        observer.reads_rejected,
         retained_fraction * 100.0,
         retained_unit,
-        stats.bases_seen,
-        stats.bases_emitted,
+        observer.bases_seen,
+        observer.bases_emitted,
         reads_per_second,
         bases_per_second,
         top_rejection,
     )
 }
 
-fn top_rejection_reason(stats: &ReadStats) -> Option<(&'static str, u64)> {
-    stats
+fn top_rejection_reason(observer: &RunObserver) -> Option<(&'static str, u64)> {
+    observer
         .rejection_counts
         .iter()
         .max_by(|(left_code, left_count), (right_code, right_count)| {
@@ -153,7 +159,7 @@ fn u64_to_f64(value: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::record::ReadStats;
+    use crate::observer::RunObserver;
 
     use super::{ProgressMode, ProgressReporter, rate, render_message};
 
@@ -169,15 +175,13 @@ mod tests {
 
     #[test]
     fn merged_pair_progress_reports_pair_retention() {
-        let stats = ReadStats {
-            reads_seen: 2,
-            reads_emitted: 1,
-            pairs_seen: 1,
-            pairs_emitted: 1,
-            ..ReadStats::default()
-        };
+        let mut observer = RunObserver::new("test".to_owned());
+        observer.reads_seen = 2;
+        observer.reads_emitted = 1;
+        observer.pairs_seen = 1;
+        observer.pairs_emitted = 1;
 
-        let message = render_message(&stats, 1.0);
+        let message = render_message(&observer, 1.0);
 
         assert!(
             message.contains("(100.0% pairs retained)"),
@@ -187,13 +191,11 @@ mod tests {
 
     #[test]
     fn single_end_progress_reports_read_retention() {
-        let stats = ReadStats {
-            reads_seen: 4,
-            reads_emitted: 3,
-            ..ReadStats::default()
-        };
+        let mut observer = RunObserver::new("test".to_owned());
+        observer.reads_seen = 4;
+        observer.reads_emitted = 3;
 
-        let message = render_message(&stats, 1.0);
+        let message = render_message(&observer, 1.0);
 
         assert!(
             message.contains("(75.0% reads retained)"),

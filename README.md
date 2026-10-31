@@ -22,7 +22,7 @@ nuclease \
 | sourmash sketch dna -p k=31 - -o sample.zip
 ```
 
-Here, `nuclease` is used to stream and preprocess reads from ENA and then pass them along into kmer sketching with Sourmash. At no point in this preprocessing will the full read dataset be materialized on disk. Instead, reads are streamed and operated on as they arrive from ENA. `nuclease` can safely resume interrupted ENA transfers and checks completed downloads against ENA's catalogue.
+Here, `nuclease` is used to stream and preprocess reads from ENA and then pass them along into kmer sketching with Sourmash. At no point in this preprocessing will the full read dataset be materialized on disk. Instead, reads are streamed and operated on as they arrive from ENA. `nuclease` resumes interrupted ENA transfers only when response identity can be verified, and checks completed downloads against ENA's catalogue size and MD5. If a transfer cannot be resumed safely, nuclease stops and recommends retrying the complete run.
 
 `nuclease`'s second big feature is developer-focused: it is highly extensible. See the [Contributing to nuclease](#contributing-to-nuclease) section for more.
 
@@ -63,6 +63,10 @@ For paired-end input, the CLI currently uses the `DropPair` orphan policy during
 Local input can be single-end (`--in reads.fastq.gz`), interleaved paired-end (`--in reads.fastq.gz --paired`), or split paired-end (`--in1 reads_1.fastq.gz --in2 reads_2.fastq.gz`). Output uses stdout by default. `--out` writes the run's natural single stream to a file: ordinary reads for single-end input, or interleaved pairs for paired input. Paired output can also be split with `--out1`/`--out2`.
 
 In designing nuclease, a fair amount of thought was put into how to handle invalid FASTQ records. Under the hood, nuclease has an extensible concept of "record admission". To control that admission, we provide the command line argument `--on-invalid-input error|skip`, which defaults to `error`. `skip` drops the entire admission, which means a single read in the case of single-end inputs or a pair for paired-end inputs. Using this also requires the user provide a path for reporting invalid records with `--invalid-input-report PATH`; every admission failure encountered while that report is configured is written as machine-friendly JSONL, with `continued` distinguishing recovered skips from terminal parser failures. The promise here is that invalid FASTQ records will never be silently glossed over, something that seems somewhat rare in the ecosystem of tools for processing sequencing reads! Note that while this can help you catch issues e.g. in storage in SRA or in upstream processing, it also carries a performance penalty, as all reads are put through additional checks. Some failures, including parser corruption that cannot be safely resynchronized and transport failures while streaming from ENA, remain fatal and use the typed process status appropriate to their source and certainty. We do our best to separate these failures from safely recoverable record-admission errors, but contributions to further improve this are welcome!
+
+`skip` applies only when parsing can safely continue. Parser-level failures, including unequal sequence and quality lengths, stop the run under either policy; the invalid-input report records `continued: false`, and nuclease does not write a success summary. Records or complete pairs emitted before the failure may already be present in the output, so a failed run's output must not be treated as complete.
+
+Paired input validates matching identifiers and rejects explicit mate designations that contradict the input position, such as `/2` in the left identifier or `/1` in the right. Under `skip`, admission failures discard the complete pair. Invalid-input events include parser evidence under `failure` or typed pair-construction evidence under `error`; header evidence in pair errors uses escaped, bounded excerpts.
 
 ## Contributing to nuclease
 
