@@ -38,7 +38,7 @@ pub(crate) enum PairedInputLayout {
 
 /// Central constructors that classify concrete failures into the application error hierarchy.
 pub(crate) mod constructors {
-    use std::{fmt, path::Path};
+    use std::{error::Error, fmt, io, path::Path};
 
     use needletail::{
         errors::{ParseError, ParseErrorKind},
@@ -401,6 +401,32 @@ pub(crate) mod constructors {
         }
     }
 
+    /// Classify an index decode failure using the last underlying read outcome.
+    ///
+    /// Truncation is malformed input; other unrecovered read failures are I/O errors.
+    /// The reader must clear recorded failures after successful reads.
+    pub(crate) fn index_load_error(
+        role: &'static str,
+        path: &Path,
+        read_error: Option<io::ErrorKind>,
+        source: Box<dyn Error + Send + Sync>,
+    ) -> RunError {
+        match read_error {
+            Some(kind) if kind != io::ErrorKind::UnexpectedEof => IoError::SelectionIndex {
+                role,
+                path: path.to_path_buf(),
+                source,
+            }
+            .into(),
+            _ => MalformedInputError::SelectionIndex {
+                role,
+                path: path.to_path_buf(),
+                source,
+            }
+            .into(),
+        }
+    }
+
     pub(crate) fn json_report_error(
         report_kind: &'static str,
         path: &Path,
@@ -639,6 +665,8 @@ enum AccessionSyntaxProblem {
 /// Semantically invalid selections discovered after successful CLI parsing or input resolution.
 #[derive(Debug, Error)]
 pub(crate) enum UsageError {
+    #[error("{role} minimizer hit threshold must be at least 1")]
+    ZeroSelectionThreshold { role: &'static str },
     #[error(
         "paired output paths imply different encodings\n\
          out1: {out1} ({encoding1})\n\
@@ -668,6 +696,13 @@ pub(crate) enum UsageError {
 /// Local input failures whose structure is demonstrably malformed.
 #[derive(Debug, Error)]
 pub(crate) enum MalformedInputError {
+    #[error("invalid {role} Deacon index {path}")]
+    SelectionIndex {
+        role: &'static str,
+        path: PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error(
         "record parser rejected malformed input while reading source={source_label} mate={mate}\n\
          admission_policy={policy}\n\
@@ -797,6 +832,13 @@ pub(crate) enum MalformedInputError {
 /// Requested inputs that cannot be opened or resolved in a supported form.
 #[derive(Debug, Error)]
 pub(crate) enum UnavailableInputError {
+    #[error("failed to open {role} Deacon index {path}")]
+    SelectionIndex {
+        role: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error(
         "failed to open local FASTQ input {path}\n\
          help: check that the path exists and is readable from this environment"
@@ -851,6 +893,13 @@ impl fmt::Display for OutputDestination {
 /// External local read, required-output, and requested-report failures.
 #[derive(Debug, Error)]
 pub(crate) enum IoError {
+    #[error("failed while reading {role} Deacon index {path}")]
+    SelectionIndex {
+        role: &'static str,
+        path: PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error(
         "failed while reading local FASTQ input {path}\n\
          help: check filesystem and storage health, then retry the read"
@@ -1200,6 +1249,11 @@ pub(crate) enum EnaContentProblem {
 /// Software defects, initialization failures, and violated internal expectations.
 #[derive(Debug, Error)]
 pub(crate) enum InternalError {
+    #[error("failed to prepare Deacon selection worker")]
+    SelectionWorker {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error(
         "failed to initialize tracing subscriber\n\
          help: report this diagnostic if it persists in a clean environment"
@@ -1276,6 +1330,40 @@ mod tests {
         UnavailableInputError, UsageError, constructors,
     };
     use crate::ena::Accession;
+
+    #[test]
+    fn index_load_error_classifies_read_evidence_and_preserves_context() {
+        let path = PathBuf::from("enrich.idx");
+        for (read_error, expected_status) in [
+            (None, 65),
+            (Some(io::ErrorKind::UnexpectedEof), 65),
+            (Some(io::ErrorKind::PermissionDenied), 74),
+            (Some(io::ErrorKind::Interrupted), 74),
+        ] {
+            let error = constructors::index_load_error(
+                "enrichment",
+                &path,
+                read_error,
+                Box::new(io::Error::other("decoder context")),
+            );
+            assert_eq!(error.exit_code(), ExitCode::from(expected_status));
+            let (role, error_path, source) = match &error {
+                RunError::Io(IoError::SelectionIndex { role, path, source }) => {
+                    (role, path, source)
+                }
+                RunError::MalformedInput(error) => match &**error {
+                    MalformedInputError::SelectionIndex { role, path, source } => {
+                        (role, path, source)
+                    }
+                    other => panic!("unexpected malformed-input error: {other}"),
+                },
+                other => panic!("unexpected index-load error: {other}"),
+            };
+            assert_eq!(*role, "enrichment");
+            assert_eq!(error_path, &path);
+            assert_eq!(source.to_string(), "decoder context");
+        }
+    }
 
     #[test]
     fn run_error_categories_map_to_stable_exit_codes() {

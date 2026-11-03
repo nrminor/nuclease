@@ -1,5 +1,7 @@
 //! Core read filtering operations and their fluent plan extensions.
 
+pub(crate) mod minimizer;
+
 use bytecount::count;
 use std::f64::consts::LN_2;
 

@@ -16,7 +16,10 @@ use crate::{
         self, InputOrigin, PairConstructionError, PairedInputLayout, Result, UnavailableInputError,
         UsageError,
     },
-    filter::{MaxNsFilter, MinEntropyFilter, MinLengthFilter, MinMeanQualityFilter},
+    filter::{
+        MaxNsFilter, MinEntropyFilter, MinLengthFilter, MinMeanQualityFilter,
+        minimizer::MinimizerFilter,
+    },
     observer::{InvalidInputEvent, InvalidInputReport, RunObserver},
     output::{OutputArgs, PairedOutputHandle, SingleOutputHandle, UnitOutput},
     pair_merge::MergePairsTransform,
@@ -194,6 +197,7 @@ type SingleEndContext = RunContext<SingleEnd>;
 type PairedEndContext = RunContext<PairedEnd>;
 
 struct RunConfig {
+    selection: Option<MinimizerFilter>,
     min_length: usize,
     max_ns: usize,
     min_mean_q: f64,
@@ -212,9 +216,17 @@ struct RunConfig {
     invalid_input_report: Option<PathBuf>,
 }
 
-impl From<&Cli> for RunConfig {
-    fn from(cli: &Cli) -> Self {
-        Self {
+impl TryFrom<&Cli> for RunConfig {
+    type Error = crate::error::RunError;
+    fn try_from(cli: &Cli) -> Result<Self> {
+        Ok(Self {
+            selection: MinimizerFilter::builder()
+                .enrich_index(cli.enrich_index.as_deref())
+                .enrich_min_hits(cli.enrich_min_hits)
+                .deplete_index(cli.deplete_index.as_deref())
+                .deplete_min_hits(cli.deplete_min_hits)
+                .policy(cli.selection_policy)
+                .load()?,
             min_length: cli.min_length,
             max_ns: cli.max_ns,
             min_mean_q: cli.min_mean_q,
@@ -231,7 +243,7 @@ impl From<&Cli> for RunConfig {
             progress_every: cli.progress_every,
             summary: cli.summary.clone(),
             invalid_input_report: cli.invalid_input_report.clone(),
-        }
+        })
     }
 }
 
@@ -251,6 +263,11 @@ impl RunConfig {
         if self.passthrough {
             return plan.orphan_policy(OrphanPolicy::DropPair).compile();
         }
+
+        let plan = match &self.selection {
+            Some(selection) => plan.step(selection.clone()),
+            None => plan,
+        };
 
         let plan = if self.merge_pairs && layout == RunLayout::Paired {
             plan.merge_pairs(crate::pair_merge::MergePairsConfig {
@@ -291,7 +308,7 @@ impl RunConfig {
 pub(crate) fn run(cli: &Cli) -> Result<()> {
     cli.init_tracing()?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting nuclease");
-    let config = RunConfig::from(cli);
+    let config = RunConfig::try_from(cli)?;
     let ui = cli.ui_policy();
 
     match cli.ingress()? {
@@ -1361,6 +1378,11 @@ mod tests {
 
     fn test_cli() -> Cli {
         Cli {
+            enrich_index: None,
+            deplete_index: None,
+            enrich_min_hits: None,
+            deplete_min_hits: None,
+            selection_policy: None,
             ena: None,
             input: None,
             paired: false,
@@ -1547,7 +1569,7 @@ mod tests {
         let output = output_args.resolve_paired()?;
         let cli = test_cli();
         let ui = cli.ui_policy();
-        let config = RunConfig::from(&cli);
+        let config = RunConfig::try_from(&cli)?;
         let error = PairedEndContext {
             source: PairedSource::LocalSplit {
                 input1: "reads_1.fastq.gz".into(),

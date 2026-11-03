@@ -42,6 +42,7 @@ This downloads a pre-built binary for your platform when one is available. If no
 
 Supported filters are:
 
+- [Deacon](https://github.com/bede/deacon) enrichment and depletion (`--enrich-index`, `--deplete-index`): keep enrichment matches or remove depletion matches before other preprocessing.
 - Maximum ambiguous bases (`--max-ns`): rejects reads with more than the configured number of `N` bases.
 - Minimum read length (`--min-length`): rejects post-transform reads shorter than the configured length.
 - Minimum mean Phred quality (`--min-mean-q`): rejects post-transform reads whose mean quality is below the configured threshold.
@@ -54,7 +55,13 @@ Supported transforms are:
 - 3' quality trimming (`--trim-min-q`): trims low-quality suffixes using the configured Phred cutoff.
 - Quality-score binning (`--bin-qualities[=2|3|5]`; disabled by default): lossily remaps Phred+33 quality scores into 2, 3, or 5 platform-neutral bins after trimming, merging, and quality-sensitive filters have already run. Passing `--bin-qualities` without a value uses 5 bins.
 
-Use `-p`/`--passthrough` to parse and validate input while emitting reads without filters or transforms. Passthrough output is produced by nuclease's normal FASTQ writer rather than copied byte-for-byte from the input, and it cannot be combined with `--merge-pairs`.
+When both indexes are supplied, `--selection-policy depletion-veto` (the default) keeps enrichment matches that do not match depletion. `--selection-policy enrichment-rescue` removes depletion matches unless they also match enrichment. Reads without a depletion match are kept under this policy.
+
+`--enrich-min-hits` and `--deplete-min-hits` set independent thresholds (default: 2 distinct minimizer hits). Paired reads pool distinct hits across both mates and are kept or rejected together.
+
+Use uncompressed Deacon exact v3 or fuse v1 indexes from a trusted source. Fuse indexes can produce false-positive matches.
+
+Use `-p`/`--passthrough` to parse and validate input while emitting reads without filters or transforms. Passthrough output is produced by nuclease's normal FASTQ writer rather than copied byte-for-byte from the input, and it cannot be combined with `--merge-pairs` or Deacon selection.
 
 Adapter presets are curated sequence catalogs, not adapter auto-detection. Adapter trimming is disabled unless a preset is selected explicitly. The current trimmer only exposes presets with entries that are safe for 3' suffix-overlap trimming. Long-read catalog entries that require 5' trimming, both-end matching, barcode interpretation, internal-adapter handling, read splitting, demultiplexing, or orientation correction are retained as structured catalog metadata until those algorithms are implemented, but are not exposed as CLI presets yet.
 
@@ -161,8 +168,6 @@ impl<T> GcRangeFilter for T where T: BuildPlan {}
 
 This teaches the execution planner that `GcRange` is a filter step. And then making the GcRangeFilter trait and blanket implementing it for all `BuildPlan` types means we can now include our new operation in the `nuclease` plan builder:
 
-Each compilation borrows the definition and prepares an independent owned worker. A filter may override `evaluate_pair` to make one atomic decision for a pair; otherwise both mates are evaluated independently. Rejection totals and reason counts measure the current records covered by each decision, so an atomic pair rejection counts two and a subsequently rejected merged record counts one. Under the drop-pair policy, a passing mate discarded because its partner failed is counted separately as suppressed, not as rejected.
-
 ```rust
 use crate::filter::{
     GcRangeFilter, MaxNsFilter, MinEntropyFilter, MinLengthFilter, MinMeanQualityFilter,
@@ -182,6 +187,8 @@ let plan = Plan::new()
     .orphan_policy(OrphanPolicy::DropPair)
     .compile()?;
 ```
+
+`compile()` prepares a fresh worker for each operation, so the same plan definition can be compiled more than once. Filters evaluate mates separately by default; override `evaluate_pair` to decide for the whole pair.
 
 Transforms that produce mutated versions of the input reads work exactly the same way.
 
@@ -296,14 +303,14 @@ In both cases, the following steps are all that's needed to do new things in `nu
 1. Make a new struct to handle the transform or filter.
 2. Make a struct that records the reason for rejection, if a filter. This isn't necessary for transforms.
 3. Implement `ReadFilter` or `ReadTransform`.
-4. Implement `PrepareExecutionStep` to construct an owned worker from the reusable definition. Preparation can fail and must leave the definition reusable.
+4. Implement `PrepareExecutionStep` to create a fresh worker for each compilation.
 5. Package the struct in a trait and blanket implement it for all plans.
 
 ### Roadmap
 
 If you're guessing I have plans to make use of this extensibility, you'd be right! These plans currently include:
 
-- [ ] Internal integration with [Deacon](https://github.com/bede/deacon) to allow decontamination or enrichment with Deacon indices.
+- [x] Enrichment and depletion with [Deacon](https://github.com/bede/deacon).
 - [x] Support for paired-read overlap merging.
 - [ ] Support for memory-frugal sorting of reads by sequence homology to improve compression.
 - [ ] More adapter trimming support.

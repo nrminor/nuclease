@@ -9,7 +9,7 @@ use std::{
 use clap::{
     ArgAction, ArgGroup, Parser, ValueEnum,
     builder::{
-        Styles,
+        RangedU64ValueParser, Styles,
         styling::{AnsiColor, Effects},
     },
 };
@@ -20,6 +20,7 @@ use crate::{
     adapter::AdapterPreset,
     ena::Accession,
     error::{InternalError, Result},
+    filter::minimizer::SelectionPolicy,
     output::{OutputArgs, OutputEncoding, OutputFormat},
     progress::ProgressMode,
     quality::QualityBinCount,
@@ -85,6 +86,21 @@ pub enum AdmissionPolicy {
     Skip,
 }
 
+impl ValueEnum for SelectionPolicy {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::DepletionVeto, Self::EnrichmentRescue]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(match self {
+            Self::DepletionVeto => clap::builder::PossibleValue::new("depletion-veto")
+                .help("Require enrichment and reject depletion"),
+            Self::EnrichmentRescue => clap::builder::PossibleValue::new("enrichment-rescue")
+                .help("Keep enrichment hits or reads without depletion hits"),
+        })
+    }
+}
+
 impl fmt::Display for AdmissionPolicy {
     /// Format the policy as its stable machine-readable token.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -112,6 +128,21 @@ impl fmt::Display for AdmissionPolicy {
         .args(["ena", "input", "in1"])
 ))]
 pub struct Cli {
+    /// Deacon enrichment index.
+    #[arg(long, conflicts_with = "passthrough", help_heading = "Selection")]
+    pub enrich_index: Option<PathBuf>,
+    /// Deacon depletion index.
+    #[arg(long, conflicts_with = "passthrough", help_heading = "Selection")]
+    pub deplete_index: Option<PathBuf>,
+    /// Minimum distinct enrichment hits (default 2).
+    #[arg(long, requires = "enrich_index", value_parser = RangedU64ValueParser::<usize>::new().range(1..), help_heading = "Selection")]
+    pub enrich_min_hits: Option<usize>,
+    /// Minimum distinct depletion hits (default 2).
+    #[arg(long, requires = "deplete_index", value_parser = RangedU64ValueParser::<usize>::new().range(1..), help_heading = "Selection")]
+    pub deplete_min_hits: Option<usize>,
+    /// Combination policy when both indexes are present.
+    #[arg(long, value_enum, requires_all = ["enrich_index", "deplete_index"], help_heading = "Selection")]
+    pub selection_policy: Option<SelectionPolicy>,
     /// ENA run accession to resolve and stream.
     #[arg(
         long,
@@ -496,6 +527,11 @@ mod tests {
 
     fn base_cli() -> Cli {
         Cli {
+            enrich_index: None,
+            deplete_index: None,
+            enrich_min_hits: None,
+            deplete_min_hits: None,
+            selection_policy: None,
             ena: None,
             input: Some(PathBuf::from("reads.fastq.gz")),
             paired: false,
@@ -544,6 +580,11 @@ mod tests {
     #[test]
     fn ingress_returns_ena_variant_for_accession_input() -> Result<()> {
         let cli = Cli {
+            enrich_index: None,
+            deplete_index: None,
+            enrich_min_hits: None,
+            deplete_min_hits: None,
+            selection_policy: None,
             ena: Some(Accession::new("SRR35939766")?),
             input: None,
             paired: false,
@@ -582,6 +623,11 @@ mod tests {
     #[test]
     fn ingress_returns_local_paired_variant_when_both_fastqs_are_present() -> Result<()> {
         let cli = Cli {
+            enrich_index: None,
+            deplete_index: None,
+            enrich_min_hits: None,
+            deplete_min_hits: None,
+            selection_policy: None,
             ena: None,
             input: None,
             paired: false,

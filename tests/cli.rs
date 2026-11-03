@@ -5,11 +5,270 @@ use std::{
     process::{Command, Stdio},
 };
 
+use deacon::{Index, MinimizerVec};
 use serde_json::Value;
 use tempfile::tempdir;
 
 fn nuclease() -> Command {
     Command::new(env!("CARGO_BIN_EXE_nuclease"))
+}
+
+#[test]
+fn selection_options_require_indexes_and_conflict_with_passthrough() {
+    let configured = nuclease()
+        .args(["--in", "reads.fastq", "--enrich-index", "missing.index"])
+        .output()
+        .expect("run");
+    assert_eq!(configured.status.code(), Some(66));
+    for args in [
+        vec!["--enrich-min-hits", "2"],
+        vec!["--deplete-min-hits", "2"],
+        vec!["--selection-policy", "depletion-veto"],
+        vec!["--enrich-index", "index", "--passthrough"],
+        vec!["--deplete-index", "index", "--deplete-min-hits", "0"],
+    ] {
+        let output = nuclease()
+            .args(["--in", "reads.fastq"])
+            .args(args)
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(2));
+    }
+}
+
+#[test]
+fn selection_hit_thresholds_accept_positive_usize_values() {
+    let temp = tempdir().expect("tempdir should exist");
+    let missing_index = temp.path().join("missing.index");
+    let maximum = usize::MAX.to_string();
+    let overflow = format!("{maximum}0");
+
+    for (index_flag, threshold_flag) in [
+        ("--enrich-index", "--enrich-min-hits"),
+        ("--deplete-index", "--deplete-min-hits"),
+    ] {
+        for (value, expected_status) in [
+            ("0", 2),
+            ("-1", 2),
+            ("invalid", 2),
+            (overflow.as_str(), 2),
+            ("1", 66),
+            (maximum.as_str(), 66),
+        ] {
+            // Valid values proceed to index loading; invalid values stop at CLI parsing.
+            let output = nuclease()
+                .args(["--in", "reads.fastq", index_flag])
+                .arg(&missing_index)
+                .arg(format!("{threshold_flag}={value}"))
+                .output()
+                .expect("nuclease should run");
+            assert_eq!(
+                output.status.code(),
+                Some(expected_status),
+                "{threshold_flag}={value}: {}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+}
+
+#[test]
+fn selection_reports_atomic_pair_rejections_and_uses_pooled_hits() {
+    let temp = tempdir().expect("tempdir");
+    let index = temp.path().join("enrich.idx");
+    // Produced with the pinned library, not an independently versioned Deacon producer.
+    let fixture = Index::from_minimizers(3, 1, MinimizerVec::U64(vec![0, 21])).expect("index");
+    deacon::write_index_to_path(&fixture, &index).expect("write index");
+    let input = temp.path().join("reads.fastq");
+    let summary = temp.path().join("summary.json");
+    fs::write(
+        &input,
+        b"@a/1\nAAA\n+\nIII\n@a/2\nCCC\n+\nIII\n@b/1\nAAA\n+\nIII\n@b/2\nAAA\n+\nIII\n",
+    )
+    .expect("input");
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("path"),
+            "--paired",
+            "--enrich-index",
+            index.to_str().expect("path"),
+            "--min-length",
+            "0",
+            "--min-mean-q",
+            "0",
+            "--summary",
+            summary.to_str().expect("path"),
+            "-qqq",
+        ])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"@a/1\nAAA\n+\nIII\n@a/2\nCCC\n+\nIII\n");
+    let summary: Value =
+        serde_json::from_slice(&fs::read(summary).expect("summary")).expect("JSON");
+    assert_eq!(summary["reads_rejected"], 2);
+    assert_eq!(summary["reads_suppressed"], 0);
+    assert_eq!(summary["rejection_breakdown"][0]["code"], "not_selected");
+    assert_eq!(summary["rejection_breakdown"][0]["count"], 2);
+}
+
+#[test]
+fn corrupt_index_is_malformed_before_input_or_output_open() {
+    let temp = tempdir().expect("tempdir");
+    let index = temp.path().join("bad.idx");
+    let output_path = temp.path().join("output.fastq");
+    fs::write(&index, b"bad").expect("index");
+    let output = nuclease()
+        .args([
+            "--in",
+            "missing.fastq",
+            "--enrich-index",
+            index.to_str().expect("path"),
+            "--out",
+            output_path.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(65));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("enrichment"));
+    assert!(!output_path.exists());
+}
+
+#[test]
+fn truncated_indexes_are_malformed_before_input_or_output_open() {
+    let temp = tempdir().expect("tempdir");
+    let index_path = temp.path().join("truncated.idx");
+    let output_path = temp.path().join("output.fastq");
+    let fixture = Index::from_minimizers(3, 1, MinimizerVec::U64(vec![0, 21])).expect("index");
+    let mut bytes = Vec::new();
+    deacon::write_index(&fixture, &mut bytes).expect("serialize index");
+
+    for length in 0..bytes.len() {
+        fs::write(&index_path, &bytes[..length]).expect("truncated index");
+        let output = nuclease()
+            .args(["--in", "missing.fastq", "--deplete-index"])
+            .arg(&index_path)
+            .arg("--out")
+            .arg(&output_path)
+            .output()
+            .expect("run");
+        assert_eq!(output.status.code(), Some(65), "prefix length {length}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("depletion"));
+        assert!(output.stdout.is_empty());
+        assert!(!output_path.exists());
+    }
+}
+
+#[test]
+fn selection_rejects_pair_before_merge() {
+    let temp = tempdir().expect("tempdir");
+    let index = temp.path().join("empty.idx");
+    let fixture = Index::from_minimizers(3, 1, MinimizerVec::U64(vec![])).expect("index");
+    deacon::write_index_to_path(&fixture, &index).expect("write index");
+    let input = temp.path().join("reads.fastq");
+    let summary = temp.path().join("summary.json");
+    fs::write(&input, b"@read/1\nACGTTGCAGTACGATCGTACGGAATTCGCCGATGACTGACCTAGGTCAGTACGATC\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n@read/2\nGATCGTACTGACCTAGGTCAGTCATCGGCGAATTCCGTACGATCGTACTGCAACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n").expect("input");
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("path"),
+            "--paired",
+            "--merge-pairs",
+            "--enrich-index",
+            index.to_str().expect("path"),
+            "--summary",
+            summary.to_str().expect("path"),
+            "-qqq",
+        ])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    let summary: Value =
+        serde_json::from_slice(&fs::read(summary).expect("summary")).expect("JSON");
+    assert_eq!(summary["reads_rejected"], 2);
+    assert_eq!(summary["reads_suppressed"], 0);
+}
+
+#[test]
+fn selection_cli_combines_independent_index_thresholds() {
+    let temp = tempdir().expect("tempdir");
+    let enrich = temp.path().join("enrich.idx");
+    let deplete = temp.path().join("deplete.idx");
+    deacon::write_index_to_path(
+        &Index::from_minimizers(3, 1, MinimizerVec::U64(vec![0])).expect("index"),
+        &enrich,
+    )
+    .expect("write");
+    deacon::write_index_to_path(
+        &Index::from_minimizers(3, 1, MinimizerVec::U64(vec![21])).expect("index"),
+        &deplete,
+    )
+    .expect("write");
+    let input = temp.path().join("reads.fastq");
+    fs::write(&input, b"@neither\nNNN\n+\nIII\n@enrich\nAAA\n+\nIII\n@deplete\nCCC\n+\nIII\n@both\nAAANCCC\n+\nIIIIIII\n").expect("input");
+    for (policy, expected) in [
+        ("depletion-veto", b"@enrich\nAAA\n+\nIII\n".as_slice()),
+        (
+            "enrichment-rescue",
+            b"@neither\nNNN\n+\nIII\n@enrich\nAAA\n+\nIII\n@both\nAAANCCC\n+\nIIIIIII\n".as_slice(),
+        ),
+    ] {
+        let output = nuclease()
+            .args([
+                "--in",
+                input.to_str().expect("path"),
+                "--enrich-index",
+                enrich.to_str().expect("path"),
+                "--deplete-index",
+                deplete.to_str().expect("path"),
+                "--enrich-min-hits",
+                "1",
+                "--deplete-min-hits",
+                "1",
+                "--selection-policy",
+                policy,
+                "--min-length",
+                "0",
+                "--min-mean-q",
+                "0",
+                "-qqq",
+            ])
+            .output()
+            .expect("run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn index_read_failure_is_io_error() {
+    let temp = tempdir().expect("tempdir");
+    let output = nuclease()
+        .args([
+            "--in",
+            "missing.fastq",
+            "--deplete-index",
+            temp.path().to_str().expect("path"),
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(74));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("depletion"));
 }
 
 #[cfg(unix)]

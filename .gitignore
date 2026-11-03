@@ -25,6 +25,9 @@
 
 !src/
 !src/*.rs
+!src/filter/
+!src/filter/mod.rs
+!src/filter/minimizer.rs
 !src/adapter/
 !src/adapter/mod.rs
 !src/adapter/catalog.rs
