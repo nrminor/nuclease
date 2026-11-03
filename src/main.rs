@@ -21,6 +21,8 @@ mod pair_merge;
 mod pipeline;
 mod plan;
 mod progress;
+#[cfg(test)]
+mod property_tests;
 mod quality;
 mod record;
 mod report;

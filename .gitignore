@@ -25,6 +25,8 @@
 
 !src/
 !src/*.rs
+!src/property_tests/
+!src/property_tests/*.rs
 !src/filter/
 !src/filter/mod.rs
 !src/filter/minimizer.rs
@@ -41,3 +43,10 @@
 
 !tests/
 !tests/*.rs
+!tests/fixtures/
+!tests/fixtures/deacon-0.19.1/
+!tests/fixtures/deacon-0.19.1/*
+
+!proptest-regressions/
+!proptest-regressions/**/
+!proptest-regressions/**/*.txt

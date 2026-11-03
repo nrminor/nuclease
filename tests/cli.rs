@@ -216,11 +216,32 @@ fn selection_cli_combines_independent_index_thresholds() {
     .expect("write");
     let input = temp.path().join("reads.fastq");
     fs::write(&input, b"@neither\nNNN\n+\nIII\n@enrich\nAAA\n+\nIII\n@deplete\nCCC\n+\nIII\n@both\nAAANCCC\n+\nIIIIIII\n").expect("input");
-    for (policy, expected) in [
-        ("depletion-veto", b"@enrich\nAAA\n+\nIII\n".as_slice()),
+    for (policy, enrich_hits, deplete_hits, expected) in [
+        ("depletion-veto", "1", "1", b"@enrich\nAAA\n+\nIII\n".as_slice()),
         (
             "enrichment-rescue",
+            "1",
+            "1",
             b"@neither\nNNN\n+\nIII\n@enrich\nAAA\n+\nIII\n@both\nAAANCCC\n+\nIIIIIII\n".as_slice(),
+        ),
+        ("depletion-veto", "2", "1", b"".as_slice()),
+        (
+            "enrichment-rescue",
+            "2",
+            "1",
+            b"@neither\nNNN\n+\nIII\n@enrich\nAAA\n+\nIII\n".as_slice(),
+        ),
+        (
+            "depletion-veto",
+            "1",
+            "2",
+            b"@enrich\nAAA\n+\nIII\n@both\nAAANCCC\n+\nIIIIIII\n".as_slice(),
+        ),
+        (
+            "enrichment-rescue",
+            "1",
+            "2",
+            b"@neither\nNNN\n+\nIII\n@enrich\nAAA\n+\nIII\n@deplete\nCCC\n+\nIII\n@both\nAAANCCC\n+\nIIIIIII\n".as_slice(),
         ),
     ] {
         let output = nuclease()
@@ -232,9 +253,9 @@ fn selection_cli_combines_independent_index_thresholds() {
                 "--deplete-index",
                 deplete.to_str().expect("path"),
                 "--enrich-min-hits",
-                "1",
+                enrich_hits,
                 "--deplete-min-hits",
-                "1",
+                deplete_hits,
                 "--selection-policy",
                 policy,
                 "--min-length",
@@ -250,7 +271,52 @@ fn selection_cli_combines_independent_index_thresholds() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(output.stdout, expected);
+        assert_eq!(output.stdout, expected, "{policy}: E={enrich_hits}, D={deplete_hits}");
+    }
+}
+
+#[test]
+fn selection_uses_evidence_before_quality_trimming() {
+    let temp = tempdir().expect("tempdir");
+    let index = temp.path().join("index");
+    let fixture = Index::from_minimizers(3, 1, MinimizerVec::U64(vec![0])).expect("index");
+    deacon::write_index_to_path(&fixture, &index).expect("write index");
+    let input = temp.path().join("reads.fastq");
+    // Only the low-quality suffix contains indexed evidence. Selection must see it
+    // before trimming removes it and leaves the nonmatching, high-quality prefix.
+    fs::write(&input, b"@read\nCCCAAA\n+\nIII!!!\n").expect("input");
+    for (index_flag, threshold_flag, expected) in [
+        (
+            "--enrich-index",
+            "--enrich-min-hits",
+            b"@read\nCCC\n+\nIII\n".as_slice(),
+        ),
+        ("--deplete-index", "--deplete-min-hits", b"".as_slice()),
+    ] {
+        let output = nuclease()
+            .arg("--in")
+            .arg(&input)
+            .arg(index_flag)
+            .arg(&index)
+            .args([
+                threshold_flag,
+                "1",
+                "--min-length",
+                "0",
+                "--min-mean-q",
+                "0",
+                "--trim-min-q",
+                "20",
+                "-qqq",
+            ])
+            .output()
+            .expect("run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, expected, "{index_flag}");
     }
 }
 

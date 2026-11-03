@@ -39,6 +39,7 @@ fastrand = "2.4.1"
 thiserror = "2.0.19"
 
 [dev-dependencies]
+proptest = { version = "1.12", default-features = false, features = ["std"] }
 tempfile = "3.23.0"
 
 [lints.clippy]
