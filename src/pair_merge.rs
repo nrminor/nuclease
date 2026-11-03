@@ -7,7 +7,7 @@ use libpairassembly::{Assembler, CorrectionParams, OverlapParams, PairInput, Seq
 use crate::{
     error::{self, InternalError, Result},
     plan::{
-        BuildPlan, IntoExecutionStep, PairTransform, PairTransformResult, PairTransformStep,
+        BuildPlan, PairTransform, PairTransformResult, PairTransformStep, PrepareExecutionStep,
         TransformArena,
     },
     record::{RecordPair, RecordView},
@@ -15,6 +15,10 @@ use crate::{
 
 /// Pair-aware transform that attempts to merge paired-end reads.
 pub(crate) struct MergePairs {
+    config: MergePairsConfig,
+}
+
+struct MergePairsWorker {
     assembler: Assembler,
 }
 
@@ -46,7 +50,13 @@ struct AssemblyRecordView<'a> {
 
 impl MergePairs {
     /// Construct a merge transform with the provided merge settings.
-    pub(crate) fn new(config: MergePairsConfig) -> Result<Self> {
+    pub(crate) const fn new(config: MergePairsConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl MergePairsWorker {
+    fn new(config: MergePairsConfig) -> Result<Self> {
         let overlap_params = OverlapParams::default()
             .with_min_overlap(config.min_overlap)
             .with_diff_percent_max(config.max_mismatch_rate);
@@ -61,7 +71,7 @@ impl MergePairs {
     }
 }
 
-impl PairTransform for MergePairs {
+impl PairTransform for MergePairsWorker {
     fn code(&self) -> &'static str {
         "merge_pairs"
     }
@@ -101,17 +111,19 @@ impl PairTransform for MergePairs {
     }
 }
 
-impl IntoExecutionStep for MergePairs {
-    fn into_execution_step(self) -> Box<dyn crate::plan::ExecutionStep> {
-        Box::new(PairTransformStep(self))
+impl PrepareExecutionStep for MergePairs {
+    fn prepare(&self) -> Result<Box<dyn crate::plan::ExecutionStep>> {
+        Ok(Box::new(PairTransformStep(MergePairsWorker::new(
+            self.config,
+        )?)))
     }
 }
 
 /// Fluent extension trait adding the `.merge_pairs(...)` transform combinator to plans.
 pub(crate) trait MergePairsTransform: BuildPlan {
     /// Attempt to merge paired reads before downstream per-record filtering.
-    fn merge_pairs(self, config: MergePairsConfig) -> Result<Self> {
-        Ok(self.step(MergePairs::new(config)?))
+    fn merge_pairs(self, config: MergePairsConfig) -> Self {
+        self.step(MergePairs::new(config))
     }
 }
 
@@ -151,7 +163,8 @@ impl SeqRecordView for AssemblyRecordView<'_> {
 mod tests {
     use crate::{
         error::{IndeterminateInputError, MalformedInputError, RunError},
-        plan::{PairTransform, TransformArena},
+        observer::RunObserver,
+        plan::{EmittedUnit, Execute, Logical, Plan, TransformArena},
         record::InputSource,
     };
 
@@ -173,18 +186,20 @@ mod tests {
 
     #[test]
     fn merge_pairs_returns_single_merged_record() {
-        let mut merge = MergePairs::new(MergePairsConfig::default())
+        let definition = Plan::<Logical>::new().merge_pairs(MergePairsConfig::default());
+        let mut merge = definition
+            .compile()
             .expect("default libpairassembly configuration should build");
-        let arena = TransformArena::new();
+        let mut arena = TransformArena::new();
+        let mut observer = RunObserver::new("test".to_owned());
 
         let result = merge
-            .apply_pair(pair(), &arena)
+            .execute(pair(), &mut arena, &mut observer)
             .expect("fixture pair should be valid libpairassembly input");
 
-        let PairTransformResult::Single { record, applied } = result else {
+        let EmittedUnit::Single(record) = result.emitted_unit() else {
             panic!("overlapping paired-end fixture should merge into one record");
         };
-        assert!(applied);
         assert_eq!(record.header(), b"read-1");
         assert_eq!(record.sequence().len(), record.quality().len());
     }

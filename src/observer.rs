@@ -389,6 +389,8 @@ pub struct RunObserver {
     pub reads_emitted: u64,
     /// Number of records rejected by preprocessing.
     pub reads_rejected: u64,
+    /// Passing mates discarded by the drop-pair policy.
+    pub reads_suppressed: u64,
     /// Number of bases observed from ingress.
     pub bases_seen: u64,
     /// Number of bases emitted to the configured output.
@@ -418,6 +420,7 @@ impl RunObserver {
             reads_seen: 0,
             reads_emitted: 0,
             reads_rejected: 0,
+            reads_suppressed: 0,
             bases_seen: 0,
             bases_emitted: 0,
             pairs_seen: 0,

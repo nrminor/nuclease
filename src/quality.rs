@@ -4,7 +4,8 @@ use std::{fmt, str::FromStr};
 
 use crate::{
     plan::{
-        BuildPlan, IntoExecutionStep, ReadTransform, TransformArena, TransformResult, TransformStep,
+        BuildPlan, PrepareExecutionStep, ReadTransform, TransformArena, TransformResult,
+        TransformStep,
     },
     record::RecordView,
 };
@@ -116,9 +117,12 @@ impl ReadTransform for QualityBin {
     }
 }
 
-impl IntoExecutionStep for QualityBin {
-    fn into_execution_step(self) -> Box<dyn crate::plan::ExecutionStep> {
-        Box::new(TransformStep(self))
+impl PrepareExecutionStep for QualityBin {
+    fn prepare(&self) -> crate::error::Result<Box<dyn crate::plan::ExecutionStep>> {
+        Ok(Box::new(TransformStep(Self {
+            boundaries: self.boundaries,
+            representatives: self.representatives,
+        })))
     }
 }
 
@@ -189,9 +193,9 @@ impl ReadTransform for QualityTrim {
     }
 }
 
-impl IntoExecutionStep for QualityTrim {
-    fn into_execution_step(self) -> Box<dyn crate::plan::ExecutionStep> {
-        Box::new(TransformStep(self))
+impl PrepareExecutionStep for QualityTrim {
+    fn prepare(&self) -> crate::error::Result<Box<dyn crate::plan::ExecutionStep>> {
+        Ok(Box::new(TransformStep(Self::new(self.cutoff))))
     }
 }
 

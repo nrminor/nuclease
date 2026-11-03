@@ -80,6 +80,8 @@ pub struct RunSummary {
     pub reads_emitted: u64,
     /// Total reads rejected.
     pub reads_rejected: u64,
+    /// Passing mates discarded by the drop-pair policy.
+    pub reads_suppressed: u64,
     /// Total reads dropped at ingress because the FASTQ record was malformed.
     pub invalid_reads: u64,
     /// Fraction of reads retained.
@@ -137,6 +139,7 @@ impl RunSummary {
             reads_seen: observer.reads_seen,
             reads_emitted: observer.reads_emitted,
             reads_rejected: observer.reads_rejected,
+            reads_suppressed: observer.reads_suppressed,
             invalid_reads: observer.invalid_reads,
             read_retention_fraction: fraction(observer.reads_emitted, observer.reads_seen),
             read_rejection_fraction: fraction(observer.reads_rejected, observer.reads_seen),
@@ -277,6 +280,11 @@ fn write_totals(output: &mut String, summary: &RunSummary) {
         "  reads rejected:      {} ({:.2}%)",
         summary.reads_rejected,
         summary.read_rejection_fraction * 100.0
+    );
+    let _ = writeln!(
+        output,
+        "  reads suppressed:    {}",
+        summary.reads_suppressed
     );
     let _ = writeln!(
         output,

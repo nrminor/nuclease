@@ -67,12 +67,32 @@ pub(crate) trait RejectionReason: std::fmt::Debug + Send + Sync + 'static {
 }
 
 /// Contract for zero-copy read filtering operations.
-pub(crate) trait ReadFilter: Send + Sync + 'static {
+pub(crate) trait ReadFilter: Send + 'static {
     /// Typed rejection reason returned when this filter rejects a record.
     type Reason: RejectionReason;
 
     /// Evaluate the filter on one borrowed record view.
-    fn evaluate(&self, record: &RecordView<'_>) -> std::result::Result<(), Self::Reason>;
+    fn evaluate(&mut self, record: &RecordView<'_>) -> std::result::Result<(), Self::Reason>;
+
+    /// Evaluate a pair, independently by default.
+    fn evaluate_pair(&mut self, pair: &RecordPair<'_>) -> PairRelation<Self::Reason> {
+        PairRelation::PerMate {
+            left: self.evaluate(&pair.left()),
+            right: self.evaluate(&pair.right()),
+        }
+    }
+}
+
+/// A pair decision, either per mate or atomic for the whole pair.
+pub(crate) enum PairRelation<R> {
+    /// Independent decisions for each mate.
+    PerMate {
+        left: std::result::Result<(), R>,
+        right: std::result::Result<(), R>,
+    },
+    /// One decision covering both mates.
+    #[allow(dead_code, reason = "whole-pair filters are an extension point")]
+    WholePair(std::result::Result<(), R>),
 }
 
 /// Contract for read transforms that may rewrite one record using the transform arena.
@@ -201,7 +221,13 @@ pub(crate) struct StepContext<'a, 'observer> {
 
 impl StepContext<'_, '_> {
     fn record_rejection(&mut self, code: &'static str) {
-        self.observer.record_rejected(code);
+        self.record_rejection_for(code, 1);
+    }
+
+    fn record_rejection_for(&mut self, code: &'static str, records: usize) {
+        for _ in 0..records {
+            self.observer.record_rejected(code);
+        }
         self.rejection_count += 1;
     }
 
@@ -268,12 +294,12 @@ pub(crate) trait ReadSetTransform: Send + 'static {
 }
 
 enum LogicalPlanItem {
-    PerUnit(Box<dyn ExecutionStep>),
+    PerUnit(Box<dyn PrepareExecutionStep>),
     #[allow(
         dead_code,
         reason = "read-set logical items are currently exercised by tests only"
     )]
-    ReadSet(Box<dyn ReadSetTransform>),
+    ReadSet(Box<dyn PrepareExecutionStep<dyn ReadSetTransform>>),
 }
 
 enum PhysicalPlanItem {
@@ -330,39 +356,49 @@ where
                     StepOutcome::Stop(context.outcome(EmittedUnit::None))
                 }
             },
-            ActiveUnit::Pair(pair) => apply_filter_to_pair(&self.0, pair, context),
+            ActiveUnit::Pair(pair) => apply_filter_to_pair(&mut self.0, pair, context),
         })
     }
 }
 
 fn apply_filter_to_pair<'a, F>(
-    filter: &F,
+    filter: &mut F,
     pair: RecordPair<'a>,
     context: &mut StepContext<'a, '_>,
 ) -> StepOutcome<'a>
 where
     F: ReadFilter,
 {
-    let left = filter
-        .evaluate(&pair.left())
-        .map_err(|reason| reason.code());
-    let right = filter
-        .evaluate(&pair.right())
-        .map_err(|reason| reason.code());
+    let (left, right) = match filter.evaluate_pair(&pair) {
+        PairRelation::WholePair(Ok(())) => return StepOutcome::Continue(ActiveUnit::Pair(pair)),
+        PairRelation::WholePair(Err(reason)) => {
+            context.record_rejection_for(reason.code(), 2);
+            return StepOutcome::Stop(context.outcome(EmittedUnit::None));
+        }
+        PairRelation::PerMate { left, right } => {
+            (left.map_err(|r| r.code()), right.map_err(|r| r.code()))
+        }
+    };
 
     match (left, right) {
         (Ok(()), Ok(())) => StepOutcome::Continue(ActiveUnit::Pair(pair)),
         (Err(left_reason), Ok(())) => {
             context.record_rejection(left_reason);
             match context.orphan_policy {
-                OrphanPolicy::DropPair => StepOutcome::Stop(context.outcome(EmittedUnit::None)),
+                OrphanPolicy::DropPair => {
+                    context.observer.reads_suppressed += 1;
+                    StepOutcome::Stop(context.outcome(EmittedUnit::None))
+                }
                 OrphanPolicy::EmitOrphan => StepOutcome::Continue(ActiveUnit::Single(pair.right())),
             }
         }
         (Ok(()), Err(right_reason)) => {
             context.record_rejection(right_reason);
             match context.orphan_policy {
-                OrphanPolicy::DropPair => StepOutcome::Stop(context.outcome(EmittedUnit::None)),
+                OrphanPolicy::DropPair => {
+                    context.observer.reads_suppressed += 1;
+                    StepOutcome::Stop(context.outcome(EmittedUnit::None))
+                }
                 OrphanPolicy::EmitOrphan => StepOutcome::Continue(ActiveUnit::Single(pair.left())),
             }
         }
@@ -411,6 +447,10 @@ where
         unit: ActiveUnit<'a>,
         context: &mut StepContext<'a, '_>,
     ) -> Result<StepOutcome<'a>> {
+        let cardinality = match unit {
+            ActiveUnit::Single(_) => 1,
+            ActiveUnit::Pair(_) => 2,
+        };
         let result = match unit {
             ActiveUnit::Single(record) => self.0.apply_single(record, context.arena)?,
             ActiveUnit::Pair(pair) => self.0.apply_pair(pair, context.arena)?,
@@ -430,17 +470,23 @@ where
                 StepOutcome::Continue(ActiveUnit::Single(record))
             }
             PairTransformResult::Drop { reason } => {
-                context.record_rejection(reason);
+                context.record_rejection_for(reason, cardinality);
                 StepOutcome::Stop(context.outcome(EmittedUnit::None))
             }
         })
     }
 }
 
-/// Bridge from authored operations into execution steps.
-pub(crate) trait IntoExecutionStep {
-    /// Convert the authored operation into a boxed execution step.
-    fn into_execution_step(self) -> Box<dyn ExecutionStep>;
+/// Bridge from reusable operation definitions to owned execution state.
+///
+/// Each preparation creates fresh mutable state. Immutable resources may be shared, but the
+/// returned worker must not borrow this definition. Preparation must leave the definition reusable
+/// on both success and failure. Workers need only be `Send`, not `Sync`.
+pub(crate) trait PrepareExecutionStep<T: ?Sized = dyn ExecutionStep>:
+    Send + Sync + 'static
+{
+    /// Prepare one independent execution instance, releasing partial resources on failure.
+    fn prepare(&self) -> Result<Box<T>>;
 }
 
 /// Authored logical plan and compiled execution plan with typestate.
@@ -471,7 +517,7 @@ pub(crate) trait BuildPlan: Sized {
     /// Append one operation to the plan.
     fn step<O>(self, op: O) -> Self
     where
-        O: IntoExecutionStep;
+        O: PrepareExecutionStep;
 
     /// Append one whole-read-set transform to the plan.
     #[allow(
@@ -480,13 +526,13 @@ pub(crate) trait BuildPlan: Sized {
     )]
     fn read_set_transform<T>(self, transform: T) -> Self
     where
-        T: ReadSetTransform;
+        T: PrepareExecutionStep<dyn ReadSetTransform>;
 
     /// Set the orphan policy used by paired execution.
     fn orphan_policy(self, policy: OrphanPolicy) -> Self;
 
-    /// Compile the logical plan into an executable plan.
-    fn compile(self) -> Self::Execution;
+    /// Prepare an owned executable plan without consuming the logical plan.
+    fn compile(&self) -> Result<Self::Execution>;
 }
 
 impl BuildPlan for Plan<Logical> {
@@ -494,16 +540,16 @@ impl BuildPlan for Plan<Logical> {
 
     fn step<O>(mut self, op: O) -> Self
     where
-        O: IntoExecutionStep,
+        O: PrepareExecutionStep,
     {
         self.logical_items
-            .push(LogicalPlanItem::PerUnit(op.into_execution_step()));
+            .push(LogicalPlanItem::PerUnit(Box::new(op)));
         self
     }
 
     fn read_set_transform<T>(mut self, transform: T) -> Self
     where
-        T: ReadSetTransform,
+        T: PrepareExecutionStep<dyn ReadSetTransform>,
     {
         self.logical_items
             .push(LogicalPlanItem::ReadSet(Box::new(transform)));
@@ -515,34 +561,45 @@ impl BuildPlan for Plan<Logical> {
         self
     }
 
-    fn compile(self) -> Self::Execution {
-        let Plan {
-            logical_items,
-            orphan_policy,
-            ..
-        } = self;
-        let mut physical_items = Vec::with_capacity(logical_items.len());
+    fn compile(&self) -> Result<Self::Execution> {
+        let stage_count = self
+            .logical_items
+            .chunk_by(|left, right| {
+                matches!(left, LogicalPlanItem::PerUnit(_))
+                    && matches!(right, LogicalPlanItem::PerUnit(_))
+            })
+            .count();
+        let mut physical_items = Vec::with_capacity(stage_count);
 
-        for item in logical_items {
+        for (index, item) in self.logical_items.iter().enumerate() {
             match item {
-                LogicalPlanItem::PerUnit(step) => match physical_items.last_mut() {
-                    Some(PhysicalPlanItem::PerUnitChain(chain)) => chain.push(step),
-                    _ => physical_items.push(PhysicalPlanItem::PerUnitChain(PerUnitChain::new(
-                        vec![step],
-                    ))),
-                },
+                LogicalPlanItem::PerUnit(definition) => {
+                    let step = definition.prepare()?;
+                    if let Some(PhysicalPlanItem::PerUnitChain(chain)) = physical_items.last_mut() {
+                        chain.push(step);
+                    } else {
+                        let chain_len = self.logical_items[index..]
+                            .iter()
+                            .take_while(|item| matches!(item, LogicalPlanItem::PerUnit(_)))
+                            .count();
+                        let mut steps = Vec::with_capacity(chain_len);
+                        steps.push(step);
+                        physical_items
+                            .push(PhysicalPlanItem::PerUnitChain(PerUnitChain::new(steps)));
+                    }
+                }
                 LogicalPlanItem::ReadSet(transform) => {
-                    physical_items.push(PhysicalPlanItem::ReadSet(transform));
+                    physical_items.push(PhysicalPlanItem::ReadSet(transform.prepare()?));
                 }
             }
         }
 
-        Plan {
+        Ok(Plan {
             logical_items: Vec::new(),
             physical_items,
-            orphan_policy,
+            orphan_policy: self.orphan_policy,
             _state: PhantomData,
-        }
+        })
     }
 }
 
@@ -653,8 +710,8 @@ impl<'a> Execute<'a, RecordPair<'a>> for Plan<Execution> {
 mod tests {
     use super::{
         ActiveUnitSink, ActiveUnitSource, BuildPlan, Execute, ExecutionOutcome, FilterStep,
-        IntoExecutionStep, Logical, OrphanPolicy, PhysicalPlanItem, Plan, ReadFilter,
-        ReadSetTransform, ReadTransform, RecordPair, RejectionReason, TransformArena,
+        Logical, OrphanPolicy, PairRelation, PhysicalPlanItem, Plan, PrepareExecutionStep,
+        ReadFilter, ReadSetTransform, ReadTransform, RecordPair, RejectionReason, TransformArena,
         TransformResult, TransformStep,
     };
     use crate::{
@@ -663,6 +720,13 @@ mod tests {
         record::RecordView,
     };
     use color_eyre::eyre::Result;
+    use std::{
+        cell::Cell,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     #[derive(Debug)]
     struct TooShort;
@@ -686,7 +750,7 @@ mod tests {
     impl ReadFilter for MinLength {
         type Reason = TooShort;
 
-        fn evaluate(&self, record: &RecordView<'_>) -> Result<(), Self::Reason> {
+        fn evaluate(&mut self, record: &RecordView<'_>) -> Result<(), Self::Reason> {
             if record.sequence().len() < self.min_length {
                 Err(TooShort)
             } else {
@@ -695,9 +759,9 @@ mod tests {
         }
     }
 
-    impl IntoExecutionStep for MinLength {
-        fn into_execution_step(self) -> Box<dyn super::ExecutionStep> {
-            Box::new(FilterStep(self))
+    impl PrepareExecutionStep for MinLength {
+        fn prepare(&self) -> crate::error::Result<Box<dyn super::ExecutionStep>> {
+            Ok(Box::new(FilterStep(Self::new(self.min_length))))
         }
     }
 
@@ -733,13 +797,19 @@ mod tests {
         }
     }
 
-    impl IntoExecutionStep for TrimPrefix {
-        fn into_execution_step(self) -> Box<dyn super::ExecutionStep> {
-            Box::new(TransformStep(self))
+    impl PrepareExecutionStep for TrimPrefix {
+        fn prepare(&self) -> crate::error::Result<Box<dyn super::ExecutionStep>> {
+            Ok(Box::new(TransformStep(Self::new(self.amount))))
         }
     }
 
     struct FakeReadSetTransform;
+
+    impl PrepareExecutionStep<dyn ReadSetTransform> for FakeReadSetTransform {
+        fn prepare(&self) -> crate::error::Result<Box<dyn ReadSetTransform>> {
+            Ok(Box::new(Self))
+        }
+    }
 
     impl ReadSetTransform for FakeReadSetTransform {
         fn code(&self) -> &'static str {
@@ -768,12 +838,120 @@ mod tests {
             .expect("test records should form a valid pair")
     }
 
+    struct TrackedWorker(Arc<AtomicUsize>);
+    impl Drop for TrackedWorker {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl super::ExecutionStep for TrackedWorker {
+        fn apply<'a>(
+            &mut self,
+            unit: super::ActiveUnit<'a>,
+            _context: &mut super::StepContext<'a, '_>,
+        ) -> crate::error::Result<super::StepOutcome<'a>> {
+            Ok(super::StepOutcome::Continue(unit))
+        }
+    }
+    impl ReadSetTransform for TrackedWorker {
+        fn code(&self) -> &'static str {
+            "tracked"
+        }
+        fn transform_read_set(
+            &mut self,
+            _input: &mut dyn ActiveUnitSource,
+            _output: &mut dyn ActiveUnitSink,
+        ) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+    struct TrackedDefinition {
+        drops: Arc<AtomicUsize>,
+        fail: bool,
+    }
+    impl TrackedDefinition {
+        fn worker(&self) -> crate::error::Result<TrackedWorker> {
+            let worker = TrackedWorker(Arc::clone(&self.drops));
+            if self.fail {
+                return Err(InternalError::PlanInvariant {
+                    detail: "prepare failure".to_owned(),
+                }
+                .into());
+            }
+            Ok(worker)
+        }
+    }
+    impl PrepareExecutionStep for TrackedDefinition {
+        fn prepare(&self) -> crate::error::Result<Box<dyn super::ExecutionStep>> {
+            Ok(Box::new(self.worker()?))
+        }
+    }
+    impl PrepareExecutionStep<dyn ReadSetTransform> for TrackedDefinition {
+        fn prepare(&self) -> crate::error::Result<Box<dyn ReadSetTransform>> {
+            Ok(Box::new(self.worker()?))
+        }
+    }
+
+    #[test]
+    fn repeated_preparation_failures_clean_up_both_stage_kinds() {
+        for fail_read_set in [false, true] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let definition = |fail| TrackedDefinition {
+                drops: Arc::clone(&drops),
+                fail,
+            };
+            let plan = if fail_read_set {
+                Plan::<Logical>::new()
+                    .step(definition(false))
+                    .read_set_transform(definition(true))
+                    .step(definition(false))
+            } else {
+                Plan::<Logical>::new()
+                    .read_set_transform(definition(false))
+                    .step(definition(true))
+                    .read_set_transform(definition(false))
+            };
+            for attempt in 1..=2 {
+                assert!(
+                    matches!(plan.compile(), Err(RunError::Internal(InternalError::PlanInvariant { detail })) if detail == "prepare failure")
+                );
+                assert_eq!(drops.load(Ordering::SeqCst), attempt * 2);
+            }
+        }
+    }
+
     #[test]
     fn logical_plan_accumulates_steps_and_compiles() {
         let _plan = Plan::<Logical>::new()
             .step(MinLength::new(4))
             .step(TrimPrefix::new(1))
-            .compile();
+            .compile()
+            .expect("logical operations should prepare");
+    }
+
+    #[test]
+    fn compiled_executions_outlive_the_reusable_logical_plan() {
+        let recipe = Plan::<Logical>::new()
+            .step(TrimPrefix::new(1))
+            .step(MinLength::new(3));
+        let mut first = recipe.compile().expect("first execution should prepare");
+        let mut second = recipe.compile().expect("second execution should prepare");
+        drop(recipe);
+
+        for execution in [&mut first, &mut second] {
+            let mut arena = TransformArena::new();
+            let mut observer = RunObserver::new("test".to_owned());
+            let outcome = execution
+                .execute(record(b"ACGT"), &mut arena, &mut observer)
+                .expect("prepared execution should own its operations");
+            let sequences = outcome
+                .emitted()
+                .map(|record| record.sequence())
+                .collect::<Vec<_>>();
+            assert_eq!(sequences, [b"CGT".as_slice()]);
+            assert_eq!(observer.reads_rejected, 0);
+            assert_eq!(observer.transform_counts["trim_prefix"], 1);
+        }
     }
 
     #[test]
@@ -783,7 +961,8 @@ mod tests {
             .step(TrimPrefix::new(1))
             .read_set_transform(FakeReadSetTransform)
             .step(MinLength::new(3))
-            .compile();
+            .compile()
+            .expect("all stages should prepare");
 
         assert_eq!(plan.physical_items.len(), 3);
         assert!(matches!(
@@ -805,7 +984,8 @@ mod tests {
         let plan = Plan::<Logical>::new()
             .step(MinLength::new(4))
             .step(TrimPrefix::new(1))
-            .compile();
+            .compile()
+            .expect("streaming operations should prepare");
 
         assert_eq!(plan.physical_items.len(), 1);
         assert!(matches!(
@@ -818,7 +998,8 @@ mod tests {
     fn per_unit_execution_rejects_read_set_transforms() {
         let mut plan = Plan::<Logical>::new()
             .read_set_transform(FakeReadSetTransform)
-            .compile();
+            .compile()
+            .expect("read-set operation should prepare");
         let mut arena = TransformArena::new();
         let mut observer = RunObserver::new("test".to_owned());
 
@@ -835,7 +1016,10 @@ mod tests {
 
     #[test]
     fn single_execution_rejects_record_when_filter_fails() {
-        let mut plan = Plan::<Logical>::new().step(MinLength::new(6)).compile();
+        let mut plan = Plan::<Logical>::new()
+            .step(MinLength::new(6))
+            .compile()
+            .expect("filter should prepare");
         let mut arena = TransformArena::new();
         let mut observer = RunObserver::new("test".to_owned());
 
@@ -850,7 +1034,10 @@ mod tests {
 
     #[test]
     fn single_execution_applies_transform_in_order() {
-        let mut plan = Plan::<Logical>::new().step(TrimPrefix::new(1)).compile();
+        let mut plan = Plan::<Logical>::new()
+            .step(TrimPrefix::new(1))
+            .compile()
+            .expect("transform should prepare");
         let mut arena = TransformArena::new();
         let mut observer = RunObserver::new("test".to_owned());
 
@@ -871,7 +1058,10 @@ mod tests {
 
     #[test]
     fn paired_execution_drops_orphan_by_default() {
-        let mut plan = Plan::<Logical>::new().step(MinLength::new(6)).compile();
+        let mut plan = Plan::<Logical>::new()
+            .step(MinLength::new(6))
+            .compile()
+            .expect("filter should prepare");
         let mut arena = TransformArena::new();
         let mut observer = RunObserver::new("test".to_owned());
 
@@ -881,6 +1071,8 @@ mod tests {
 
         assert_eq!(outcome.emitted().count(), 0);
         assert_eq!(outcome.rejection_count(), 1);
+        assert_eq!(observer.reads_rejected, 1);
+        assert_eq!(observer.reads_suppressed, 1);
     }
 
     #[test]
@@ -888,7 +1080,8 @@ mod tests {
         let mut plan = Plan::<Logical>::new()
             .step(MinLength::new(6))
             .orphan_policy(OrphanPolicy::EmitOrphan)
-            .compile();
+            .compile()
+            .expect("filter should prepare");
         let mut arena = TransformArena::new();
         let mut observer = RunObserver::new("test".to_owned());
 
@@ -898,6 +1091,261 @@ mod tests {
 
         assert_eq!(outcome.emitted().count(), 1);
         assert_eq!(outcome.rejection_count(), 1);
+        assert_eq!(observer.reads_suppressed, 0);
+    }
+
+    #[test]
+    fn default_pair_filter_evaluates_both_mates_under_both_policies() {
+        for policy in [OrphanPolicy::DropPair, OrphanPolicy::EmitOrphan] {
+            for (left, right) in [
+                (b"ACGT".as_slice(), b"ACGT".as_slice()),
+                (b"ACGT".as_slice(), b"ACGTAC".as_slice()),
+                (b"ACGTAC".as_slice(), b"ACGT".as_slice()),
+                (b"ACGTAC".as_slice(), b"ACGTAC".as_slice()),
+            ] {
+                let mut plan = Plan::<Logical>::new()
+                    .step(MinLength::new(6))
+                    .orphan_policy(policy)
+                    .compile()
+                    .expect("prepare");
+                let mut observer = RunObserver::new("test".to_owned());
+                let mut arena = TransformArena::new();
+                let outcome = plan
+                    .execute(pair(left, right), &mut arena, &mut observer)
+                    .expect("execute");
+                let failures = usize::from(left.len() < 6) + usize::from(right.len() < 6);
+                let emitted = if failures == 0 {
+                    2
+                } else {
+                    usize::from(failures == 1 && policy == OrphanPolicy::EmitOrphan)
+                };
+                let records: Vec<_> = outcome.emitted().map(|r| r.sequence()).collect();
+                assert_eq!(records.len(), emitted);
+                if emitted == 1 {
+                    assert_eq!(records[0], if left.len() == 6 { left } else { right });
+                }
+                assert_eq!(outcome.rejection_count(), failures);
+                assert_eq!(observer.reads_rejected, failures as u64);
+                assert_eq!(
+                    observer
+                        .rejection_counts
+                        .get("too_short")
+                        .copied()
+                        .unwrap_or(0),
+                    failures as u64
+                );
+                assert_eq!(
+                    observer.reads_suppressed,
+                    u64::from(failures == 1 && policy == OrphanPolicy::DropPair)
+                );
+            }
+        }
+    }
+
+    struct CollapsePair;
+    impl super::PairTransform for CollapsePair {
+        fn code(&self) -> &'static str {
+            "collapse"
+        }
+        fn apply_pair<'a>(
+            &mut self,
+            pair: RecordPair<'a>,
+            _arena: &'a TransformArena,
+        ) -> crate::error::Result<super::PairTransformResult<'a>> {
+            Ok(super::PairTransformResult::Single {
+                record: pair.left(),
+                applied: true,
+            })
+        }
+    }
+    impl PrepareExecutionStep for CollapsePair {
+        fn prepare(&self) -> crate::error::Result<Box<dyn super::ExecutionStep>> {
+            Ok(Box::new(super::PairTransformStep(Self)))
+        }
+    }
+    struct DropUnit;
+    impl super::PairTransform for DropUnit {
+        fn code(&self) -> &'static str {
+            "drop"
+        }
+        fn apply_pair<'a>(
+            &mut self,
+            _pair: RecordPair<'a>,
+            _arena: &'a TransformArena,
+        ) -> crate::error::Result<super::PairTransformResult<'a>> {
+            Ok(super::PairTransformResult::Drop { reason: "dropped" })
+        }
+        fn apply_single<'a>(
+            &mut self,
+            _record: RecordView<'a>,
+            _arena: &'a TransformArena,
+        ) -> crate::error::Result<super::PairTransformResult<'a>> {
+            Ok(super::PairTransformResult::Drop { reason: "dropped" })
+        }
+    }
+    impl PrepareExecutionStep for DropUnit {
+        fn prepare(&self) -> crate::error::Result<Box<dyn super::ExecutionStep>> {
+            Ok(Box::new(super::PairTransformStep(Self)))
+        }
+    }
+
+    #[test]
+    fn merged_single_rejection_counts_only_current_record() {
+        let mut plan = Plan::<Logical>::new()
+            .step(CollapsePair)
+            .step(MinLength::new(6))
+            .step(TrimPrefix::new(1))
+            .compile()
+            .expect("prepare");
+        let mut arena = TransformArena::new();
+        let mut observer = RunObserver::new("test".to_owned());
+        let outcome = plan
+            .execute(pair(b"ACGT", b"ACGTAC"), &mut arena, &mut observer)
+            .expect("execute");
+        assert_eq!(outcome.emitted().count(), 0);
+        assert_eq!(outcome.rejection_count(), 1);
+        assert_eq!(observer.reads_rejected, 1);
+        assert_eq!(observer.rejection_counts["too_short"], 1);
+        assert_eq!(observer.reads_suppressed, 0);
+        assert!(!observer.transform_counts.contains_key("trim_prefix"));
+    }
+
+    #[test]
+    fn pair_transform_drop_counts_current_unit_cardinality() {
+        for single in [false, true] {
+            let recipe = Plan::<Logical>::new()
+                .step(DropUnit)
+                .step(TrimPrefix::new(1));
+            let mut plan = recipe.compile().expect("prepare");
+            let mut arena = TransformArena::new();
+            let mut observer = RunObserver::new("test".to_owned());
+            let outcome = if single {
+                plan.execute(record(b"ACGT"), &mut arena, &mut observer)
+            } else {
+                plan.execute(pair(b"ACGT", b"ACGT"), &mut arena, &mut observer)
+            }
+            .expect("execute");
+            assert_eq!(outcome.emitted().count(), 0);
+            assert_eq!(outcome.rejection_count(), 1);
+            let expected = if single { 1 } else { 2 };
+            assert_eq!(observer.reads_rejected, expected);
+            assert_eq!(observer.rejection_counts["dropped"], expected);
+            assert_eq!(observer.reads_suppressed, 0);
+            assert!(observer.transform_counts.is_empty());
+        }
+    }
+
+    struct AtomicFilter(bool);
+
+    impl ReadFilter for AtomicFilter {
+        type Reason = TooShort;
+
+        fn evaluate(&mut self, _record: &RecordView<'_>) -> Result<(), Self::Reason> {
+            panic!("pair hook must be used")
+        }
+
+        fn evaluate_pair(&mut self, _pair: &RecordPair<'_>) -> PairRelation<Self::Reason> {
+            PairRelation::WholePair(if self.0 { Ok(()) } else { Err(TooShort) })
+        }
+    }
+
+    impl PrepareExecutionStep for AtomicFilter {
+        fn prepare(&self) -> crate::error::Result<Box<dyn super::ExecutionStep>> {
+            Ok(Box::new(FilterStep(Self(self.0))))
+        }
+    }
+
+    #[test]
+    fn whole_pair_rejection_is_atomic_under_both_orphan_policies() {
+        for policy in [OrphanPolicy::DropPair, OrphanPolicy::EmitOrphan] {
+            let mut plan = Plan::<Logical>::new()
+                .step(AtomicFilter(false))
+                .step(TrimPrefix::new(1))
+                .orphan_policy(policy)
+                .compile()
+                .expect("prepare");
+            let mut arena = TransformArena::new();
+            let mut observer = RunObserver::new("test".to_owned());
+            let outcome = plan
+                .execute(pair(b"ACGTAC", b"ACGT"), &mut arena, &mut observer)
+                .expect("execute");
+            assert_eq!(outcome.emitted().count(), 0);
+            assert_eq!(outcome.rejection_count(), 1);
+            assert_eq!(observer.reads_rejected, 2);
+            assert_eq!(observer.rejection_counts["too_short"], 2);
+            assert_eq!(observer.reads_suppressed, 0);
+            assert!(observer.transform_counts.is_empty());
+        }
+    }
+
+    #[test]
+    fn whole_pair_acceptance_preserves_both_mates() {
+        for policy in [OrphanPolicy::DropPair, OrphanPolicy::EmitOrphan] {
+            let mut plan = Plan::<Logical>::new()
+                .step(AtomicFilter(true))
+                .orphan_policy(policy)
+                .compile()
+                .expect("prepare");
+            let mut arena = TransformArena::new();
+            let mut observer = RunObserver::new("test".to_owned());
+            let outcome = plan
+                .execute(pair(b"ACGTAC", b"ACGT"), &mut arena, &mut observer)
+                .expect("execute");
+            assert_eq!(
+                outcome.emitted().map(|r| r.sequence()).collect::<Vec<_>>(),
+                [b"ACGTAC".as_slice(), b"ACGT".as_slice()]
+            );
+            assert_eq!(outcome.rejection_count(), 0);
+            assert_eq!(observer.reads_rejected, 0);
+            assert_eq!(observer.reads_suppressed, 0);
+        }
+    }
+
+    struct StatefulFilter(Cell<usize>);
+
+    impl ReadFilter for StatefulFilter {
+        type Reason = TooShort;
+        fn evaluate(&mut self, _record: &RecordView<'_>) -> Result<(), Self::Reason> {
+            let count = self.0.get();
+            self.0.set(count + 1);
+            if count == 0 { Ok(()) } else { Err(TooShort) }
+        }
+    }
+
+    struct StatefulDefinition;
+    impl PrepareExecutionStep for StatefulDefinition {
+        fn prepare(&self) -> crate::error::Result<Box<dyn super::ExecutionStep>> {
+            Ok(Box::new(FilterStep(StatefulFilter(Cell::new(0)))))
+        }
+    }
+
+    #[test]
+    fn prepared_non_sync_workers_have_independent_state_and_accept_borrowed_records() {
+        let recipe = Plan::<Logical>::new().step(StatefulDefinition);
+        let mut first = recipe.compile().expect("prepare");
+        let mut second = recipe.compile().expect("prepare");
+        let sequence = Vec::from(&b"ACGT"[..]);
+        let quality = Vec::from(&b"IIII"[..]);
+        let record = RecordView::new(b"read", &sequence, &quality);
+        for plan in [&mut first, &mut second] {
+            let mut observer = RunObserver::new("test".to_owned());
+            let mut arena = TransformArena::new();
+            assert_eq!(
+                plan.execute(record, &mut arena, &mut observer)
+                    .expect("execute")
+                    .emitted()
+                    .count(),
+                1
+            );
+            let mut arena = TransformArena::new();
+            assert_eq!(
+                plan.execute(record, &mut arena, &mut observer)
+                    .expect("execute")
+                    .emitted()
+                    .count(),
+                0
+            );
+        }
     }
 
     #[test]

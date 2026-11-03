@@ -1242,6 +1242,42 @@ fn unsupported_fasta_is_not_an_invalid_input_event() {
 }
 
 #[test]
+fn paired_filter_reports_suppressed_passing_mate() {
+    let temp = tempdir().expect("tempdir");
+    let input = temp.path().join("reads.fastq");
+    let summary = temp.path().join("summary.json");
+    fs::write(&input, b"@read1/1\nAAAA\n+\nIIII\n@read1/2\nAAA\n+\nIII\n").expect("fixture");
+    let output = nuclease()
+        .args([
+            "--in",
+            input.to_str().expect("path"),
+            "--paired",
+            "--min-length",
+            "4",
+            "--trim-min-q",
+            "0",
+            "--min-mean-q",
+            "0",
+            "--summary",
+            summary.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    let summary: Value =
+        serde_json::from_str(&fs::read_to_string(summary).expect("summary")).expect("JSON");
+    assert_eq!(summary["reads_rejected"], 1);
+    assert_eq!(summary["reads_suppressed"], 1);
+    assert_eq!(summary["pairs_rejected"], 1);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("reads suppressed:    1"));
+}
+
+#[test]
 fn paired_fastq_streams_interleaved_reads_and_writes_summary() {
     let temp = tempdir().expect("tempdir should be created");
     let input1 = temp.path().join("reads_1.fastq");

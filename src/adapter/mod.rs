@@ -4,7 +4,8 @@ use wide::u8x16;
 
 use crate::{
     plan::{
-        BuildPlan, IntoExecutionStep, ReadTransform, TransformArena, TransformResult, TransformStep,
+        BuildPlan, PrepareExecutionStep, ReadTransform, TransformArena, TransformResult,
+        TransformStep,
     },
     record::RecordView,
 };
@@ -256,9 +257,9 @@ impl ReadTransform for AdapterTrim {
     }
 }
 
-impl IntoExecutionStep for AdapterTrim {
-    fn into_execution_step(self) -> Box<dyn crate::plan::ExecutionStep> {
-        Box::new(TransformStep(self))
+impl PrepareExecutionStep for AdapterTrim {
+    fn prepare(&self) -> crate::error::Result<Box<dyn crate::plan::ExecutionStep>> {
+        Ok(Box::new(TransformStep(Self::new(self.catalog))))
     }
 }
 

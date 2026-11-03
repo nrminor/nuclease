@@ -249,7 +249,7 @@ impl RunConfig {
 
         let plan = Plan::<Logical>::new();
         if self.passthrough {
-            return Ok(plan.orphan_policy(OrphanPolicy::DropPair).compile());
+            return plan.orphan_policy(OrphanPolicy::DropPair).compile();
         }
 
         let plan = if self.merge_pairs && layout == RunLayout::Paired {
@@ -257,7 +257,7 @@ impl RunConfig {
                 min_overlap: self.merge_min_overlap,
                 max_mismatch_rate: self.merge_max_mismatch_rate,
                 min_correction_delta_q: self.merge_min_correction_delta_q,
-            })?
+            })
         } else {
             plan
         };
@@ -278,7 +278,7 @@ impl RunConfig {
             None => plan,
         };
 
-        Ok(plan.orphan_policy(OrphanPolicy::DropPair).compile())
+        plan.orphan_policy(OrphanPolicy::DropPair).compile()
     }
 }
 

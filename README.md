@@ -117,7 +117,7 @@ use crate::{plan::ReadFilter, record::RecordView};
 impl ReadFilter for GcRange {
     type Reason = GcOutOfRange;
 
-    fn evaluate(&self, record: &RecordView<'_>) -> Result<(), Self::Reason> {
+    fn evaluate(&mut self, record: &RecordView<'_>) -> Result<(), Self::Reason> {
         let seq = record.sequence();
 
         if seq.is_empty() {
@@ -142,11 +142,11 @@ impl ReadFilter for GcRange {
 That's technically all we need to use the filter in `nuclease`. But let's go one step further and bring it into our composable fluent interface:
 
 ```rust
-use crate::plan::{BuildPlan, ExecutionStep, FilterStep, IntoExecutionStep};
+use crate::plan::{BuildPlan, ExecutionStep, FilterStep, PrepareExecutionStep};
 
-impl IntoExecutionStep for GcRange {
-    fn into_execution_step(self) -> Box<dyn ExecutionStep> {
-        Box::new(FilterStep(self))
+impl PrepareExecutionStep for GcRange {
+    fn prepare(&self) -> crate::error::Result<Box<dyn ExecutionStep>> {
+        Ok(Box::new(FilterStep(GcRange::new(self.min_gc, self.max_gc))))
     }
 }
 
@@ -160,6 +160,8 @@ impl<T> GcRangeFilter for T where T: BuildPlan {}
 ```
 
 This teaches the execution planner that `GcRange` is a filter step. And then making the GcRangeFilter trait and blanket implementing it for all `BuildPlan` types means we can now include our new operation in the `nuclease` plan builder:
+
+Each compilation borrows the definition and prepares an independent owned worker. A filter may override `evaluate_pair` to make one atomic decision for a pair; otherwise both mates are evaluated independently. Rejection totals and reason counts measure the current records covered by each decision, so an atomic pair rejection counts two and a subsequently rejected merged record counts one. Under the drop-pair policy, a passing mate discarded because its partner failed is counted separately as suppressed, not as rejected.
 
 ```rust
 use crate::filter::{
@@ -178,7 +180,7 @@ let plan = Plan::new()
     .min_mean_q(cli.min_mean_q)
     .min_entropy(cli.min_entropy)
     .orphan_policy(OrphanPolicy::DropPair)
-    .compile();
+    .compile()?;
 ```
 
 Transforms that produce mutated versions of the input reads work exactly the same way.
@@ -246,11 +248,11 @@ impl ReadTransform for TrimPrefix {
 As with filters, bridge the transform into the executor and expose a fluent method:
 
 ```rust
-use crate::plan::{BuildPlan, ExecutionStep, IntoExecutionStep, TransformStep};
+use crate::plan::{BuildPlan, ExecutionStep, PrepareExecutionStep, TransformStep};
 
-impl IntoExecutionStep for TrimPrefix {
-    fn into_execution_step(self) -> Box<dyn ExecutionStep> {
-        Box::new(TransformStep(self))
+impl PrepareExecutionStep for TrimPrefix {
+    fn prepare(&self) -> crate::error::Result<Box<dyn ExecutionStep>> {
+        Ok(Box::new(TransformStep(TrimPrefix::new(self.bases))))
     }
 }
 
@@ -284,7 +286,7 @@ let plan = Plan::new()
     .min_mean_q(cli.min_mean_q)
     .min_entropy(cli.min_entropy)
     .orphan_policy(OrphanPolicy::DropPair)
-    .compile();
+    .compile()?;
 ```
 
 The transform reports whether it was actually applied. When `applied` is true, the executor records the transform code (`trim_prefix`) in run statistics without the pipeline needing transform-specific accounting.
@@ -294,7 +296,7 @@ In both cases, the following steps are all that's needed to do new things in `nu
 1. Make a new struct to handle the transform or filter.
 2. Make a struct that records the reason for rejection, if a filter. This isn't necessary for transforms.
 3. Implement `ReadFilter` or `ReadTransform`.
-4. Implement `IntoExecutionStep` for the new filter/transform struct.
+4. Implement `PrepareExecutionStep` to construct an owned worker from the reusable definition. Preparation can fail and must leave the definition reusable.
 5. Package the struct in a trait and blanket implement it for all plans.
 
 ### Roadmap

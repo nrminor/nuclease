@@ -4,7 +4,7 @@ use bytecount::count;
 use std::f64::consts::LN_2;
 
 use crate::{
-    plan::{BuildPlan, FilterStep, IntoExecutionStep, ReadFilter, RejectionReason},
+    plan::{BuildPlan, FilterStep, PrepareExecutionStep, ReadFilter, RejectionReason},
     record::RecordView,
 };
 
@@ -32,7 +32,7 @@ impl MaxNs {
 impl ReadFilter for MaxNs {
     type Reason = TooManyNs;
 
-    fn evaluate(&self, record: &RecordView<'_>) -> Result<(), Self::Reason> {
+    fn evaluate(&mut self, record: &RecordView<'_>) -> Result<(), Self::Reason> {
         let observed = count(record.sequence(), b'N');
         if observed > self.max_ns {
             Err(TooManyNs {})
@@ -42,9 +42,9 @@ impl ReadFilter for MaxNs {
     }
 }
 
-impl IntoExecutionStep for MaxNs {
-    fn into_execution_step(self) -> Box<dyn crate::plan::ExecutionStep> {
-        Box::new(FilterStep(self))
+impl PrepareExecutionStep for MaxNs {
+    fn prepare(&self) -> crate::error::Result<Box<dyn crate::plan::ExecutionStep>> {
+        Ok(Box::new(FilterStep(Self::new(self.max_ns))))
     }
 }
 
@@ -81,7 +81,7 @@ impl MinLength {
 impl ReadFilter for MinLength {
     type Reason = TooShort;
 
-    fn evaluate(&self, record: &RecordView<'_>) -> Result<(), Self::Reason> {
+    fn evaluate(&mut self, record: &RecordView<'_>) -> Result<(), Self::Reason> {
         let observed = record.sequence().len();
         if observed < self.min_length {
             Err(TooShort {})
@@ -91,9 +91,9 @@ impl ReadFilter for MinLength {
     }
 }
 
-impl IntoExecutionStep for MinLength {
-    fn into_execution_step(self) -> Box<dyn crate::plan::ExecutionStep> {
-        Box::new(FilterStep(self))
+impl PrepareExecutionStep for MinLength {
+    fn prepare(&self) -> crate::error::Result<Box<dyn crate::plan::ExecutionStep>> {
+        Ok(Box::new(FilterStep(Self::new(self.min_length))))
     }
 }
 
@@ -130,7 +130,7 @@ impl MinMeanQuality {
 impl ReadFilter for MinMeanQuality {
     type Reason = LowMeanQuality;
 
-    fn evaluate(&self, record: &RecordView<'_>) -> Result<(), Self::Reason> {
+    fn evaluate(&mut self, record: &RecordView<'_>) -> Result<(), Self::Reason> {
         let total: u32 = record
             .quality()
             .iter()
@@ -149,9 +149,9 @@ impl ReadFilter for MinMeanQuality {
     }
 }
 
-impl IntoExecutionStep for MinMeanQuality {
-    fn into_execution_step(self) -> Box<dyn crate::plan::ExecutionStep> {
-        Box::new(FilterStep(self))
+impl PrepareExecutionStep for MinMeanQuality {
+    fn prepare(&self) -> crate::error::Result<Box<dyn crate::plan::ExecutionStep>> {
+        Ok(Box::new(FilterStep(Self::new(self.min_mean_q))))
     }
 }
 
@@ -189,7 +189,7 @@ impl MinEntropy {
 impl ReadFilter for MinEntropy {
     type Reason = LowEntropy;
 
-    fn evaluate(&self, record: &RecordView<'_>) -> Result<(), Self::Reason> {
+    fn evaluate(&mut self, record: &RecordView<'_>) -> Result<(), Self::Reason> {
         let observed = shannon_entropy(record.sequence());
         if observed < self.min_entropy {
             Err(LowEntropy {})
@@ -199,9 +199,9 @@ impl ReadFilter for MinEntropy {
     }
 }
 
-impl IntoExecutionStep for MinEntropy {
-    fn into_execution_step(self) -> Box<dyn crate::plan::ExecutionStep> {
-        Box::new(FilterStep(self))
+impl PrepareExecutionStep for MinEntropy {
+    fn prepare(&self) -> crate::error::Result<Box<dyn crate::plan::ExecutionStep>> {
+        Ok(Box::new(FilterStep(Self::new(self.min_entropy))))
     }
 }
 
