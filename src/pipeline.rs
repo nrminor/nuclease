@@ -226,7 +226,24 @@ impl TryFrom<&Cli> for RunConfig {
                 .deplete_index(cli.deplete_index.as_deref())
                 .deplete_min_hits(cli.deplete_min_hits)
                 .policy(cli.selection_policy)
-                .load()?,
+                .construction_parameters(cli.index_kmer_length, cli.index_window_size)
+                .save_enrich_index(
+                    cli.save_enrich_index
+                        .as_ref()
+                        .map(|path| path.as_deref().into()),
+                )
+                .save_deplete_index(
+                    cli.save_deplete_index
+                        .as_ref()
+                        .map(|path| path.as_deref().into()),
+                )
+                .build(&[
+                    cli.out.as_deref(),
+                    cli.out1.as_deref(),
+                    cli.out2.as_deref(),
+                    cli.summary.as_deref(),
+                    cli.invalid_input_report.as_deref(),
+                ])?,
             min_length: cli.min_length,
             max_ns: cli.max_ns,
             min_mean_q: cli.min_mean_q,
@@ -1378,6 +1395,10 @@ mod tests {
 
     fn test_cli() -> Cli {
         Cli {
+            index_kmer_length: None,
+            index_window_size: None,
+            save_enrich_index: None,
+            save_deplete_index: None,
             enrich_index: None,
             deplete_index: None,
             enrich_min_hits: None,

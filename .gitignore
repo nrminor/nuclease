@@ -30,6 +30,9 @@
 !src/filter/
 !src/filter/mod.rs
 !src/filter/minimizer.rs
+!src/filter/minimizer/
+!src/filter/minimizer/construction.rs
+!src/filter/minimizer/source.rs
 !src/adapter/
 !src/adapter/mod.rs
 !src/adapter/catalog.rs

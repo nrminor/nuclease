@@ -427,6 +427,31 @@ pub(crate) mod constructors {
         }
     }
 
+    pub(crate) fn reference_parse_error(
+        role: &'static str,
+        path: &Path,
+        read_error: Option<io::ErrorKind>,
+        source: ParseError,
+    ) -> RunError {
+        // Decoder errors without a raw read failure describe corrupt compression.
+        // Needletail can erase a raw failure during its initial format probe.
+        if read_error.is_some_and(|kind| kind != io::ErrorKind::UnexpectedEof) {
+            IoError::Reference {
+                role,
+                path: path.to_path_buf(),
+                source,
+            }
+            .into()
+        } else {
+            MalformedInputError::Reference {
+                role,
+                path: path.to_path_buf(),
+                source,
+            }
+            .into()
+        }
+    }
+
     pub(crate) fn json_report_error(
         report_kind: &'static str,
         path: &Path,
@@ -665,6 +690,23 @@ enum AccessionSyntaxProblem {
 /// Semantically invalid selections discovered after successful CLI parsing or input resolution.
 #[derive(Debug, Error)]
 pub(crate) enum UsageError {
+    #[error("invalid index construction parameters k={k}, w={w}")]
+    IndexParameters {
+        k: u8,
+        w: u8,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error("enrichment and depletion must not use the same source file: {enrich}, {deplete}")]
+    SameSelectionSource { enrich: PathBuf, deplete: PathBuf },
+    #[error(
+        "saving the {role} index requires a reference source, not a prebuilt index or an absent source"
+    )]
+    SaveRequiresReference { role: &'static str },
+    #[error("saved index destination already exists: {path}")]
+    IndexDestinationExists { path: PathBuf },
+    #[error("saved index destination {path} collides with another output {other}")]
+    IndexOutputCollision { path: PathBuf, other: PathBuf },
     #[error("{role} minimizer hit threshold must be at least 1")]
     ZeroSelectionThreshold { role: &'static str },
     #[error(
@@ -696,6 +738,15 @@ pub(crate) enum UsageError {
 /// Local input failures whose structure is demonstrably malformed.
 #[derive(Debug, Error)]
 pub(crate) enum MalformedInputError {
+    #[error("invalid {role} reference {path}")]
+    Reference {
+        role: &'static str,
+        path: PathBuf,
+        #[source]
+        source: ParseError,
+    },
+    #[error("reference {path} produced no usable minimizers with k={k}, w={w}")]
+    EmptyReferenceIndex { path: PathBuf, k: u8, w: u8 },
     #[error("invalid {role} Deacon index {path}")]
     SelectionIndex {
         role: &'static str,
@@ -832,7 +883,7 @@ pub(crate) enum MalformedInputError {
 /// Requested inputs that cannot be opened or resolved in a supported form.
 #[derive(Debug, Error)]
 pub(crate) enum UnavailableInputError {
-    #[error("failed to open {role} Deacon index {path}")]
+    #[error("failed to open {role} index or reference {path}")]
     SelectionIndex {
         role: &'static str,
         path: PathBuf,
@@ -893,6 +944,19 @@ impl fmt::Display for OutputDestination {
 /// External local read, required-output, and requested-report failures.
 #[derive(Debug, Error)]
 pub(crate) enum IoError {
+    #[error("failed while reading {role} reference {path}")]
+    Reference {
+        role: &'static str,
+        path: PathBuf,
+        #[source]
+        source: ParseError,
+    },
+    #[error("failed to prepare or save index destination {path}")]
+    SaveIndex {
+        path: PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("failed while reading {role} Deacon index {path}")]
     SelectionIndex {
         role: &'static str,
@@ -1249,6 +1313,11 @@ pub(crate) enum EnaContentProblem {
 /// Software defects, initialization failures, and violated internal expectations.
 #[derive(Debug, Error)]
 pub(crate) enum InternalError {
+    #[error("failed to construct Deacon index")]
+    IndexConstruction {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("failed to prepare Deacon selection worker")]
     SelectionWorker {
         #[source]

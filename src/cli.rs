@@ -128,10 +128,10 @@ impl fmt::Display for AdmissionPolicy {
         .args(["ena", "input", "in1"])
 ))]
 pub struct Cli {
-    /// Deacon enrichment index.
+    /// Enrichment source: a Deacon index or FASTA/FASTQ reference (optionally compressed).
     #[arg(long, conflicts_with = "passthrough", help_heading = "Selection")]
     pub enrich_index: Option<PathBuf>,
-    /// Deacon depletion index.
+    /// Depletion source: a Deacon index or FASTA/FASTQ reference (optionally compressed).
     #[arg(long, conflicts_with = "passthrough", help_heading = "Selection")]
     pub deplete_index: Option<PathBuf>,
     /// Minimum distinct enrichment hits (default 2).
@@ -143,6 +143,36 @@ pub struct Cli {
     /// Combination policy when both indexes are present.
     #[arg(long, value_enum, requires_all = ["enrich_index", "deplete_index"], help_heading = "Selection")]
     pub selection_policy: Option<SelectionPolicy>,
+    /// K-mer length for reference construction (default 31; prebuilt indexes keep their settings).
+    #[arg(long, help_heading = "Index construction")]
+    pub index_kmer_length: Option<u8>,
+    /// Minimizer window size for reference construction (default 15).
+    #[arg(long, help_heading = "Index construction")]
+    pub index_window_size: Option<u8>,
+    /// Save the constructed enrichment index; without PATH, append `.k<K>.w<W>.idx` to the reference path.
+    #[arg(
+        long,
+        requires = "enrich_index",
+        value_name = "PATH",
+        help_heading = "Index construction"
+    )]
+    #[expect(
+        clippy::option_option,
+        reason = "Clap distinguishes absent, bare, and valued save flags"
+    )]
+    pub save_enrich_index: Option<Option<PathBuf>>,
+    /// Save the constructed depletion index; without PATH, append `.k<K>.w<W>.idx` to the reference path.
+    #[arg(
+        long,
+        requires = "deplete_index",
+        value_name = "PATH",
+        help_heading = "Index construction"
+    )]
+    #[expect(
+        clippy::option_option,
+        reason = "Clap distinguishes absent, bare, and valued save flags"
+    )]
+    pub save_deplete_index: Option<Option<PathBuf>>,
     /// ENA run accession to resolve and stream.
     #[arg(
         long,
@@ -527,6 +557,10 @@ mod tests {
 
     fn base_cli() -> Cli {
         Cli {
+            index_kmer_length: None,
+            index_window_size: None,
+            save_enrich_index: None,
+            save_deplete_index: None,
             enrich_index: None,
             deplete_index: None,
             enrich_min_hits: None,
@@ -580,6 +614,10 @@ mod tests {
     #[test]
     fn ingress_returns_ena_variant_for_accession_input() -> Result<()> {
         let cli = Cli {
+            index_kmer_length: None,
+            index_window_size: None,
+            save_enrich_index: None,
+            save_deplete_index: None,
             enrich_index: None,
             deplete_index: None,
             enrich_min_hits: None,
@@ -623,6 +661,10 @@ mod tests {
     #[test]
     fn ingress_returns_local_paired_variant_when_both_fastqs_are_present() -> Result<()> {
         let cli = Cli {
+            index_kmer_length: None,
+            index_window_size: None,
+            save_enrich_index: None,
+            save_deplete_index: None,
             enrich_index: None,
             deplete_index: None,
             enrich_min_hits: None,

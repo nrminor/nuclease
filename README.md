@@ -61,6 +61,19 @@ When both indexes are supplied, `--selection-policy depletion-veto` (the default
 
 Use uncompressed Deacon exact v3 or fuse v1 indexes from a trusted source. Fuse indexes can produce false-positive matches.
 
+Both index options also accept local FASTA or FASTQ references, plain or gzip/bzip2/xz/zstd-compressed. Source contents, not filename extensions, determine the format. References are built into exact indexes before reads are opened; FASTQ reference qualities are unused. Read-processing input remains FASTQ-only. Supplying the same underlying source file for both roles, including symlink or hardlink aliases, is an error.
+
+Construction is ephemeral unless `--save-enrich-index [PATH]` or `--save-deplete-index [PATH]` is supplied. A bare save flag appends `.k<K>.w<W>.idx` to the complete reference filename: `targets.fa.gz.k31.w15.idx`, for example. An explicit path chooses another destination. To reuse a saved index, supply its path on a later run; references are not automatically replaced by nearby indexes.
+
+`--index-kmer-length` (default 31) and `--index-window-size` (default 15) apply to all references built in that invocation. Both must be positive and odd, k must be at most 61, and k+w must be at most 96. Prebuilt indexes retain their own settings; unused explicit construction settings produce a warning. A reference producing no usable minimizers is an error.
+
+```sh
+nuclease --in reads.fastq.gz --enrich-index targets.fa.gz --save-enrich-index > selected.fastq
+nuclease --in reads.fastq.gz --enrich-index targets.fa.gz.k31.w15.idx > selected.fastq
+```
+
+Saving requires a reference source and never replaces an existing destination. Saved indexes cannot share destinations with other run outputs. Publication occurs only after serialization completes; save failures stop the run before read outputs open. Completed indexes survive later failures. Temporary staging files are cleaned up on ordinary errors, but forced termination may leave staging files; power-loss durability is not guaranteed. Preparation is sequential, and construction memory grows with distinct minimizers and the largest reference record; it is not capped by a fixed buffer size.
+
 Use `-p`/`--passthrough` to parse and validate input while emitting reads without filters or transforms. Passthrough output is produced by nuclease's normal FASTQ writer rather than copied byte-for-byte from the input, and it cannot be combined with `--merge-pairs` or Deacon selection.
 
 Adapter presets are curated sequence catalogs, not adapter auto-detection. Adapter trimming is disabled unless a preset is selected explicitly. The current trimmer only exposes presets with entries that are safe for 3' suffix-overlap trimming. Long-read catalog entries that require 5' trimming, both-end matching, barcode interpretation, internal-adapter handling, read splitting, demultiplexing, or orientation correction are retained as structured catalog metadata until those algorithms are implemented, but are not exposed as CLI presets yet.

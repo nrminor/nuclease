@@ -210,7 +210,7 @@ fn check_history(settings: &Settings, history: &[Unit]) {
         .enrich_min_hits(settings.enrich_threshold)
         .deplete_min_hits(settings.deplete_threshold)
         .policy(settings.policy)
-        .load()
+        .build(&[])
         .expect("load generated indexes");
     let recipe = Plan::<Logical>::new().orphan_policy(settings.orphan_policy);
     let recipe = match selection {

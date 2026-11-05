@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use deacon::{FilterKernel, FilterParams, Index};
+use deacon::{DEFAULT_KMER_LENGTH, DEFAULT_WINDOW_SIZE, FilterKernel, FilterParams, Index};
 
 use crate::{
     error::{InternalError, Result, UnavailableInputError, UsageError, constructors},
@@ -16,6 +16,24 @@ use crate::{
     },
     record::{RecordPair, RecordView},
 };
+
+mod construction;
+mod source;
+
+/// Where a requested constructed index should be saved.
+#[derive(Clone, Copy)]
+pub(crate) enum SaveIndex<'a> {
+    /// Append the construction parameters to the reference's complete filename.
+    BesideReference,
+    /// Save at the supplied destination without replacement.
+    At(&'a Path),
+}
+
+impl<'a> From<Option<&'a Path>> for SaveIndex<'a> {
+    fn from(path: Option<&'a Path>) -> Self {
+        path.map_or(Self::BesideReference, Self::At)
+    }
+}
 
 /// How enrichment and depletion decisions are combined.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -66,6 +84,7 @@ impl MinimizerFilter {
                 return Err(UsageError::ZeroSelectionThreshold { role }.into());
             }
         }
+        source::reject_same_sources(enrich_path, deplete_path)?;
         let enrich = enrich_path
             .map(|path| load_index(path, "enrichment", enrich_min_hits))
             .transpose()?;
@@ -92,10 +111,14 @@ pub(crate) struct MinimizerFilterBuilder<'a> {
     deplete_index: Option<&'a Path>,
     deplete_min_hits: Option<usize>,
     policy: Option<SelectionPolicy>,
+    k: Option<u8>,
+    w: Option<u8>,
+    save_enrich: Option<SaveIndex<'a>>,
+    save_deplete: Option<SaveIndex<'a>>,
 }
 
 impl<'a> MinimizerFilterBuilder<'a> {
-    /// Set the enrichment index path.
+    /// Set the enrichment index or reference path.
     pub(crate) fn enrich_index(mut self, path: impl Into<Option<&'a Path>>) -> Self {
         self.enrich_index = path.into();
         self
@@ -107,7 +130,7 @@ impl<'a> MinimizerFilterBuilder<'a> {
         self
     }
 
-    /// Set the depletion index path.
+    /// Set the depletion index or reference path.
     pub(crate) fn deplete_index(mut self, path: impl Into<Option<&'a Path>>) -> Self {
         self.deplete_index = path.into();
         self
@@ -125,15 +148,111 @@ impl<'a> MinimizerFilterBuilder<'a> {
         self
     }
 
-    /// Load the configured indexes into an owned filter definition.
-    pub(crate) fn load(self) -> Result<Option<MinimizerFilter>> {
-        MinimizerFilter::load(
-            self.enrich_index,
-            self.enrich_min_hits.unwrap_or(2),
-            self.deplete_index,
-            self.deplete_min_hits.unwrap_or(2),
-            self.policy.unwrap_or_default(),
-        )
+    /// Override shared construction parameters; prebuilt indexes remain authoritative.
+    pub(crate) fn construction_parameters(mut self, k: Option<u8>, w: Option<u8>) -> Self {
+        self.k = k;
+        self.w = w;
+        self
+    }
+
+    /// Request enrichment saving at the selected destination.
+    pub(crate) fn save_enrich_index(mut self, path: Option<SaveIndex<'a>>) -> Self {
+        self.save_enrich = path;
+        self
+    }
+
+    /// Request depletion saving at the selected destination.
+    pub(crate) fn save_deplete_index(mut self, path: Option<SaveIndex<'a>>) -> Self {
+        self.save_deplete = path;
+        self
+    }
+
+    /// Prepare sources sequentially, saving only on request and never replacing outputs.
+    ///
+    /// Supply every other file output so index saves cannot collide with them. Read
+    /// decoding and output creation must start only after this method succeeds.
+    pub(crate) fn build(self, other_outputs: &[Option<&Path>]) -> Result<Option<MinimizerFilter>> {
+        for (path, hits, save, role) in [
+            (
+                self.enrich_index,
+                self.enrich_min_hits,
+                self.save_enrich,
+                "enrichment",
+            ),
+            (
+                self.deplete_index,
+                self.deplete_min_hits,
+                self.save_deplete,
+                "depletion",
+            ),
+        ] {
+            if path.is_some() && hits == Some(0) {
+                return Err(UsageError::ZeroSelectionThreshold { role }.into());
+            }
+            if path.is_none() && save.is_some() {
+                return Err(UsageError::SaveRequiresReference { role }.into());
+            }
+        }
+        source::reject_same_sources(self.enrich_index, self.deplete_index)?;
+        let k = self.k.unwrap_or(DEFAULT_KMER_LENGTH);
+        let w = self.w.unwrap_or(DEFAULT_WINDOW_SIZE);
+        let enrich = self
+            .enrich_index
+            .map(|path| source::Source::open(path, "enrichment", self.save_enrich, k, w))
+            .transpose()?;
+        let deplete = self
+            .deplete_index
+            .map(|path| source::Source::open(path, "depletion", self.save_deplete, k, w))
+            .transpose()?;
+        let constructs = enrich.as_ref().is_some_and(source::Source::is_reference)
+            || deplete.as_ref().is_some_and(source::Source::is_reference);
+        if !constructs {
+            drop((enrich, deplete));
+            if self.k.is_some() || self.w.is_some() {
+                tracing::warn!(
+                    "index construction settings are unused: no reference source supplied"
+                );
+            }
+            return MinimizerFilter::load(
+                self.enrich_index,
+                self.enrich_min_hits.unwrap_or(2),
+                self.deplete_index,
+                self.deplete_min_hits.unwrap_or(2),
+                self.policy.unwrap_or_default(),
+            );
+        }
+        // Validate shared settings before either construction or publication.
+        deacon::Minimizers::new(k, w).map_err(|source| UsageError::IndexParameters {
+            k,
+            w,
+            source: source.into_boxed_dyn_error(),
+        })?;
+        let saved_paths = [
+            enrich
+                .as_ref()
+                .and_then(source::Source::save_path)
+                .map(Path::to_path_buf),
+            deplete
+                .as_ref()
+                .and_then(source::Source::save_path)
+                .map(Path::to_path_buf),
+        ];
+        let saves = saved_paths.each_ref().map(|path| path.as_deref());
+        source::validate_destinations(&saves, other_outputs)?;
+        let enrich = enrich
+            .map(|source| source.prepare(k, w, self.enrich_min_hits.unwrap_or(2)))
+            .transpose()?;
+        let deplete = deplete
+            .map(|source| source.prepare(k, w, self.deplete_min_hits.unwrap_or(2)))
+            .transpose()?;
+        // Also check resolved file identity after publication (e.g. a case-insensitive
+        // filesystem may resolve differently spelled, previously absent outputs).
+        source::validate_published_outputs(&saves, other_outputs)?;
+        Ok(Some(MinimizerFilter {
+            enrich,
+            deplete,
+            policy: self.policy.unwrap_or_default(),
+        }))
     }
 }
 
@@ -395,7 +514,7 @@ mod tests {
         let path = index(dir.path(), "index", vec![0, 21]);
         let built = MinimizerFilter::builder()
             .enrich_index(path.as_path())
-            .load()
+            .build(&[])
             .expect("builder")
             .expect("filter");
         let raw = MinimizerFilter::load(Some(&path), 2, None, 2, SelectionPolicy::DepletionVeto)
@@ -429,7 +548,7 @@ mod tests {
             MinimizerFilter::builder()
                 .enrich_index(missing.as_path())
                 .enrich_min_hits(0)
-                .load(),
+                .build(&[]),
         ] {
             assert!(matches!(
                 result,
@@ -459,7 +578,7 @@ mod tests {
                     .enrich_min_hits(1)
                     .deplete_min_hits(1)
                     .policy(policy)
-                    .load()
+                    .build(&[])
                     .expect("load");
                 let recipe = if let Some(selection) = selection {
                     Plan::<Logical>::new().step(selection)
@@ -510,7 +629,7 @@ mod tests {
                 .step(
                     MinimizerFilter::builder()
                         .enrich_index(path.as_path())
-                        .load()
+                        .build(&[])
                         .expect("load")
                         .expect("filter"),
                 )
