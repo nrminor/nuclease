@@ -25,7 +25,7 @@ fn installer(release_url: &str) -> (TempDir, Command) {
     // Only these local utilities and the mocks are reachable through PATH.
     // GNU tar invokes gzip to extract compressed archives.
     for name in [
-        "uname", "mktemp", "mkdir", "chmod", "mv", "rm", "tar", "gzip", "cp", "cat",
+        "mktemp", "mkdir", "chmod", "mv", "rm", "tar", "gzip", "cp", "cat",
     ] {
         let program = ["/usr/bin", "/bin"]
             .into_iter()
@@ -34,6 +34,17 @@ fn installer(release_url: &str) -> (TempDir, Command) {
             .expect("installer utility");
         symlink(program, bin.join(name)).expect("utility link");
     }
+    executable(
+        &bin.join("uname"),
+        r#"#!/bin/bash
+set -euo pipefail
+case "$1" in
+  -s) printf '%s\n' "${TEST_OS:-Linux}" ;;
+  -m) printf '%s\n' "${TEST_ARCH:-x86_64}" ;;
+  *) exit 99 ;;
+esac
+"#,
+    );
     executable(
         &bin.join("curl"),
         r#"#!/bin/bash
@@ -67,6 +78,12 @@ esac
         r#"#!/bin/bash
 set -euo pipefail
 printf '%s\n' "$@" > "$TEST_ROOT/cargo.args"
+if [[ "${RUSTFLAGS+x}" == x ]]; then
+  printf '%s' "$RUSTFLAGS" > "$TEST_ROOT/cargo.rustflags"
+fi
+if [[ "${CARGO_ENCODED_RUSTFLAGS+x}" == x ]]; then
+  printf '%s' "$CARGO_ENCODED_RUSTFLAGS" > "$TEST_ROOT/cargo.encoded-rustflags"
+fi
 if [[ "${CARGO_EXIT:-0}" != 0 ]]; then exit "$CARGO_EXIT"; fi
 while [[ $# -gt 0 ]]; do
   if [[ "$1" == --root ]]; then
@@ -120,6 +137,106 @@ fn source_fallback_installs_the_selected_release_with_locked_dependencies() {
     let download =
         fs::read_to_string(dir.path().join("download.args")).expect("download arguments");
     assert!(download.contains("/releases/download/v0.8.0/nuclease-"));
+}
+
+#[test]
+fn source_fallback_enables_avx2_on_x86_and_preserves_compiler_flags() {
+    for (os, arch) in [
+        ("Linux", "x86_64"),
+        ("Darwin", "x86_64"),
+        ("Linux", "amd64"),
+    ] {
+        for (plain, encoded, expected_plain, expected_encoded) in [
+            (None, None, Some("-Ctarget-feature=+avx2"), None),
+            (Some(""), None, Some("-Ctarget-feature=+avx2"), None),
+            (
+                Some("-C debuginfo=1"),
+                None,
+                Some("-C debuginfo=1 -Ctarget-feature=+avx2"),
+                None,
+            ),
+            (
+                Some("-C debuginfo=1"),
+                Some("--cfg\u{1f}build_label=\"with spaces\""),
+                Some("-C debuginfo=1"),
+                Some("--cfg\u{1f}build_label=\"with spaces\"\u{1f}-Ctarget-feature=+avx2"),
+            ),
+            (
+                Some("-C debuginfo=1"),
+                Some(""),
+                Some("-C debuginfo=1"),
+                Some("-Ctarget-feature=+avx2"),
+            ),
+            (None, Some(""), None, Some("-Ctarget-feature=+avx2")),
+        ] {
+            let (dir, mut command) =
+                installer("https://github.com/nrminor/nuclease/releases/tag/v0.8.0");
+            command.env("TEST_OS", os).env("TEST_ARCH", arch);
+            if let Some(flags) = plain {
+                command.env("RUSTFLAGS", flags);
+            }
+            if let Some(flags) = encoded {
+                command.env("CARGO_ENCODED_RUSTFLAGS", flags);
+            }
+            succeeds(&command.output().expect("installer"));
+            for (file, expected) in [
+                ("cargo.rustflags", expected_plain),
+                ("cargo.encoded-rustflags", expected_encoded),
+            ] {
+                let path = dir.path().join(file);
+                if let Some(expected) = expected {
+                    assert_eq!(
+                        fs::read_to_string(path).expect("compiler flags"),
+                        expected,
+                        "{os} {arch}: {file}",
+                    );
+                } else {
+                    assert!(!path.exists(), "{os} {arch}: unexpected {file}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn source_fallback_leaves_arm_compiler_flags_unchanged() {
+    for (os, arch) in [("Linux", "aarch64"), ("Darwin", "arm64")] {
+        for (plain, encoded) in [
+            (None, None),
+            (Some(""), Some("")),
+            (Some("-C debuginfo=1"), None),
+            (
+                Some("-C debuginfo=1"),
+                Some("--cfg\u{1f}build_label=\"with spaces\""),
+            ),
+        ] {
+            let (dir, mut command) =
+                installer("https://github.com/nrminor/nuclease/releases/tag/v0.8.0");
+            command.env("TEST_OS", os).env("TEST_ARCH", arch);
+            if let Some(flags) = plain {
+                command.env("RUSTFLAGS", flags);
+            }
+            if let Some(flags) = encoded {
+                command.env("CARGO_ENCODED_RUSTFLAGS", flags);
+            }
+            succeeds(&command.output().expect("installer"));
+            for (file, expected) in [
+                ("cargo.rustflags", plain),
+                ("cargo.encoded-rustflags", encoded),
+            ] {
+                let path = dir.path().join(file);
+                if let Some(expected) = expected {
+                    assert_eq!(
+                        fs::read_to_string(path).expect("compiler flags"),
+                        expected,
+                        "{os} {arch}: {file}",
+                    );
+                } else {
+                    assert!(!path.exists(), "{os} {arch}: unexpected {file}");
+                }
+            }
+        }
+    }
 }
 
 #[test]

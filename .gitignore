@@ -12,6 +12,9 @@
 !cliff.toml
 !rust-toolchain.toml
 
+!.cargo/
+!.cargo/config.toml
+
 !.mise/
 !.mise/development-env.sh
 !.mise/tasks/

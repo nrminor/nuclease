@@ -226,6 +226,7 @@ fail_no_cargo_in_env() {
 build_from_source() {
     local install_dir="$1"
     local version="$2"
+    local platform="$3"
     local install_root
     install_root=$(get_cargo_install_root "$install_dir")
 
@@ -246,6 +247,15 @@ build_from_source() {
     info "Installing ${BINARY_NAME} ${version} from its release tag..."
     info "Using cargo: $(command -v cargo)"
     info "Install root: ${install_root}"
+
+    # Git installs do not read the fetched crate's Cargo configuration.
+    if [[ "$platform" == x86_64-* ]]; then
+        if [[ "${CARGO_ENCODED_RUSTFLAGS+x}" == x ]]; then
+            local -x CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS:+${CARGO_ENCODED_RUSTFLAGS}$'\x1f'}-Ctarget-feature=+avx2"
+        else
+            local -x RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-Ctarget-feature=+avx2"
+        fi
+    fi
 
     if cargo install --git "https://github.com/${REPO}.git" --tag "$version" --locked --root "${install_root}" --force; then
         info "Successfully built and installed ${BINARY_NAME}"
@@ -301,6 +311,7 @@ show_help() {
     echo ""
     echo -e "${BOLD}REQUIREMENTS${NC}"
     echo "    Runtime:"
+    echo "        - AVX2-capable CPU on x86-64; ARM64 uses NEON"
     echo "        - No external runtime services are required for local FASTQ input"
     echo "        - Network access is required for ENA accession streaming"
     echo ""
@@ -457,7 +468,7 @@ main() {
 
     warn "Failed to download pre-built binary"
     warn "Falling back to source build of ${version}..."
-    build_from_source "$install_dir" "$version"
+    build_from_source "$install_dir" "$version" "$platform"
     verify_installation "$install_dir"
     show_next_steps
 }

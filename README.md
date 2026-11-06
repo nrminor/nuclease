@@ -30,6 +30,8 @@ Another big feature is developer-focused: `nuclease` is highly extensible. See t
 
 ## Installation
 
+On x86-64, both downloaded binaries and source builds require an AVX2-capable CPU. ARM64 builds use NEON. There is no runtime fallback for x86 CPUs without AVX2.
+
 A simple curl install is the recommended installation method:
 
 ```sh
@@ -40,11 +42,17 @@ This downloads the latest release's pre-built binary for your platform. If binar
 
 When `CONDA_PREFIX` is set by a conda, mamba, or pixi environment, the installer places the binary in `$CONDA_PREFIX/bin`. Otherwise, it installs to `$HOME/.local/bin`, which may need to be added to `PATH`. Source builds require Cargo; outside a conda-compatible environment, the installer installs Rust through rustup if Cargo is missing. Inside an environment, it instead asks you to install Rust there.
 
-To install directly from crates.io with Rust 1.95 or later and your platform's build tools:
+To install directly from crates.io with Rust 1.95 or later and your platform's build tools, use the command for your architecture:
 
 ```sh
+# x86-64 (AVX2 required)
+RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+avx2" cargo install nuclease --locked
+
+# ARM64
 cargo install nuclease --locked
 ```
+
+The installer supplies the x86 compiler flag automatically. For manual installs, `CARGO_ENCODED_RUSTFLAGS` takes precedence over `RUSTFLAGS`; if it is set, include the AVX2 flag there instead.
 
 ## Supported Preprocessing Operations
 
@@ -123,6 +131,8 @@ Nuclease exists in part because I like developing tools in Rust with future hack
 The published crate currently provides the CLI, not a library API. The examples below show how to extend the code inside this repository.
 
 Run `mise run test` for tests or `mise run check` for all checks. Property tests live in `src/property_tests/`, grouped by behavior, and run with the ordinary suite. Proptest shrinks failures and saves replay seeds under `tests/fixtures/proptest/`; retain useful seeds in version control and promote discovered counterexamples into named regressions. Deacon interoperability fixtures are checked in, so these tests need neither a Deacon installation nor network access.
+
+Repository builds use `.cargo/config.toml` to enable AVX2 only for x86-64 targets. If you override Cargo's compiler flags, retain `-C target-feature=+avx2` for those targets. Run `mise run build-release` to check the optimized build as CI does; debug builds do not exercise the dependency's SIMD requirement check.
 
 > [!NOTE]
 > The following demos are quite nice in my opinion...but they will only seem that way if you know Rust!

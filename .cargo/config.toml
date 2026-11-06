@@ -1,0 +1,4 @@
+# Deacon's optimized x86 builds require AVX2, not the build host's full CPU feature set.
+# Environment rustflags override this default and must retain +avx2 on x86-64.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+avx2"]
