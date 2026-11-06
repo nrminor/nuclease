@@ -23,8 +23,9 @@ fn installer(release_url: &str) -> (TempDir, Command) {
     fs::create_dir(&bin).expect("mock command directory");
     fs::create_dir(&scratch).expect("installer temporary directory");
     // Only these local utilities and the mocks are reachable through PATH.
+    // GNU tar invokes gzip to extract compressed archives.
     for name in [
-        "uname", "mktemp", "mkdir", "chmod", "mv", "rm", "tar", "cp", "cat",
+        "uname", "mktemp", "mkdir", "chmod", "mv", "rm", "tar", "gzip", "cp", "cat",
     ] {
         let program = ["/usr/bin", "/bin"]
             .into_iter()
@@ -269,13 +270,15 @@ fn available_release_binary_does_not_invoke_cargo() {
             .output()
             .expect("fixture archive"),
     );
-    succeeds(
-        &command
-            .env("BINARY_ARCHIVE", archive)
-            .output()
-            .expect("installer"),
+    let output = command
+        .env("BINARY_ARCHIVE", archive)
+        .output()
+        .expect("installer");
+    succeeds(&output);
+    assert!(
+        !dir.path().join("cargo.args").exists(),
+        "unexpected source fallback: {output:?}",
     );
-    assert!(!dir.path().join("cargo.args").exists());
     assert_eq!(
         fs::read_to_string(dir.path().join("home/.local/bin/nuclease")).expect("installed binary"),
         contents,
