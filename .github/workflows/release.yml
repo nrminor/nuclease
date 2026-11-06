@@ -12,7 +12,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   create-release:
-    name: Create Release
+    name: Create Draft Release
     needs: [ci-stable]
     runs-on: ubuntu-latest
     permissions:
@@ -30,7 +30,7 @@ jobs:
       - name: Generate changelog
         run: git-cliff --config cliff.toml --latest --strip header -o CHANGES.md
 
-      - name: Create Release
+      - name: Create Draft Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -39,6 +39,7 @@ jobs:
             PRERELEASE_FLAG="--prerelease"
           fi
           gh release create "${{ github.ref_name }}" \
+            --draft \
             --title "Release ${{ github.ref_name }}" \
             --notes-file CHANGES.md \
             $PRERELEASE_FLAG
@@ -119,3 +120,18 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ github.ref_name }}" "${{ env.ASSET_PATH }}" --clobber
+
+  publish-release:
+    name: Publish Complete Release
+    needs: [build-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft=false
