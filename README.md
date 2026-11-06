@@ -122,7 +122,7 @@ Nuclease exists in part because I like developing tools in Rust with future hack
 
 The published crate currently provides the CLI, not a library API. The examples below show how to extend the code inside this repository.
 
-Run `mise run test` for tests or `mise run check` for all checks. Property tests live in `src/property_tests/`, grouped by behavior, and run with the ordinary suite. Proptest shrinks failures and saves replay seeds under `proptest-regressions/`; retain useful seeds in version control and promote discovered counterexamples into named regressions. Deacon interoperability fixtures are checked in, so these tests need neither a Deacon installation nor network access.
+Run `mise run test` for tests or `mise run check` for all checks. Property tests live in `src/property_tests/`, grouped by behavior, and run with the ordinary suite. Proptest shrinks failures and saves replay seeds under `tests/fixtures/proptest/`; retain useful seeds in version control and promote discovered counterexamples into named regressions. Deacon interoperability fixtures are checked in, so these tests need neither a Deacon installation nor network access.
 
 > [!NOTE]
 > The following demos are quite nice in my opinion...but they will only seem that way if you know Rust!

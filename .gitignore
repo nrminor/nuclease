@@ -50,6 +50,6 @@
 !tests/fixtures/deacon-0.19.1/
 !tests/fixtures/deacon-0.19.1/*
 
-!proptest-regressions/
-!proptest-regressions/**/
-!proptest-regressions/**/*.txt
+!tests/fixtures/proptest/
+!tests/fixtures/proptest/**/
+!tests/fixtures/proptest/**/*.txt

@@ -233,7 +233,7 @@ proptest! {
         cases: 128,
         max_shrink_iters: 2048,
         failure_persistence: Some(Box::new(FileFailurePersistence::SourceParallel(
-            "proptest-regressions",
+            "tests/fixtures/proptest",
         ))),
         ..ProptestConfig::default()
     })]
