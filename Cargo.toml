@@ -1,14 +1,14 @@
 [package]
 name = "nuclease"
-version = "0.7.0"
-description = "Streaming FASTQ preprocessor with a focus on extensibility"
+version = "0.8.0"
+description = "Streaming FASTQ preprocessing with Deacon-based read selection"
 authors = ["Nicholas Minor <nrminor@wisc.edu>"]
 edition = "2024"
 license = "MIT"
 rust-version = "1.95.0"
 repository = "https://github.com/nrminor/nuclease"
 homepage = "https://github.com/nrminor/nuclease"
-documentation = "https://docs.rs/nuclease"
+documentation = "https://github.com/nrminor/nuclease#readme"
 readme = "README.md"
 keywords = ["fastq", "ena", "bioinformatics", "preprocessing", "sequencing"]
 categories = ["command-line-utilities", "science"]

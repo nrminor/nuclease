@@ -24,7 +24,9 @@ nuclease \
 
 Here, `nuclease` is used to stream and preprocess reads from ENA and then pass them along into kmer sketching with Sourmash. At no point in this preprocessing will the full read dataset be materialized on disk. Instead, reads are streamed and operated on as they arrive from ENA. `nuclease` resumes interrupted ENA transfers only when response identity can be verified, and checks completed downloads against ENA's catalogue size and MD5. If a transfer cannot be resumed safely, nuclease stops and recommends retrying the complete run.
 
-`nuclease`'s second big feature is developer-focused: it is highly extensible. See the [Contributing to nuclease](#contributing-to-nuclease) section for more.
+`nuclease` can also enrich for or deplete reads matching reference sequences using [Deacon](https://github.com/bede/deacon) minimizer indexes. Use a prebuilt index for repeated runs, or supply a reference to construct an index on demand. Paired reads contribute evidence together and are selected as whole pairs before other preprocessing.
+
+Another big feature is developer-focused: `nuclease` is highly extensible. See the [Contributing to nuclease](#contributing-to-nuclease) section for more.
 
 ## Installation
 
@@ -34,7 +36,15 @@ A simple curl install is the recommended installation method:
 curl -fsSL https://raw.githubusercontent.com/nrminor/nuclease/main/INSTALL.sh | bash
 ```
 
-This downloads the latest release's pre-built binary for your platform. If the binary download fails, the installer builds that same release tag with Cargo and its locked dependencies, not unreleased source from `main`. If the latest release cannot be identified, installation stops with an error. When a conda, mamba, or pixi environment is active, the installer places the binary in that environment's `bin` directory.
+This downloads the latest release's pre-built binary for your platform. If binary installation fails, the installer builds that same release tag with Cargo and its locked dependencies, not unreleased source from `main`. If the latest release cannot be identified, installation stops with an error.
+
+When `CONDA_PREFIX` is set by a conda, mamba, or pixi environment, the installer places the binary in `$CONDA_PREFIX/bin`. Otherwise, it installs to `$HOME/.local/bin`, which may need to be added to `PATH`. Source builds require Cargo; outside a conda-compatible environment, the installer installs Rust through rustup if Cargo is missing. Inside an environment, it instead asks you to install Rust there.
+
+To install directly from crates.io with Rust 1.95 or later and your platform's build tools:
+
+```sh
+cargo install nuclease --locked
+```
 
 ## Supported Preprocessing Operations
 
@@ -55,11 +65,29 @@ Supported transforms are:
 - 3' quality trimming (`--trim-min-q`): trims low-quality suffixes using the configured Phred cutoff.
 - Quality-score binning (`--bin-qualities[=2|3|5]`; disabled by default): lossily remaps Phred+33 quality scores into 2, 3, or 5 platform-neutral bins after trimming, merging, and quality-sensitive filters have already run. Passing `--bin-qualities` without a value uses 5 bins.
 
-When both indexes are supplied, `--selection-policy depletion-veto` (the default) keeps enrichment matches that do not match depletion. `--selection-policy enrichment-rescue` removes depletion matches unless they also match enrichment. Reads without a depletion match are kept under this policy.
+Adapter presets are curated sequence catalogs, not adapter auto-detection. Adapter trimming is disabled unless a preset is selected explicitly. The current trimmer only exposes presets with entries that are safe for 3' suffix-overlap trimming. Long-read catalog entries that require 5' trimming, both-end matching, barcode interpretation, internal-adapter handling, read splitting, demultiplexing, or orientation correction are retained as structured catalog metadata until those algorithms are implemented, but are not exposed as CLI presets yet.
 
-`--enrich-min-hits` and `--deplete-min-hits` set independent thresholds (default: 2 distinct minimizer hits). Paired reads pool distinct hits across both mates and are kept or rejected together.
+### Deacon selection
 
 Use uncompressed Deacon exact v3 or fuse v1 indexes from a trusted source. Fuse indexes can produce false-positive matches.
+
+```sh
+# Enrich for reads matching a target index.
+nuclease --in reads.fastq.gz --enrich-index targets.idx > enriched.fastq
+
+# Deplete host-matching pairs while preserving split paired output.
+nuclease --in1 reads_1.fastq.gz --in2 reads_2.fastq.gz \
+  --deplete-index host.idx --out1 depleted_1.fastq.gz --out2 depleted_2.fastq.gz
+
+# Require a target-index match and reject reads matching the host index.
+nuclease --in reads.fastq.gz --enrich-index targets.idx --deplete-index host.idx > selected.fastq
+```
+
+Selection runs before pair merging, trimming, and ordinary read filters. Those later steps still apply: the examples above use the default quality trimming and filters, so selection alone does not guarantee a read appears unchanged in the output.
+
+When both indexes are supplied, `--selection-policy depletion-veto` (the default) keeps enrichment matches that do not match depletion. `--selection-policy enrichment-rescue` removes depletion matches unless they also match enrichment. Reads without a depletion match are kept under this policy.
+
+`--enrich-min-hits` and `--deplete-min-hits` set independent thresholds (default: 2 distinct minimizer hits). Paired reads pool distinct hits across both mates and are kept or rejected together at the selection step.
 
 Both index options also accept local FASTA or FASTQ references, plain or gzip/bzip2/xz/zstd-compressed. Source contents, not filename extensions, determine the format. References are built into exact indexes before reads are opened; FASTQ reference qualities are unused. Read-processing input remains FASTQ-only. Supplying the same underlying source file for both roles, including symlink or hardlink aliases, is an error.
 
@@ -74,9 +102,9 @@ nuclease --in reads.fastq.gz --enrich-index targets.fa.gz.k31.w15.idx > selected
 
 Saving requires a reference source and never replaces an existing destination. Saved indexes cannot share destinations with other run outputs. Publication occurs only after serialization completes; save failures stop the run before read outputs open. Completed indexes survive later failures. Temporary staging files are cleaned up on ordinary errors, but forced termination may leave staging files; power-loss durability is not guaranteed. Preparation is sequential, and construction memory grows with distinct minimizers and the largest reference record; it is not capped by a fixed buffer size.
 
-Use `-p`/`--passthrough` to parse and validate input while emitting reads without filters or transforms. Passthrough output is produced by nuclease's normal FASTQ writer rather than copied byte-for-byte from the input, and it cannot be combined with `--merge-pairs` or Deacon selection.
+### Input and output behavior
 
-Adapter presets are curated sequence catalogs, not adapter auto-detection. Adapter trimming is disabled unless a preset is selected explicitly. The current trimmer only exposes presets with entries that are safe for 3' suffix-overlap trimming. Long-read catalog entries that require 5' trimming, both-end matching, barcode interpretation, internal-adapter handling, read splitting, demultiplexing, or orientation correction are retained as structured catalog metadata until those algorithms are implemented, but are not exposed as CLI presets yet.
+Use `-p`/`--passthrough` to parse and validate input while emitting reads without filters or transforms. Passthrough output is produced by nuclease's normal FASTQ writer rather than copied byte-for-byte from the input, and it cannot be combined with `--merge-pairs` or Deacon selection.
 
 For paired-end input, the CLI currently uses the `DropPair` orphan policy during paired processing: if one mate is rejected, the surviving mate is suppressed rather than emitted. With `--merge-pairs`, successfully merged pairs become single records and continue through the rest of the pipeline as single records. Pairs that cannot be merged continue through paired processing as the original mate pair. Because a merge-enabled run may contain a mix of merged single records and unmerged pairs, `--merge-pairs` requires paired input and single-stream output rather than split `--out1`/`--out2` files. The execution engine also has an internal `EmitOrphan` policy, but orphan emission is not exposed as a supported CLI/output mode yet. Open an issue if you'd like that prioritized!
 
@@ -92,6 +120,8 @@ Paired input validates matching identifiers and rejects explicit mate designatio
 
 Nuclease exists in part because I like developing tools in Rust with future hacking in mind. That ethos is pervasive in nuclease, with clear pathways for adding new operations to be run on FASTQs via the `ReadFilter` and `ReadTransform` traits.
 
+The published crate currently provides the CLI, not a library API. The examples below show how to extend the code inside this repository.
+
 Run `mise run test` for tests or `mise run check` for all checks. Property tests live in `src/property_tests/`, grouped by behavior, and run with the ordinary suite. Proptest shrinks failures and saves replay seeds under `proptest-regressions/`; retain useful seeds in version control and promote discovered counterexamples into named regressions. Deacon interoperability fixtures are checked in, so these tests need neither a Deacon installation nor network access.
 
 > [!NOTE]
@@ -99,7 +129,7 @@ Run `mise run test` for tests or `mise run check` for all checks. Property tests
 
 ### Extending nuclease with new filters
 
-In `nuclease`, most operations are _filters_, where some computation is run to decide whether a read should be passed on the in the stream or not. These operations are represented with the `ReadFilter` trait.
+In `nuclease`, most operations are _filters_, where some computation is run to decide whether a read should be passed on in the stream or not. These operations are represented with the `ReadFilter` trait.
 
 To see how this works, let's implement a new filter for GC-contents. Filters each start as a Rust struct that takes responsibility for filtering:
 
