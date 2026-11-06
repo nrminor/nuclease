@@ -97,15 +97,28 @@ detect_platform() {
 }
 
 get_latest_release() {
-    local url="https://api.github.com/repos/${REPO}/releases/latest"
+    local url="https://github.com/${REPO}/releases/latest"
+    local release_url=""
     if command -v curl &>/dev/null; then
-        curl -fsSL "$url" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
+        release_url=$(curl -fsSL --head --output /dev/null --write-out '%{url_effective}' "$url") || return 1
     elif command -v wget &>/dev/null; then
-        wget -qO- "$url" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
+        local response header location rest
+        response=$(wget -q --server-response --spider "$url" 2>&1) || return 1
+        # Wget reports each redirect; accept only the last Location header.
+        while read -r header location rest; do
+            if [[ "$header" == [Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]: ]]; then
+                [[ -z "${rest%$'\r'}" ]] || return 1
+                release_url="${location%$'\r'}"
+            fi
+        done <<< "$response"
     else
         error "Neither curl nor wget found. Please install one of them."
-        exit 1
+        return 1
     fi
+
+    local prefix="https://github.com/${REPO}/releases/tag/"
+    [[ "$release_url" == "$prefix"* ]] || return 1
+    printf '%s\n' "${release_url#"$prefix"}"
 }
 
 install_binary() {
@@ -212,6 +225,7 @@ fail_no_cargo_in_env() {
 
 build_from_source() {
     local install_dir="$1"
+    local version="$2"
     local install_root
     install_root=$(get_cargo_install_root "$install_dir")
 
@@ -229,11 +243,11 @@ build_from_source() {
         fi
     fi
 
-    info "Installing ${BINARY_NAME} from GitHub repository..."
+    info "Installing ${BINARY_NAME} ${version} from its release tag..."
     info "Using cargo: $(command -v cargo)"
     info "Install root: ${install_root}"
 
-    if cargo install --git "https://github.com/${REPO}.git" --root "${install_root}" --force; then
+    if cargo install --git "https://github.com/${REPO}.git" --tag "$version" --locked --root "${install_root}" --force; then
         info "Successfully built and installed ${BINARY_NAME}"
     else
         error "Failed to install from source"
@@ -278,9 +292,12 @@ show_help() {
     echo "       Downloads the latest release binary for your platform from GitHub."
     echo ""
     echo -e "    2. ${BOLD}Build from source${NC} (fallback)"
-    echo "       If no pre-built binary is available, builds from source using cargo."
+    echo "       If the binary download fails, builds the same release tag with Cargo."
+    echo "       Uses the release's Cargo.lock (--locked), never unreleased main."
     echo "       - In conda environments: Requires the rust package to be installed"
     echo "       - Global installs: Automatically installs rustup if needed"
+    echo ""
+    echo "    If the latest release cannot be identified, installation stops."
     echo ""
     echo -e "${BOLD}REQUIREMENTS${NC}"
     echo "    Runtime:"
@@ -426,24 +443,21 @@ main() {
     echo ""
 
     local version
-    version=$(get_latest_release)
-
-    if [[ -n "$version" ]]; then
-        info "Latest release: ${version}"
-        if install_binary "$version" "$platform" "$install_dir"; then
-            verify_installation "$install_dir"
-            show_next_steps
-            return 0
-        fi
-        warn "Failed to download pre-built binary"
-        echo ""
-    else
-        warn "Could not determine latest release"
-        echo ""
+    if ! version=$(get_latest_release) || [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+        error "Could not determine latest release. Check your connection to GitHub and retry."
+        return 1
     fi
 
-    warn "Falling back to source build..."
-    build_from_source "$install_dir"
+    info "Latest release: ${version}"
+    if install_binary "$version" "$platform" "$install_dir"; then
+        verify_installation "$install_dir"
+        show_next_steps
+        return 0
+    fi
+
+    warn "Failed to download pre-built binary"
+    warn "Falling back to source build of ${version}..."
+    build_from_source "$install_dir" "$version"
     verify_installation "$install_dir"
     show_next_steps
 }

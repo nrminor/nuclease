@@ -95,7 +95,7 @@ run = "mbx tui"
 
 [tasks.build-release]
 description = "Build Nuclease with the release profile"
-run = "cargo build --release"
+run = "cargo build --release --locked"
 
 [tasks.check-compile]
 description = "Check all targets and features without building artifacts"

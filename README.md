@@ -34,7 +34,7 @@ A simple curl install is the recommended installation method:
 curl -fsSL https://raw.githubusercontent.com/nrminor/nuclease/main/INSTALL.sh | bash
 ```
 
-This downloads a pre-built binary for your platform when one is available. If no binary is available, it falls back to building from source with Cargo. When a conda, mamba, or pixi environment is active, the installer places the binary in that environment's `bin` directory.
+This downloads the latest release's pre-built binary for your platform. If the binary download fails, the installer builds that same release tag with Cargo and its locked dependencies, not unreleased source from `main`. If the latest release cannot be identified, installation stops with an error. When a conda, mamba, or pixi environment is active, the installer places the binary in that environment's `bin` directory.
 
 ## Supported Preprocessing Operations
 
